@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>MoyMoy — dev</title>
+    <!-- Browser-dev harness: loads React/Babel from a CDN and the design fonts
+         from Google Fonts, so the bundle is testable WITHOUT the MochiOS host.
+         Point it at a local backend with ?moymoy_http=http://127.0.0.1:7433 and
+         pick an identity with ?mcid=Steve (the SDK reads these in browser-dev). -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="wallet/wallet.css" />
+    <style>
+      html, body { margin: 0; height: 100%; background: #0a0a0a; overflow: hidden; }
+      /* A phone-sized frame centered on the page for desktop preview. */
+      .dev-host { position: fixed; inset: 0; display: grid; place-items: center; }
+      .dev-phone { position: relative; width: 460px; height: 950px; overflow: hidden;
+        background: var(--bg-white); box-shadow: 0 40px 100px -20px rgba(0,0,0,0.6), 0 0 0 8px #0d0d0e; }
+      #root { position: absolute; inset: 0; overflow: hidden; }
+      .boot { position: absolute; inset: 0; display: grid; place-items: center;
+              font-family: 'Archivo', system-ui, sans-serif; font-weight: 800; color: #0B7A41; }
+    </style>
+  </head>
+  <body>
+    <div class="dev-host">
+      <div class="dev-phone">
+        <div id="root"><div class="boot">MoyMoy 起動中…</div></div>
+      </div>
+    </div>
+
+    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
+
+    <script src="moymoy-sdk.js"></script>
+    <script type="text/babel" src="wallet/crystal.jsx"></script>
+    <script type="text/babel" src="wallet/moymoy.jsx"></script>
+    <script type="text/babel" src="wallet/moymoy-screens.jsx"></script>
+
+    <script type="text/babel" data-presets="react">
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(<MoyMoyApp onClose={() => alert("HOME (dev)")} />);
+    </script>
+  </body>
+</html>

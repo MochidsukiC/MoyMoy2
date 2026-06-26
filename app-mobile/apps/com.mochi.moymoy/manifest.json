@@ -1,0 +1,34 @@
+{
+  "id": "com.mochi.moymoy",
+  "version": "0.1.0",
+  "schema_version": 1,
+  "name": { "default": "MoyMoy", "ja": "モイモイ" },
+  "description": {
+    "default": "In-Minecraft emerald wallet for MochiOS — check your balance, send エメ to friends, pay merchants, and charge from the emeralds in your inventory.",
+    "ja": "MochiOS のゲーム内エメラルド決済ウォレット。残高確認、フレンドへの送金、加盟店での支払い、インベントリのエメラルドからのチャージができます。"
+  },
+  "author": { "name": "Mochidsuki", "url": "https://houlab.jp", "support_email": "dev@houlab.jp" },
+  "license": "Proprietary",
+  "categories": ["finance", "utilities"],
+  "bundle": {
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.1.0/com.mochi.moymoy-0.1.0.tar",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "size": 0,
+    "format": "tar"
+  },
+  "runtime": { "kind": "js", "foreground": { "entry": "index.html" } },
+  "icon": {
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.1.0/com.mochi.moymoy-0.1.0.png",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "size_px": 512,
+    "format": "png"
+  },
+  "allowed_origins": ["https://moymoy.cs.mnn"],
+  "allowed_services": [],
+  "requires": {
+    "permissions": [],
+    "mochi_services": ["phone_state.read"],
+    "min_runtime_version": "0.1.0"
+  },
+  "supported_platforms": ["mc"]
+}

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>MoyMoy</title>
+    <!-- The MoyMoy header is deep green → the OS status bar uses light icons. -->
+    <meta name="mochi-statusbar" content="light" />
+    <!-- Shared OS UI runtime fonts/tokens, same-origin via the host. -->
+    <link rel="stylesheet" href="/__mochi_runtime__/fonts.css" />
+    <link rel="stylesheet" href="wallet/wallet.css" />
+    <style>
+      html, body { margin: 0; height: 100%; background: var(--bg-white, #fefefc); overflow: hidden; }
+      #root { position: relative; inset: 0; height: 100%; overflow: hidden; }
+      .boot { position: fixed; inset: 0; display: grid; place-items: center;
+              font-family: 'Archivo', system-ui, sans-serif; font-weight: 800;
+              letter-spacing: -0.02em; color: #0B7A41; }
+    </style>
+  </head>
+  <body>
+    <div id="root"><div class="boot">MoyMoy 起動中…</div></div>
+
+    <!-- In-world prelude: React + ReactDOM + Babel from the host runtime
+         (same-origin). The FG mochi.* API (os.gameName / os.gameUuid / storage)
+         is injected by the host. -->
+    <script src="/__mochi_runtime__/react.js"></script>
+    <script src="/__mochi_runtime__/react-dom.js"></script>
+    <script src="/__mochi_runtime__/babel.js"></script>
+
+    <!-- Wallet client SDK (talks to moymoy.cs.mnn). -->
+    <script src="moymoy-sdk.js"></script>
+
+    <!-- Presentational + wired components (verbatim / adapted from the design). -->
+    <script type="text/babel" src="wallet/crystal.jsx"></script>
+    <script type="text/babel" src="wallet/moymoy.jsx"></script>
+    <script type="text/babel" src="wallet/moymoy-screens.jsx"></script>
+
+    <!-- Mount. MoyMoy is the whole app surface; the header HOME button asks the
+         OS to exit back to the launcher. -->
+    <script type="text/babel" data-presets="react">
+      function exitToHome() {
+        try {
+          if (window.mochi && mochi.os) {
+            if (mochi.os.exit) return mochi.os.exit();
+            if (mochi.os.home) return mochi.os.home();
+          }
+        } catch (e) { /* in-world only */ }
+      }
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(<MoyMoyApp onClose={exitToHome} />);
+    </script>
+  </body>
+</html>
