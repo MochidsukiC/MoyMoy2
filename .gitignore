@@ -1,0 +1,33 @@
+# Rust
+/server/**/target/
+**/target-codex-*/
+*.pdb
+
+# SQLite (runtime DB + WAL/SHM)
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# TLS / secrets (dev Mochi CA, leaf certs, bearer)
+*.pem
+*.key
+.devstack/
+
+# Gradle / Forge mod
+/mod/.gradle/
+/mod/build/
+/mod/run/
+/mod/bin/
+!/mod/gradle/wrapper/gradle-wrapper.jar
+
+# Node / app bundle build
+node_modules/
+/dist/*.tar
+/dist/*.png
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+Thumbs.db

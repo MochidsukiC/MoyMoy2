@@ -1,0 +1,58 @@
+[package]
+name = "moymoy-cs"
+version = "0.1.0"
+edition = "2021"
+description = "MoyMoy cs.mnn wallet backend — serves the wallet (balance/send/request/history) over the MNN overlay (moymoy.cs.mnn) with an EMBEDDED cs tunnel (mochi-hub-cs-sdk), persists to SQLite, and drives emerald deposit/withdraw against the in-world mod over the MochiOS command bus (mc-sdk, bidirectional)."
+
+# Standalone workspace so this crate resolves independently while path-depending
+# into the co-located MochiOS2.0 checkout for the embedded cs tunnel + command-bus
+# SDKs. (Mirrors PiggleShop2/server/piggleshop-cs.)
+[workspace]
+
+[[bin]]
+name = "moymoy-cs"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime + HTTP. Versions/features PINNED to match MochiOS2.0's workspace
+# so the shared transitive crates (rustls/quinn/ring) unify with the SDK trees.
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+tower = { version = "0.5", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+md5 = "0.7"  # Minecraft offline-mode player UUID (nameUUIDFromBytes of "OfflinePlayer:<name>")
+
+# SQLite — bundled so there is no system libsqlite dependency. r2d2 pool for
+# read concurrency under WAL; writers serialize on BEGIN IMMEDIATE + busy_timeout.
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+
+# TLS serving for path-C (https://moymoy.cs.mnn end-to-end through the gateway
+# CONNECT tunnel). Pin the ring provider like MochiOS does.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+
+# Embedded cs tunnel (the "tunnel-embedded SDK"): claim moymoy.cs.mnn in-process,
+# no sidecar (DEV.md §5.4.3 / app.toml tunnel="self"). Path-dep into the
+# co-located MochiOS2.0 checkout.
+mochi-hub-cs-sdk = { path = "../../../MochiOS2.0/hub/cs-sdk" }
+
+# Command bus: bidirectional with the in-world mod over mTLS QUIC :7421 — send
+# emerald.deposit/withdraw (auto-routed to the player's live server) and receive
+# the mod's settlement acks (cs_hosts claim + run_inbound). Optional at runtime
+# (degrades to wallet-only when no cert is configured).
+mochi-hub-mc-sdk = { path = "../../../MochiOS2.0/hub/mc-sdk" }
+mochi-hub-mc-pki = { path = "../../../MochiOS2.0/hub/mc-pki" }
