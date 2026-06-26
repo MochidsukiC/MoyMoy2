@@ -54,9 +54,22 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(db = %db_path, "sqlite ready");
 
     // --- optional command bus (emerald charge) ---
-    let bus = CommandBus::connect().await?;
+    let bus = CommandBus::connect(pool.clone()).await?;
     let can_charge = bus.is_some();
     let charge = Arc::new(ChargeCoordinator::new(pool.clone(), bus));
+
+    // Reconciliation: re-send non-terminal emerald ops so a dropped command/ack
+    // eventually settles (at-least-once + op-idempotent mod). Once at startup,
+    // then on a timer. Only meaningful when the command bus is connected.
+    if can_charge {
+        let charge_rec = charge.clone();
+        tokio::spawn(async move {
+            loop {
+                charge_rec.reconcile().await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
 
     let state = AppState {
         pool: pool.clone(),
