@@ -152,12 +152,17 @@ pub fn history(
     Ok(rows)
 }
 
-/// Atomic transfer of `amount` エメ from `from_id` to `to_id`. Records a debit on
-/// the sender (`kind`: send|pay, `sender_label`) and a `receive` credit on the
-/// recipient. The whole read-check-update-ledger runs in one `BEGIN IMMEDIATE`.
+/// Atomic transfer of `amount` エメ from `from_id` to `to_id`, inside the
+/// caller's transaction. Records a debit on the sender (`kind`: send|pay,
+/// `sender_label`) and a `receive` credit on the recipient.
+///
+/// The caller owns the `BEGIN IMMEDIATE` transaction so the idempotency
+/// check-reserve-execute-record is one atomic unit (no TOCTOU double-spend
+/// between concurrent retries of the same idem_key). This function never begins
+/// or commits — it only reads/writes through `tx`.
 #[allow(clippy::too_many_arguments)]
 pub fn transfer(
-    conn: &mut Connection,
+    tx: &rusqlite::Transaction<'_>,
     from_id: &str,
     from_name: Option<&str>,
     to_id: &str,
@@ -173,21 +178,23 @@ pub fn transfer(
         return Ok(TxResult::SelfTransfer);
     }
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let sender = identity::get_or_create(&tx, from_id, from_name)?;
-    let receiver = identity::get_or_create(&tx, to_id, to_name)?;
+    let sender = identity::get_or_create(tx, from_id, from_name)?;
+    let receiver = identity::get_or_create(tx, to_id, to_name)?;
 
     if sender.balance < amount {
-        // Read-only path: dropping the tx rolls back the (idempotent) get_or_create
-        // upserts of names — acceptable, they re-apply on the next call.
         return Ok(TxResult::Insufficient {
             balance: sender.balance,
         });
     }
 
     let now = now_ms();
-    let sender_after = sender.balance - amount;
-    let receiver_after = receiver.balance + amount;
+    let sender_after = sender.balance - amount; // non-negative: checked balance >= amount
+    let receiver_after = match receiver.balance.checked_add(amount) {
+        Some(v) => v,
+        // Practically unreachable (MAX_AMOUNT bounds growth) but honest-fail on
+        // money arithmetic rather than panic/wrap.
+        None => return Ok(TxResult::BadAmount),
+    };
 
     tx.execute(
         "UPDATE accounts SET balance = ?2, updated_unix_ms = ?3 WHERE account_id = ?1",
@@ -211,7 +218,7 @@ pub fn transfer(
 
     let sender_tx_id = Uuid::new_v4().to_string();
     insert_txn(
-        &tx,
+        tx,
         &sender_tx_id,
         from_id,
         kind,
@@ -223,7 +230,7 @@ pub fn transfer(
         now,
     )?;
     insert_txn(
-        &tx,
+        tx,
         &Uuid::new_v4().to_string(),
         to_id,
         "receive",
@@ -235,7 +242,7 @@ pub fn transfer(
         now,
     )?;
 
-    tx.commit()?;
+    // The caller commits (after recording idempotency) so the whole unit is atomic.
     Ok(TxResult::Ok {
         tx_id: sender_tx_id,
         balance_after: sender_after,
@@ -243,21 +250,26 @@ pub fn transfer(
     })
 }
 
-/// Credit `amount` to `account_id` and record a `charge` txn, inside the caller's
-/// transaction. Used by the emerald-charge settlement (charge.rs). Returns the
-/// new balance.
+/// Credit `amount` to `account_id` and record a `charge` txn with `label`, inside
+/// the caller's transaction. Used by the emerald-charge settlement (charge.rs,
+/// label "インベントリのエメラルド") and dev funding (a distinct label, so dev eme
+/// is auditable as such). Returns the new balance, or an out-of-range error on
+/// overflow (honest-fail on money arithmetic).
 pub fn credit_charge(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
     amount: i64,
     now: i64,
+    label: &str,
 ) -> rusqlite::Result<i64> {
     let bal: i64 = tx.query_row(
         "SELECT balance FROM accounts WHERE account_id = ?1",
         [account_id],
         |r| r.get(0),
     )?;
-    let after = bal + amount;
+    let after = bal
+        .checked_add(amount)
+        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, amount))?;
     tx.execute(
         "UPDATE accounts SET balance = ?2, updated_unix_ms = ?3 WHERE account_id = ?1",
         params![account_id, after, now],
@@ -267,7 +279,7 @@ pub fn credit_charge(
         &Uuid::new_v4().to_string(),
         account_id,
         "charge",
-        "インベントリのエメラルド",
+        label,
         None,
         None,
         amount,

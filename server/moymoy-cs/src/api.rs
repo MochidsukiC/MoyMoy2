@@ -221,11 +221,15 @@ async fn send(
         .unwrap_or_else(|| "送金".to_string());
 
     let value = blocking(st.pool, move |conn| {
-        if let Some(prev) = db::idem_get(conn, &req.idem_key)? {
-            return Ok(replay(prev));
+        // Single BEGIN IMMEDIATE: the idem check-reserve-execute-record is one
+        // atomic unit, so concurrent retries of the same idem_key serialize and
+        // the second one replays (no TOCTOU double-spend).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(prev) = db::idem_get(&tx, &req.idem_key, "send")? {
+            return Ok(replay(prev)); // tx drops → rollback (read-only path)
         }
         let result = wallet::transfer(
-            conn,
+            &tx,
             &from_id,
             from_name.as_deref(),
             &to_id,
@@ -236,8 +240,9 @@ async fn send(
         )?;
         let (v, ok) = tx_result_json(result);
         if ok {
-            db::idem_put(conn, &req.idem_key, "send", &v.to_string())?;
+            db::idem_put(&tx, &req.idem_key, "send", &v.to_string())?;
         }
+        tx.commit()?;
         Ok::<Value, ApiError>(v)
     })
     .await?;
@@ -261,15 +266,16 @@ async fn pay(State(st): State<AppState>, Json(req): Json<PayReq>) -> Result<Json
     let from_name = req.mcid.clone();
 
     let value = blocking(st.pool, move |conn| {
-        if let Some(prev) = db::idem_get(conn, &req.idem_key)? {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(prev) = db::idem_get(&tx, &req.idem_key, "pay")? {
             return Ok(replay(prev));
         }
-        let (to_id, merchant_name) = match wallet::merchant_account(conn, &req.merchant_id)? {
+        let (to_id, merchant_name) = match wallet::merchant_account(&tx, &req.merchant_id)? {
             Some(m) => m,
             None => return Ok(json!({ "ok": false, "error": "unknown_target" })),
         };
         let result = wallet::transfer(
-            conn,
+            &tx,
             &from_id,
             from_name.as_deref(),
             &to_id,
@@ -280,8 +286,9 @@ async fn pay(State(st): State<AppState>, Json(req): Json<PayReq>) -> Result<Json
         )?;
         let (v, ok) = tx_result_json(result);
         if ok {
-            db::idem_put(conn, &req.idem_key, "pay", &v.to_string())?;
+            db::idem_put(&tx, &req.idem_key, "pay", &v.to_string())?;
         }
+        tx.commit()?;
         Ok::<Value, ApiError>(v)
     })
     .await?;
@@ -338,7 +345,7 @@ async fn dev_credit(
     let balance = blocking(st.pool, move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         identity::get_or_create(&tx, &account_id, mcid.as_deref())?;
-        let after = wallet::credit_charge(&tx, &account_id, req.amount, db::now_ms())?;
+        let after = wallet::credit_charge(&tx, &account_id, req.amount, db::now_ms(), "開発用クレジット")?;
         tx.commit()?;
         Ok::<i64, ApiError>(after)
     })

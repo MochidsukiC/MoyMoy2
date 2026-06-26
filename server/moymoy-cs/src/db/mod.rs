@@ -70,11 +70,13 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Look up a frozen idempotency response by key (the stored JSON string).
-pub fn idem_get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+/// Look up a frozen idempotency response by (key, scope) — the stored JSON
+/// string. `scope` is part of the match so the same key reused across a `send`
+/// and a `pay` cannot replay the wrong operation's response.
+pub fn idem_get(conn: &Connection, key: &str, scope: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row(
-        "SELECT response_json FROM idempotency WHERE idem_key = ?1",
-        [key],
+        "SELECT response_json FROM idempotency WHERE idem_key = ?1 AND scope = ?2",
+        [key, scope],
         |r| r.get::<_, String>(0),
     )
     .optional()
