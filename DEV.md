@@ -58,18 +58,22 @@ UIフロー:
 
 ## 問題 / 課題
 
-- **段階0 ブロッカー**: デザイン「MochiOS Mobile.html」は `claude_design` MCP（要 `/design-login`）で取得。未取得の間はフロントエンドと design-derived エンドポイント/カラムが未確定。
+- **in-game チャットコマンドからの backend 報告は不可**: `mochi` connector(`MochiMod`)は `DISPATCH`(inbound ルーティング)のみ公開で、ハンドラ外からの unsolicited 送信API が無い。よってエメラルドチャージは**アプリ起点**（プレイヤー在線中にアプリのチャージタブ使用→backend が MOD に在世エメラルド消費を指示）で完結する。真の `/eme deposit` チャットコマンドが必要なら mochi connector に outbound 送信API追加が必要で、それは承認の要る MochiOS2.0 改変。`/eme` は読み取り専用ヘルパ(換金可能量表示)のみ。
 - エメラルドチャージの致命ウィンドウ（consume成功・ack喪失・SavedDataフラッシュ前クラッシュ）は台帳+reconciliation+`setDirty()`直後フラッシュで最小化（exactly-once は原理的限界）。
+- **CodeX レビュー保留**: recursive-codex-reviewer の CodeX 本体がレート制限（〜2026-06-28）で起動不可。e1931fd 以降は Claude 自己レビューのみ（指摘 A/B/C/E は反映済）。リセット後に CodeX 再レビュー推奨。
 
 ---
 
 ## TODO
 
-- [ ] 段階1: バックエンド基盤（Cargo.toml + 内蔵トンネル + TLS）
-- [ ] 段階1: SQLite層 + ウォレットドメイン
-- [ ] 段階1: HTTP API層（MC無しで動く最小ウォレット）
-- [ ] 段階0: デザイン取込（要 /design-login）→ 仕様確定
-- [ ] 段階2: フロントエンドバンドル
-- [ ] 段階3: コマンドバス + チャージ整合
-- [ ] 段階3: MC サーバーサイドmod
-- [ ] 段階4: 配置・公開・E2E 検証
+- [x] 段階0: デザイン取込（claude_design MCP）→ 仕様確定
+- [x] 段階1: バックエンド基盤（Cargo.toml + 内蔵トンネル + TLS）
+- [x] 段階1: SQLite層 + ウォレットドメイン
+- [x] 段階1: HTTP API層（MC無しで動く最小ウォレット）— E2E検証済
+- [x] レビュー指摘修正: 冪等の単一トランザクション化(TOCTOU二重支払い根絶)
+- [x] 段階2: フロントエンドバンドル（デザイン駆動）
+- [x] 段階3: コマンドバス + チャージ整合（emerald_ops 台帳）
+- [x] 段階3: MC サーバーサイドmod（Forge、moymoy-0.1.0.jar ビルド済）
+- [x] 段階4: 配置・公開ツール（tools/, deploy/, icon.png）
+- [ ] 段階4: フル E2E（devstack + MC server 稼働下でのチャージ実機検証）— 運用環境で実施
+- [ ] (任意) CodeX リセット後の再レビュー

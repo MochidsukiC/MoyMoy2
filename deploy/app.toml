@@ -1,0 +1,36 @@
+# MoyMoy backend manifest for the MochiOS app-backend launcher.
+#
+# Copy this (and the built `moymoy-cs` binary) into the Hub workdir under
+# `app_backends/moymoy/`, then enable it in the Hub TUI (or set enabled = true).
+# `tools/deploy-backend.ps1` does the copy for you.
+#
+# tunnel = "self": the backend embeds its own cs tunnel (mochi-hub-cs-sdk), so the
+# launcher injects only MOCHI_APP_LISTEN and runs NO tunnel itself (DEV.md §5.4.3).
+
+enabled = true
+domain  = "moymoy.cs.mnn"
+# `exec` omitted on purpose: the launcher auto-detects the single runnable file in
+# this dir (moymoy-cs / moymoy-cs.exe), which is portable across Windows/Unix
+# without hardcoding the `.exe` suffix. Add `exec = ["./moymoy-cs"]` to override.
+listen_env = "MOCHI_APP_LISTEN"
+tunnel  = "self"
+
+[env]
+# Wallet store (relative to app_backends/moymoy/).
+MOYMOY_DB_PATH = "moymoy.db"
+# Serve TLS for path-C (https://moymoy.cs.mnn through the gateway CONNECT tunnel).
+MOYMOY_CS_TLS  = "1"
+
+# Embedded cs tunnel → Hub endpoints. These match a local `mochi-inworld` devstack;
+# override for a non-local Hub. The bearer is a secret — set it from your secret
+# store, not in a committed file.
+MOCHI_TUNNEL_HUB_WS   = "ws://127.0.0.1:7411"
+MOCHI_TUNNEL_HUB_QUIC = "127.0.0.1:7420"
+MOCHI_IPVM_ROUTER_URL = "http://127.0.0.1:7400"
+# MOCHI_TUNNEL_BEARER = "<secret>"
+
+# Emerald charge (OPTIONAL — omit for a wallet-only deploy). Point at the mc
+# client cert minted by:  mochi-mc-ca issue --mcserver-id moymoy --out <dir>
+# MOCHI_MC_CERT_DIR  = "<cert dir>"
+MOCHI_MC_HUB_QUIC  = "127.0.0.1:7421"
+MOCHI_IPVM_GATEWAY = "127.0.0.1:7411"
