@@ -73,7 +73,12 @@ UIフロー:
 - **memo 未実装**: デザインの送金/支払いフローに memo 入力欄が無いため、API からも除外（受理して捨てる挙動は不採用）。必要時は transactions.memo への配線を追加。
 - **in-game チャットコマンドからの backend 報告は不可**: `mochi` connector(`MochiMod`)は `DISPATCH`(inbound ルーティング)のみ公開で、ハンドラ外からの unsolicited 送信API が無い。よってエメラルドチャージは**アプリ起点**で完結する。真の `/eme deposit` には mochi connector への outbound 送信API追加（承認の要る MochiOS2.0 改変）が必要。
 - エメラルドチャージの致命ウィンドウ（consume成功・ack喪失・SavedDataフラッシュ前クラッシュ）は台帳+reconciliation+`setDirty()`直後フラッシュで最小化（exactly-once は原理的限界）。
-- **CodeX 再レビュー**: v2 再設計（backend `6b85dc5` / frontend `9cc6c18`）は recursive-codex-reviewer をバックグラウンド起動済み。指摘は検証のうえ反映する。
+- **CodeX 再レビュー（反映済）**: v2 再設計に recursive-codex-reviewer を実施。妥当指摘を反映 — backend `382acc2`（冪等の複合PK化で二重決済防止 / `user_version` を tx 内へ移しマイグレーション原子化 / 握り潰しログ化 ほか）、frontend `ffb40c8`（`me()` を ok/expired/unknown で識別し一時エラーで口座を消さない / アンマウントガード / 401 即時処理 ほか）。
+- **承認ゲート保留（共有層に跨る設計課題・未着手）**: 着手前に設計案の承認が必要。
+  - **R007**: `/wallet/inventory` の mc_uuid 所有権検証。リンクは charge 時に確立されるため、未リンク照会を許容しつつリンク後のみ検証する設計が要る。
+  - **R008**: `reconcile` の op TTL / dead-letter。`sent` の消費済みエメラルドを安全に失効させる escalate フロー（単純 TTL は消費済み無クレジット化の危険）。
+  - **R05/R06**: SDK の `_session` がグローバルのため、非アクティブ口座の logout / 切替検証中に並行 API が誤セッションを送る競合。`getJson/postJson` への per-call トークン引数化で根治。
+  - **R13 / charge 再試行**: `store.set` 失敗の握り潰し、チャージ poll タイムアウト後の再試行で別 op_id の二重消費窓。
 
 ---
 
@@ -90,6 +95,8 @@ UIフロー:
 - [x] 段階4: 配置・公開ツール（tools/, deploy/, icon.png）
 - [x] **再設計**: 独立アカウント(handle+PIN)+セッション検証 — backend（`6b85dc5`、HTTPスモーク緑）
 - [x] **再設計**: マルチアカウント(1端末=複数口座)+1口座=複数MCキャラ — frontend（`9cc6c18`、Babel透過）
-- [ ] 再公開: バンドル再パック＋registry再登録（`tools/register-hub.ps1`）、backend 再配置（`tools/deploy-backend.ps1`）
-- [ ] フル E2E（in-world / ブラウザ harness で 口座開設→切替→送金→チャージ自動リンク の実機検証）
-- [ ] CodeX 再レビュー指摘の反映（backend/frontend 両 reviewer 完了待ち）
+- [x] CodeX 再レビュー指摘の反映（backend `382acc2` / frontend `ffb40c8`）
+- [x] 再公開: バンドル v0.2.0 を GitHub リリース化＋registry再登録（`tools/register-hub.ps1`、:7409 へ 0.2.0 配置）
+- [ ] backend 再配置（`tools/deploy-backend.ps1`）— レビュー反映後の moymoy-cs を Hub workdir へ
+- [ ] フル E2E（in-world で 0.2.0 再インストール → 口座開設→切替→送金→チャージ自動リンク の実機検証）
+- [ ] 承認ゲート課題の設計対応（R007 / R008 / R05・R06 / R13・charge再試行）— §問題参照
