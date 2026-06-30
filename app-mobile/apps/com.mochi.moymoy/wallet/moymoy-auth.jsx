@@ -250,7 +250,7 @@ function AuthLogin({ onDone, onBack }) {
   const [busy, setBusy] = maState(false);
   const [err, setErr] = maState("");
 
-  const handleOk = handle.trim().length >= 3;
+  const handleOk = /^[A-Za-z0-9_]{3,20}$/.test(handle.trim());
 
   function pressPin(k) {
     setErr("");
@@ -363,13 +363,19 @@ function AccountMenu({ open, accounts, activeId, onSwitch, onAdd, onLogout, onSe
 function SettingsSheet({ open, account, onLogout, onClose }) {
   const [links, setLinks] = maState([]);
   const [loaded, setLoaded] = maState(false);
+  const [failed, setFailed] = maState(false);
   maEffect(() => {
     if (!open) return;
     setLoaded(false);
+    setFailed(false);
     let alive = true;
     MoyMoy.me()
-      .then((r) => { if (alive && r.ok) setLinks(r.linked_mc || []); })
-      .catch(() => {})
+      .then((r) => {
+        if (!alive) return;
+        if (r.ok) setLinks(r.linked_mc || []);
+        else setFailed(true);
+      })
+      .catch(() => { if (alive) setFailed(true); })
       .finally(() => { if (alive) setLoaded(true); });
     return () => { alive = false; };
   }, [open]);
@@ -399,7 +405,12 @@ function SettingsSheet({ open, account, onLogout, onClose }) {
               </div>
             </div>
           ))}
-          {loaded && links.length === 0 && (
+          {loaded && failed && (
+            <div style={{ padding: 18, textAlign: "center", fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)" }}>
+              連携キャラクターを読み込めませんでした。<br />通信状態をご確認のうえ、開き直してください。
+            </div>
+          )}
+          {loaded && !failed && links.length === 0 && (
             <div style={{ padding: 18, textAlign: "center", fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)" }}>
               まだ連携キャラクターはありません。<br />チャージするとそのキャラクターが自動で連携されます。
             </div>
@@ -430,17 +441,24 @@ function MoyMoyRoot({ onClose }) {
       const active = list.find((a) => a.account_id === aid) || list[0] || null;
       if (active) {
         MoyMoy.setSession(active.session);
+        let verdict = "unknown"; // "ok" | "expired" | "unknown"
         try {
           const me = await MoyMoy.me();
-          if (alive && me.ok) {
-            setAccounts(list);
-            setActiveId(active.account_id);
-            setPhase("app");
-            return;
-          }
-        } catch (e) { /* fall through to auth */ }
-        // Active session invalid — drop it, keep the rest for manual re-login.
+          verdict = me.ok ? "ok" : (me.error === "unauthorized" ? "expired" : "unknown");
+        } catch (e) {
+          // network / non-200 HTTP / JSON parse failure — can't verify (transient)
+          verdict = "unknown";
+        }
         if (!alive) return;
+        if (verdict !== "expired") {
+          // valid OR unverifiable (transient): keep the session. A genuine 401
+          // during use is handled by the wallet's onExpired — never delete on a blip.
+          setAccounts(list);
+          setActiveId(active.account_id);
+          setPhase("app");
+          return;
+        }
+        // verdict === "expired" (401): session truly invalid — drop it, keep the rest.
         const rest = list.filter((a) => a.account_id !== active.account_id);
         setAccounts(rest);
         setActiveId(null);
@@ -467,16 +485,25 @@ function MoyMoyRoot({ onClose }) {
   async function switchTo(id) {
     const acc = accounts.find((a) => a.account_id === id);
     if (!acc || id === activeId) return;
+    const prev = accounts.find((a) => a.account_id === activeId) || null;
     MoyMoy.setSession(acc.session);
+    let verdict = "unknown";
     try {
       const me = await MoyMoy.me();
-      if (me.ok) {
-        setActiveId(id);
-        await saveAccounts(accounts, id);
-        return;
-      }
-    } catch (e) { /* invalid below */ }
-    // Session expired — drop it and send the user to login for that handle.
+      verdict = me.ok ? "ok" : (me.error === "unauthorized" ? "expired" : "unknown");
+    } catch (e) { verdict = "unknown"; }
+    if (verdict === "ok") {
+      setActiveId(id);
+      await saveAccounts(accounts, id);
+      return;
+    }
+    if (verdict === "unknown") {
+      // Couldn't verify (network/server/parse) — abort the switch, keep both
+      // accounts, restore the current session. Never delete on a transient error.
+      MoyMoy.setSession(prev ? prev.session : null);
+      return;
+    }
+    // verdict === "expired" (401): that session is truly invalid — drop it.
     const rest = accounts.filter((a) => a.account_id !== id);
     setAccounts(rest);
     if (activeId) { const cur = rest.find((a) => a.account_id === activeId); MoyMoy.setSession(cur ? cur.session : null); }

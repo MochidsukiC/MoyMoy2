@@ -152,13 +152,14 @@ function MoySend({ friends = [], onPick }) {
   const [busy, setBusy] = msState(false);
   const [err, setErr] = msState("");
   const cleanHandle = qy.trim().replace(/^@/, "");
+  const handleValid = /^[A-Za-z0-9_]{3,20}$/.test(cleanHandle);
   const shown = qy
     ? friends.filter(f => (f.name + " " + (f.sub || "") + " " + (f.handle || "")).toLowerCase().includes(cleanHandle.toLowerCase()))
     : friends;
 
   async function resolveAndPick() {
     const h = cleanHandle;
-    if (h.length < 3) { setErr("MoyMoy ID（3文字以上）を入力してください"); return; }
+    if (!handleValid) { setErr("MoyMoy ID（半角英数字と _ の3〜20文字）を入力してください"); return; }
     setBusy(true); setErr("");
     try {
       const r = await MoyMoy.lookup(h);
@@ -189,10 +190,10 @@ function MoySend({ friends = [], onPick }) {
               style={{ flex: 1, padding: "12px 4px", border: "none", background: "transparent",
               fontFamily: "var(--font-jp)", fontSize: 14, color: "var(--ink)", outline: "none" }} />
           </div>
-          <button disabled={busy || cleanHandle.length < 3} onClick={resolveAndPick} style={{
-            border: "1.5px solid #000", background: busy || cleanHandle.length < 3 ? "#bdbdbd" : "var(--moy)",
-            color: "#fff", boxShadow: busy || cleanHandle.length < 3 ? "none" : "3px 3px 0 #0B5A33",
-            cursor: busy || cleanHandle.length < 3 ? "default" : "pointer", padding: "0 16px",
+          <button disabled={busy || !handleValid} onClick={resolveAndPick} style={{
+            border: "1.5px solid #000", background: busy || !handleValid ? "#bdbdbd" : "var(--moy)",
+            color: "#fff", boxShadow: busy || !handleValid ? "none" : "3px 3px 0 #0B5A33",
+            cursor: busy || !handleValid ? "default" : "pointer", padding: "0 16px",
             fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15 }}>送る</button>
         </div>
         {err && <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, color: "var(--carle-red)" }}>{err}</div>}
@@ -469,6 +470,7 @@ const ERR_LABEL = {
   mc_unavailable: "Minecraft サーバーに接続されていません",
   no_character: "Minecraft キャラクターが見つかりません",
   charge_pending: "チャージは保留中です（反映までお待ちください）",
+  charge_failed: "チャージに失敗しました。もう一度お試しください",
   unauthorized: "セッションが切れました。ログインし直してください",
 };
 function errLabel(code) {
@@ -485,6 +487,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   const [inv, setInv] = msState({ emeralds: 0, blocks: 0 });
   const [canCharge, setCanCharge] = msState(false);
   const [loaded, setLoaded] = msState(false);
+  const mountedRef = msRef(true);
 
   const [tab, setTab] = msState("home");
   const [flow, setFlow] = msState(null);       // {kind, target}  amount-entry
@@ -507,9 +510,10 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     "--moy-mint": "#D6F5E3",
   };
 
-  async function refresh() {
+  async function refresh(isAlive = () => true) {
     try {
       const h = await MoyMoy.home();
+      if (!isAlive()) return;
       if (h.ok) {
         setBalance(h.balance);
         setProfile(h.profile);
@@ -521,24 +525,29 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     } catch (e) { /* keep last good state */ }
   }
 
-  async function loadAll() {
-    await refresh();
+  async function loadAll(isAlive = () => true) {
+    await refresh(isAlive);
     try {
       const m = await MoyMoy.merchants();
-      if (m.ok) setMerchants(m.merchants.map(enrichMerchant));
+      if (isAlive() && m.ok) setMerchants(m.merchants.map(enrichMerchant));
     } catch (e) { /* ignore */ }
     try {
       const f = await MoyMoy.friends();
-      if (f.ok) setFriends(f.friends.map(enrichFriend));
+      if (isAlive() && f.ok) setFriends(f.friends.map(enrichFriend));
     } catch (e) { /* ignore */ }
     try {
       const i = await MoyMoy.inventory();
-      if (i.ok) setInv({ emeralds: i.emeralds, blocks: i.blocks });
+      if (isAlive() && i.ok) setInv({ emeralds: i.emeralds, blocks: i.blocks });
     } catch (e) { /* ignore */ }
-    setLoaded(true);
+    if (isAlive()) setLoaded(true);
   }
 
-  msEffect(() => { loadAll(); }, []);
+  msEffect(() => {
+    mountedRef.current = true;
+    let alive = true;
+    loadAll(() => alive);
+    return () => { alive = false; mountedRef.current = false; };
+  }, []);
 
   // Full history (separate from the home "recent" slice) when the history tab opens.
   msEffect(() => {
@@ -552,6 +561,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     for (let i = 0; i < tries; i++) {
       try {
         const r = await MoyMoy.op(opId);
+        if (r.error === "unauthorized") return { unauthorized: true };
         if (r.ok && r.op && (r.op.state === "settled" || r.op.state === "failed")) return r.op;
       } catch (e) { /* retry */ }
       await new Promise(res => setTimeout(res, 600));
@@ -585,20 +595,24 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       if (kind === "charge") {
         // Charge is async: poll the op until the mod settles the consumed amount.
         const op = await pollOp(res.op_id);
+        if (op && op.unauthorized) { setBusy(false); setConfirm(null); onExpired(); return; }
         if (!op || op.state !== "settled") {
-          setErr(errLabel("charge_pending"));
+          if (!mountedRef.current) return;
+          setErr(errLabel(op && op.state === "failed" ? "charge_failed" : "charge_pending"));
           setBusy(false);
-          await refresh();
+          await refresh(() => mountedRef.current);
           return;
         }
         shownAmount = op.settled_amount != null ? op.settled_amount : amount;
       }
 
-      await refresh();
+      await refresh(() => mountedRef.current);
+      if (!mountedRef.current) return;
       try {
         const i = await MoyMoy.inventory();
-        if (i.ok) setInv({ emeralds: i.emeralds, blocks: i.blocks });
+        if (mountedRef.current && i.ok) setInv({ emeralds: i.emeralds, blocks: i.blocks });
       } catch (e) { /* ignore */ }
+      if (!mountedRef.current) return;
 
       setBusy(false);
       setConfirm(null);
@@ -606,6 +620,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       setComplete({ kind, target: target ? target.name : null, amount: shownAmount });
       setTab("home");
     } catch (e) {
+      if (!mountedRef.current) return;
       setErr("通信に失敗しました");
       setBusy(false);
     }
