@@ -40,12 +40,14 @@ pub struct HomeView {
     pub txns: Vec<Txn>,
 }
 
-/// A "send" target (recent counterparty / contact).
+/// A "send" target (recent counterparty / contact). `handle` is the MoyMoy ID
+/// the app sends to (`@handle`); `id` is the backing account_id.
 #[derive(Debug, Serialize)]
 pub struct Friend {
     pub id: String,
     pub name: String,
     pub sub: String,
+    pub handle: String,
 }
 
 /// A "pay" target (registered shop).
@@ -95,16 +97,20 @@ pub fn balance(conn: &Connection, account_id: &str) -> rusqlite::Result<i64> {
         .unwrap_or(0))
 }
 
-/// Home aggregate. Provisions the account on first sight so a new player sees a
-/// zero-balance card immediately.
-pub fn home(conn: &Connection, account_id: &str, mcid: Option<&str>) -> rusqlite::Result<HomeView> {
-    let acct = identity::get_or_create(conn, account_id, mcid)?;
+/// Home aggregate for an existing (authenticated) account. Returns `None` if the
+/// account row is gone (the caller treats that as an internal inconsistency,
+/// since a valid session always points at a live account).
+pub fn home(conn: &Connection, account_id: &str) -> rusqlite::Result<Option<HomeView>> {
+    let acct = match identity::get(conn, account_id)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     let txns = history(conn, account_id, 6, "all")?;
-    Ok(HomeView {
+    Ok(Some(HomeView {
         balance: acct.balance,
         profile: profile_of(&acct),
         txns,
-    })
+    }))
 }
 
 /// Recent ledger rows, newest first. `filter` ∈ all|pay|send|charge (anything
@@ -154,19 +160,18 @@ pub fn history(
 
 /// Atomic transfer of `amount` エメ from `from_id` to `to_id`, inside the
 /// caller's transaction. Records a debit on the sender (`kind`: send|pay,
-/// `sender_label`) and a `receive` credit on the recipient.
+/// `sender_label`) and a `receive` credit on the recipient. Both accounts must
+/// already exist (a missing side ⇒ `UnknownTarget`) — accounts are created only
+/// via `/auth/register`, never implicitly by a transfer.
 ///
 /// The caller owns the `BEGIN IMMEDIATE` transaction so the idempotency
 /// check-reserve-execute-record is one atomic unit (no TOCTOU double-spend
 /// between concurrent retries of the same idem_key). This function never begins
 /// or commits — it only reads/writes through `tx`.
-#[allow(clippy::too_many_arguments)]
 pub fn transfer(
     tx: &rusqlite::Transaction<'_>,
     from_id: &str,
-    from_name: Option<&str>,
     to_id: &str,
-    to_name: Option<&str>,
     amount: i64,
     kind: &str,
     sender_label: &str,
@@ -178,8 +183,14 @@ pub fn transfer(
         return Ok(TxResult::SelfTransfer);
     }
 
-    let sender = identity::get_or_create(tx, from_id, from_name)?;
-    let receiver = identity::get_or_create(tx, to_id, to_name)?;
+    let sender = match identity::get(tx, from_id)? {
+        Some(a) => a,
+        None => return Ok(TxResult::UnknownTarget),
+    };
+    let receiver = match identity::get(tx, to_id)? {
+        Some(a) => a,
+        None => return Ok(TxResult::UnknownTarget),
+    };
 
     if sender.balance < amount {
         return Ok(TxResult::Insufficient {
@@ -205,16 +216,8 @@ pub fn transfer(
         params![to_id, receiver_after, now],
     )?;
 
-    let counterparty_name = receiver
-        .mcid
-        .clone()
-        .or_else(|| to_name.map(str::to_string))
-        .unwrap_or_else(|| sender_label.to_string());
-    let sender_display = sender
-        .mcid
-        .clone()
-        .or_else(|| from_name.map(str::to_string))
-        .unwrap_or_else(|| "プレイヤー".to_string());
+    let counterparty_name = receiver.label();
+    let sender_display = sender.label();
 
     let sender_tx_id = Uuid::new_v4().to_string();
     insert_txn(
@@ -311,24 +314,29 @@ fn insert_txn(
     Ok(())
 }
 
-/// Recent distinct counterparties as "send" targets (most recent first).
+/// Recent distinct counterparties that are real MoyMoy users (have a handle), as
+/// "send" targets (most recent first). Merchants (no handle) are excluded — they
+/// live in the pay tab.
 pub fn friends(conn: &Connection, account_id: &str) -> rusqlite::Result<Vec<Friend>> {
     let mut stmt = conn.prepare(
-        "SELECT counterparty_id, counterparty_name, MAX(ts_unix_ms) AS last_ts \
-         FROM transactions \
-         WHERE account_id = ?1 AND counterparty_id IS NOT NULL AND kind IN ('send','pay','receive') \
-         GROUP BY counterparty_id ORDER BY last_ts DESC LIMIT 20",
+        "SELECT a.account_id, a.handle, a.display_name, MAX(t.ts_unix_ms) AS last_ts \
+         FROM transactions t JOIN accounts a ON a.account_id = t.counterparty_id \
+         WHERE t.account_id = ?1 AND t.counterparty_id IS NOT NULL \
+           AND t.kind IN ('send','pay','receive') AND a.handle IS NOT NULL \
+         GROUP BY a.account_id ORDER BY last_ts DESC LIMIT 20",
     )?;
     let rows = stmt
         .query_map([account_id], |row| {
             let id: String = row.get(0)?;
-            let name: Option<String> = row.get(1)?;
+            let handle: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let display: Option<String> = row.get(2)?;
             Ok(Friend {
-                id: id.clone(),
-                name: name.clone().unwrap_or_else(|| "プレイヤー".to_string()),
-                sub: name
-                    .map(|n| format!("@{}", n.to_lowercase()))
-                    .unwrap_or_else(|| format!("@{}", &id[..id.len().min(8)])),
+                id,
+                name: display
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("@{handle}")),
+                sub: format!("@{handle}"),
+                handle,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -385,9 +393,11 @@ pub fn seed_demo_merchants(conn: &mut Connection) -> rusqlite::Result<()> {
         let account_id = identity::offline_uuid(&format!("merchant:{mid}"))
             .hyphenated()
             .to_string();
+        // Merchant accounts are non-login (handle / pin_hash stay NULL); they
+        // receive `pay` transfers and display by `display_name`.
         tx.execute(
             "INSERT OR IGNORE INTO accounts \
-               (account_id, mcid, balance, holder, card_number, card_expiry, is_merchant, created_unix_ms, updated_unix_ms) \
+               (account_id, display_name, balance, holder, card_number, card_expiry, is_merchant, created_unix_ms, updated_unix_ms) \
              VALUES (?1, ?2, 0, ?3, ?4, '07/29', 1, ?5, ?5)",
             params![
                 account_id,

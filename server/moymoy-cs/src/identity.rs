@@ -1,26 +1,47 @@
-//! Player identity & account provisioning.
+//! Account read helpers + UUID/card-face utilities shared by the wallet & auth
+//! layers.
 //!
-//! An account is keyed by the canonical Minecraft UUID. The app supplies it from
-//! `mochi.os.gameUuid()`; when only a name is known (offline servers, name-only
-//! transfers) we derive the Mojang *offline* UUID exactly as the server does
-//! (`UUID.nameUUIDFromBytes("OfflinePlayer:" + name)`), so the two paths key the
-//! same row.
+//! Since the v2 redesign an account is an **independent MoyMoy account**
+//! (handle + PIN — created by [`crate::auth`]); `account_id` is a server-generated
+//! UUID, no longer a Minecraft UUID. The Minecraft UUID survives only as a
+//! *linked resource* for emerald charging — recorded in `account_mc_links` by
+//! [`link_mc`], routed by `emerald_ops.mc_uuid`.
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::db::now_ms;
 
-/// One wallet account row (includes the cosmetic card face from the design).
+/// One account row as the wallet consumes it (balance + card face + labels).
 #[derive(Debug, Clone)]
 pub struct Account {
     pub account_id: String,
-    pub mcid: Option<String>,
+    pub handle: Option<String>,
+    pub display_name: Option<String>,
     pub balance: i64,
     pub holder: String,
     pub card_number: String,
     pub card_expiry: String,
     pub is_merchant: bool,
+}
+
+impl Account {
+    /// Best human label: friendly name, else `@handle`, else a generic.
+    pub fn label(&self) -> String {
+        self.display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.handle.clone().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "プレイヤー".to_string())
+    }
+}
+
+/// A Minecraft character linked to an account (settings / `/auth/me`).
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkedMc {
+    pub mc_uuid: String,
+    pub mcid: Option<String>,
 }
 
 /// Canonicalize a UUID string to lowercase hyphenated form, or `None` if it is
@@ -29,10 +50,9 @@ pub fn normalize_uuid(s: &str) -> Option<String> {
     Uuid::parse_str(s.trim()).ok().map(|u| u.hyphenated().to_string())
 }
 
-/// The Minecraft *offline-mode* UUID for `name`:
-/// `UUID.nameUUIDFromBytes("OfflinePlayer:" + name)` — an MD5 (version-3) name
-/// UUID. Lets a name-only request resolve to the same account a UUID request
-/// would on an offline server.
+/// The Minecraft *offline-mode* UUID for `name`
+/// (`UUID.nameUUIDFromBytes("OfflinePlayer:" + name)` — an MD5 v3 name UUID).
+/// Used to give demo merchants stable backing-account ids.
 pub fn offline_uuid(name: &str) -> Uuid {
     let digest = md5::compute(format!("OfflinePlayer:{name}").as_bytes());
     let mut b = digest.0; // [u8; 16]
@@ -41,27 +61,14 @@ pub fn offline_uuid(name: &str) -> Uuid {
     Uuid::from_bytes(b)
 }
 
-/// Resolve a request's identity to a canonical account_id: prefer a valid
-/// `mc_uuid`, else derive the offline UUID from `mcid`. Returns `None` if neither
-/// is usable.
-pub fn resolve_account_id(mc_uuid: Option<&str>, mcid: Option<&str>) -> Option<String> {
-    if let Some(u) = mc_uuid.and_then(normalize_uuid) {
-        return Some(u);
-    }
-    mcid.map(|n| n.trim())
-        .filter(|n| !n.is_empty())
-        .map(|n| offline_uuid(n).hyphenated().to_string())
-}
-
 /// A stable, cosmetic 16-digit "card number" (grouped in 4s) derived from the
-/// account UUID — purely for the card face in the design, never an identifier.
+/// account id — purely for the card face in the design, never an identifier.
 pub fn card_number_for(account_id: &str) -> String {
     let digest = md5::compute(account_id.as_bytes());
     let mut n: u64 = 0;
     for b in &digest.0[..8] {
         n = n.wrapping_mul(131).wrapping_add(u64::from(*b));
     }
-    // 16 digits in 5000_0000_0000_0000 ..= 9999_9999_9999_9999 (card-like leading digit).
     let span = 5_000_000_000_000_000u64;
     let sixteen = 5_000_000_000_000_000u64 + (n % span);
     let s = format!("{sixteen:016}");
@@ -72,7 +79,8 @@ pub fn card_number_for(account_id: &str) -> String {
 fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     Ok(Account {
         account_id: row.get("account_id")?,
-        mcid: row.get("mcid")?,
+        handle: row.get("handle")?,
+        display_name: row.get("display_name")?,
         balance: row.get("balance")?,
         holder: row.get("holder")?,
         card_number: row.get("card_number")?,
@@ -84,7 +92,7 @@ fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
 /// Fetch an account by id, if it exists.
 pub fn get(conn: &Connection, account_id: &str) -> rusqlite::Result<Option<Account>> {
     conn.query_row(
-        "SELECT account_id, mcid, balance, holder, card_number, card_expiry, is_merchant \
+        "SELECT account_id, handle, display_name, balance, holder, card_number, card_expiry, is_merchant \
          FROM accounts WHERE account_id = ?1",
         [account_id],
         row_to_account,
@@ -92,53 +100,38 @@ pub fn get(conn: &Connection, account_id: &str) -> rusqlite::Result<Option<Accou
     .optional()
 }
 
-/// Get the account for `account_id`, creating it (zero balance, derived card
-/// face) on first sight. Refreshes `mcid`/`holder` when a newer name is supplied.
-/// Must be called inside the caller's transaction when atomicity with a balance
-/// change is required.
-pub fn get_or_create(
+/// Record (idempotently) that `account_id` owns Minecraft character `mc_uuid`.
+/// Called on charge — the gameUuid is runtime-attested in-world, so this is a
+/// verified link. Refreshes the cached `mcid` (latest name) on conflict.
+pub fn link_mc(
     conn: &Connection,
     account_id: &str,
+    mc_uuid: &str,
     mcid: Option<&str>,
-) -> rusqlite::Result<Account> {
-    if let Some(mut acct) = get(conn, account_id)? {
-        // Keep the display name fresh when the client reports a (newer) name.
-        if let Some(name) = mcid.map(str::trim).filter(|n| !n.is_empty()) {
-            if acct.mcid.as_deref() != Some(name) {
-                let now = now_ms();
-                conn.execute(
-                    "UPDATE accounts SET mcid = ?2, holder = ?3, updated_unix_ms = ?4 \
-                     WHERE account_id = ?1",
-                    rusqlite::params![account_id, name, holder_from(name), now],
-                )?;
-                acct.mcid = Some(name.to_string());
-                acct.holder = holder_from(name);
-            }
-        }
-        return Ok(acct);
-    }
-
-    let now = now_ms();
-    let holder = mcid.map(holder_from).unwrap_or_else(|| "PLAYER".to_string());
-    let card = card_number_for(account_id);
+) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO accounts \
-           (account_id, mcid, balance, holder, card_number, card_expiry, is_merchant, created_unix_ms, updated_unix_ms) \
-         VALUES (?1, ?2, 0, ?3, ?4, '07/29', 0, ?5, ?5)",
-        rusqlite::params![account_id, mcid, holder, card, now],
+        "INSERT INTO account_mc_links (account_id, mc_uuid, mcid, linked_unix_ms) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(account_id, mc_uuid) DO UPDATE SET \
+           mcid = COALESCE(excluded.mcid, account_mc_links.mcid)",
+        params![account_id, mc_uuid, mcid, now_ms()],
     )?;
-    Ok(Account {
-        account_id: account_id.to_string(),
-        mcid: mcid.map(str::to_string),
-        balance: 0,
-        holder,
-        card_number: card,
-        card_expiry: "07/29".to_string(),
-        is_merchant: false,
-    })
+    Ok(())
 }
 
-/// The card-face holder string for a player name (uppercased, ASCII-ish display).
-fn holder_from(name: &str) -> String {
-    name.to_uppercase()
+/// The Minecraft characters linked to an account (most recent first).
+pub fn linked_mc(conn: &Connection, account_id: &str) -> rusqlite::Result<Vec<LinkedMc>> {
+    let mut stmt = conn.prepare(
+        "SELECT mc_uuid, mcid FROM account_mc_links \
+         WHERE account_id = ?1 ORDER BY linked_unix_ms DESC",
+    )?;
+    let rows = stmt
+        .query_map([account_id], |r| {
+            Ok(LinkedMc {
+                mc_uuid: r.get(0)?,
+                mcid: r.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }

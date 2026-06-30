@@ -40,6 +40,16 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+
+    /// A missing/invalid/expired session — the `AuthedAccount` extractor's
+    /// rejection. The app treats `401` as "log in again".
+    pub fn unauthorized(detail: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            detail: detail.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

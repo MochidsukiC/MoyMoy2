@@ -19,8 +19,11 @@ pub type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
 /// The v1 schema baseline (idempotent `CREATE IF NOT EXISTS`).
 const SCHEMA_V1: &str = include_str!("schema.sql");
+/// The v2 delta: independent MoyMoy accounts (handle + PIN), sessions, MC links
+/// (additive ALTERs + new tables; resets legacy mc_uuid-keyed wallet data).
+const SCHEMA_V2: &str = include_str!("schema_v2.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -65,7 +68,14 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 1;
         tracing::info!("sqlite migrated to schema v1");
     }
-    // Future: `if version < 2 { ...; version = 2; }`
+    if version < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V2)?;
+        tx.commit()?;
+        version = 2;
+        tracing::info!("sqlite migrated to schema v2 (independent MoyMoy accounts)");
+    }
+    // Future: `if version < 3 { ...; version = 3; }`
     conn.pragma_update(None, "user_version", version)?;
     Ok(())
 }

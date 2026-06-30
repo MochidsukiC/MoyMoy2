@@ -31,6 +31,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 md5 = "0.7"  # Minecraft offline-mode player UUID (nameUUIDFromBytes of "OfflinePlayer:<name>")
 
+# Independent-account auth: Argon2id for PINs (never store plaintext), SHA-256 for
+# session-token hashes (fast per-request verify), a CSPRNG for token bytes, and
+# base64 for opaque token/hash encoding. All pure-Rust, no ring/system deps.
+argon2 = "0.5"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+
 # SQLite — bundled so there is no system libsqlite dependency. r2d2 pool for
 # read concurrency under WAL; writers serialize on BEGIN IMMEDIATE + busy_timeout.
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -46,14 +46,15 @@ impl ChargeCoordinator {
         self.bus.is_some()
     }
 
-    /// Query the player's chargeable inventory via the mod. Only reached when
-    /// `can_charge()` is true (the inventory handler short-circuits otherwise).
-    pub async fn query_inventory(&self, account_id: &str) -> Result<Inventory, ApiError> {
+    /// Query a Minecraft character's chargeable inventory via the mod, keyed by
+    /// `mc_uuid` (the current gameUuid — distinct from the MoyMoy account_id since
+    /// v2). Only reached when `can_charge()` is true.
+    pub async fn query_inventory(&self, mc_uuid: &str) -> Result<Inventory, ApiError> {
         let bus = self
             .bus
             .as_ref()
             .ok_or_else(|| ApiError::internal("charge unavailable"))?;
-        let uuid = Uuid::parse_str(account_id)
+        let uuid = Uuid::parse_str(mc_uuid)
             .map_err(|_| ApiError::bad_request("mc_uuid is not a UUID"))?;
         match bus.query_inventory(&uuid).await {
             Some((emeralds, blocks)) => Ok(Inventory {
@@ -71,12 +72,16 @@ impl ChargeCoordinator {
     }
 
     /// Begin an emerald charge: record a pending `emerald_ops` row (idempotent on
-    /// `idem_key`), send the consume command to the mod, and return a pollable op
-    /// (`GET /wallet/op`). The balance is credited later, on the mod's ack.
+    /// `idem_key`), auto-link the Minecraft character to the MoyMoy account, send
+    /// the consume command to the mod, and return a pollable op (`GET /wallet/op`).
+    /// The balance is credited later, on the mod's ack — to `account_id` (the
+    /// MoyMoy account), while consumption is routed by `mc_uuid` (the character).
     pub async fn begin_charge(
         &self,
         idem_key: &str,
         account_id: &str,
+        mc_uuid: &str,
+        mcid: Option<&str>,
         amount: i64,
     ) -> Result<Value, ApiError> {
         if amount <= 0 || amount > wallet::MAX_AMOUNT {
@@ -87,10 +92,12 @@ impl ChargeCoordinator {
             None => return Ok(json!({ "ok": false, "error": "mc_unavailable" })),
         };
 
-        // 1. Create (or replay) the op in one transaction.
+        // 1. Create (or replay) the op + link the character in one transaction.
         let pool = self.pool.clone();
         let ik = idem_key.to_string();
         let aid = account_id.to_string();
+        let muuid = mc_uuid.to_string();
+        let mcid_owned = mcid.map(str::to_string);
         let (op_id, fresh) = tokio::task::spawn_blocking(move || -> Result<(String, bool), ApiError> {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -104,9 +111,12 @@ impl ChargeCoordinator {
             tx.execute(
                 "INSERT INTO emerald_ops \
                    (op_id, idem_key, account_id, mc_uuid, direction, requested_amount, settled_amount, state, created_unix_ms, updated_unix_ms) \
-                 VALUES (?1, ?2, ?3, ?3, 'charge', ?4, NULL, 'pending', ?5, ?5)",
-                params![op_id, ik, aid, amount, now],
+                 VALUES (?1, ?2, ?3, ?4, 'charge', ?5, NULL, 'pending', ?6, ?6)",
+                params![op_id, ik, aid, muuid, amount, now],
             )?;
+            // Auto-link the character to this account (verified: the gameUuid is
+            // runtime-attested in-world).
+            crate::identity::link_mc(&tx, &aid, &muuid, mcid_owned.as_deref())?;
             let resp = json!({ "ok": true, "op_id": op_id, "state": "pending" });
             db::idem_put(&tx, &ik, "charge", &resp.to_string())?;
             tx.commit()?;
@@ -121,8 +131,9 @@ impl ChargeCoordinator {
             return Ok(json!({ "ok": true, "op_id": op_id, "state": "pending", "duplicate": true }));
         }
 
-        // 2. Ask the mod to consume the emeralds (auto-routed to the live server).
-        let uuid = match Uuid::parse_str(account_id) {
+        // 2. Ask the mod to consume the emeralds (auto-routed to the live server
+        //    by the character's mc_uuid).
+        let uuid = match Uuid::parse_str(mc_uuid) {
             Ok(u) => u,
             Err(_) => {
                 self.set_state(&op_id, "failed").await;
@@ -152,7 +163,7 @@ impl ChargeCoordinator {
                 Err(_) => return Vec::new(),
             };
             let mut stmt = match conn.prepare(
-                "SELECT op_id, idem_key, account_id, requested_amount FROM emerald_ops \
+                "SELECT op_id, idem_key, mc_uuid, requested_amount FROM emerald_ops \
                  WHERE state IN ('pending','sent') ORDER BY created_unix_ms ASC LIMIT 50",
             ) {
                 Ok(s) => s,
@@ -168,8 +179,10 @@ impl ChargeCoordinator {
             Err(_) => return,
         };
 
-        for (op_id, idem_key, account_id, amount) in ops {
-            if let Ok(uuid) = Uuid::parse_str(&account_id) {
+        // Re-send routed by the character's mc_uuid; the credit on settle still
+        // lands on the op's account_id (see settle_ack).
+        for (op_id, idem_key, mc_uuid, amount) in ops {
+            if let Ok(uuid) = Uuid::parse_str(&mc_uuid) {
                 if let SendOutcome::Sent = bus.send_charge(&uuid, &op_id, &idem_key, amount).await {
                     self.set_state(&op_id, "sent").await;
                 }
@@ -255,22 +268,25 @@ pub fn settle_ack(conn: &mut Connection, ack: &Value) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Read an `emerald_ops` row as a pollable view, if it exists. Works without the
-/// command bus (pure ledger read).
-pub fn op_view(conn: &Connection, op_id: &str) -> rusqlite::Result<Option<Value>> {
+/// Read an `emerald_ops` row as `(owner_account_id, pollable view)`, if it
+/// exists. The caller checks ownership (a session may only poll its own ops).
+/// Works without the command bus (pure ledger read).
+pub fn op_view(conn: &Connection, op_id: &str) -> rusqlite::Result<Option<(String, Value)>> {
     conn.query_row(
-        "SELECT op_id, direction, requested_amount, settled_amount, state, updated_unix_ms \
+        "SELECT op_id, account_id, direction, requested_amount, settled_amount, state, updated_unix_ms \
          FROM emerald_ops WHERE op_id = ?1",
         [op_id],
         |row| {
-            Ok(json!({
+            let account_id: String = row.get(1)?;
+            let view = json!({
                 "op_id": row.get::<_, String>(0)?,
-                "direction": row.get::<_, String>(1)?,
-                "requested_amount": row.get::<_, i64>(2)?,
-                "settled_amount": row.get::<_, Option<i64>>(3)?,
-                "state": row.get::<_, String>(4)?,
-                "updated_ms": row.get::<_, i64>(5)?,
-            }))
+                "direction": row.get::<_, String>(2)?,
+                "requested_amount": row.get::<_, i64>(3)?,
+                "settled_amount": row.get::<_, Option<i64>>(4)?,
+                "state": row.get::<_, String>(5)?,
+                "updated_ms": row.get::<_, i64>(6)?,
+            });
+            Ok((account_id, view))
         },
     )
     .optional()

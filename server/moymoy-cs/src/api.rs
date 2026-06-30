@@ -3,23 +3,34 @@
 //! with a permissive CORS layer (the rein/piggleshop pattern). Every DB call runs
 //! in `spawn_blocking` (rusqlite is synchronous).
 //!
-//! Endpoints (design-derived from "MochiOS Mobile.html"):
+//! Identity (v2): callers authenticate with a MoyMoy account (handle + PIN — see
+//! [`crate::auth`]). Wallet endpoints resolve the account from the
+//! `X-MoyMoy-Session` header via the [`AuthedAccount`] extractor — no more
+//! self-asserted mc_uuid. The Minecraft UUID is supplied only for charge /
+//! inventory (the character whose emeralds to consume).
+//!
+//! Endpoints:
 //!   GET  /healthz
 //!   GET  /wallet/status
-//!   GET  /wallet/home?mc_uuid=&mcid=
-//!   GET  /wallet/history?mc_uuid=&limit=&filter=
-//!   GET  /wallet/friends?mc_uuid=
-//!   GET  /wallet/merchants
-//!   GET  /wallet/inventory?mc_uuid=        (mod-backed; degrades when can_charge=false)
-//!   POST /wallet/send      {idem_key, from_uuid|from_mcid, to_uuid|to_mcid, amount, memo?}
-//!   POST /wallet/pay       {idem_key, mc_uuid|mcid, merchant_id, amount, memo?}
-//!   POST /wallet/charge    {idem_key, mc_uuid, mcid?, amount}
-//!   GET  /wallet/op?op_id=
+//!   POST /auth/register   {handle, display_name, pin, phone_id?}
+//!   POST /auth/login      {handle, pin, phone_id?}
+//!   POST /auth/logout     (X-MoyMoy-Session)
+//!   GET  /auth/me         (auth)
+//!   GET  /auth/lookup?handle=            (auth — send-target resolution)
+//!   GET  /wallet/home     (auth)
+//!   GET  /wallet/history?limit=&filter=  (auth)
+//!   GET  /wallet/friends  (auth)
+//!   GET  /wallet/merchants (auth)
+//!   GET  /wallet/inventory?mc_uuid=&mcid= (auth; mod-backed)
+//!   POST /wallet/send     {idem_key, to_handle, amount}            (auth)
+//!   POST /wallet/pay      {idem_key, merchant_id, amount}          (auth)
+//!   POST /wallet/charge   {idem_key, amount, mc_uuid, mcid?}       (auth)
+//!   GET  /wallet/op?op_id=                                         (auth)
 
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::{header, Method};
+use axum::http::{header, HeaderMap, HeaderName, Method};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -27,10 +38,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::auth::{self, AuthedAccount, LoginOutcome, RegisterOutcome};
 use crate::charge::ChargeCoordinator;
 use crate::db::{self, Pool};
 use crate::error::ApiError;
-use crate::identity::{self};
+use crate::identity;
 use crate::wallet::{self, TxResult};
 
 /// Shared handler state (cheap to clone — the pool and coordinator are `Arc`-ish).
@@ -50,11 +62,22 @@ pub fn router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static(auth::SESSION_HEADER),
+        ]);
 
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/wallet/status", get(status))
+        // Auth (independent MoyMoy accounts).
+        .route("/auth/register", post(register))
+        .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
+        .route("/auth/me", get(me))
+        .route("/auth/lookup", get(lookup))
+        // Wallet (session-authenticated).
         .route("/wallet/home", get(home))
         .route("/wallet/history", get(history))
         .route("/wallet/friends", get(friends))
@@ -71,34 +94,136 @@ pub fn router(state: AppState) -> Router {
         .layer(cors)
 }
 
-// ── shared query helpers ─────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct WhoQuery {
-    mc_uuid: Option<String>,
-    mcid: Option<String>,
-}
-
-/// Resolve a query's identity to a canonical account_id, or a `bad_request`.
-fn require_account_id(mc_uuid: Option<&str>, mcid: Option<&str>) -> Result<String, ApiError> {
-    identity::resolve_account_id(mc_uuid, mcid)
-        .ok_or_else(|| ApiError::bad_request("mc_uuid or mcid required"))
-}
-
-// ── GET handlers ─────────────────────────────────────────────────────────────
+// ── status ───────────────────────────────────────────────────────────────────
 
 async fn status(State(st): State<AppState>) -> impl IntoResponse {
     Json(json!({ "ok": true, "app": "moymoy", "can_charge": st.can_charge() }))
 }
 
-async fn home(
+// ── auth ─────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RegisterReq {
+    handle: String,
+    display_name: String,
+    pin: String,
+    phone_id: Option<String>,
+}
+
+async fn register(
     State(st): State<AppState>,
-    Query(q): Query<WhoQuery>,
+    Json(req): Json<RegisterReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let account_id = require_account_id(q.mc_uuid.as_deref(), q.mcid.as_deref())?;
+    let value = blocking(st.pool, move |conn| {
+        // IMMEDIATE so the handle-uniqueness check + insert are one atomic unit.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let outcome = auth::register(
+            &tx,
+            &req.handle,
+            &req.display_name,
+            &req.pin,
+            req.phone_id.as_deref(),
+        )?;
+        let v = match outcome {
+            RegisterOutcome::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
+            RegisterOutcome::BadHandle => json!({ "ok": false, "error": "bad_handle" }),
+            RegisterOutcome::BadPin => json!({ "ok": false, "error": "bad_pin" }),
+            RegisterOutcome::BadDisplayName => json!({ "ok": false, "error": "bad_display_name" }),
+            RegisterOutcome::HandleTaken => json!({ "ok": false, "error": "handle_taken" }),
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    handle: String,
+    pin: String,
+    phone_id: Option<String>,
+}
+
+async fn login(
+    State(st): State<AppState>,
+    Json(req): Json<LoginReq>,
+) -> Result<Json<Value>, ApiError> {
+    let value = blocking(st.pool, move |conn| {
+        // IMMEDIATE so the attempt-counter update / session mint commit atomically.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let outcome = auth::login(&tx, &req.handle, &req.pin, req.phone_id.as_deref())?;
+        let v = match outcome {
+            LoginOutcome::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
+            LoginOutcome::Invalid => json!({ "ok": false, "error": "invalid_credentials" }),
+            LoginOutcome::Locked { retry_after_ms } => {
+                json!({ "ok": false, "error": "locked", "retry_after_ms": retry_after_ms })
+            }
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let token = headers
+        .get(auth::SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(tok) = token {
+        blocking(st.pool, move |conn| {
+            auth::logout(conn, &tok)?;
+            Ok::<(), ApiError>(())
+        })
+        .await?;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn me(State(st): State<AppState>, acct: AuthedAccount) -> Result<Json<Value>, ApiError> {
+    let id = acct.account_id;
+    let (view, links) = blocking(st.pool, move |conn| {
+        let view = auth::account_view(conn, &id)?
+            .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
+        let links = identity::linked_mc(conn, &id)?;
+        Ok::<_, ApiError>((view, links))
+    })
+    .await?;
+    Ok(Json(json!({ "ok": true, "account": view, "linked_mc": links })))
+}
+
+#[derive(Deserialize)]
+struct LookupQuery {
+    handle: String,
+}
+
+async fn lookup(
+    State(st): State<AppState>,
+    _acct: AuthedAccount,
+    Query(q): Query<LookupQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let v = blocking(st.pool, move |conn| {
+        let found = auth::lookup_handle(conn, &q.handle)?;
+        Ok::<Value, ApiError>(match found {
+            Some(a) => json!({ "ok": true, "account": a }),
+            None => json!({ "ok": false, "error": "not_found" }),
+        })
+    })
+    .await?;
+    Ok(Json(v))
+}
+
+// ── wallet GET ───────────────────────────────────────────────────────────────
+
+async fn home(State(st): State<AppState>, acct: AuthedAccount) -> Result<Json<Value>, ApiError> {
     let can_charge = st.can_charge();
+    let id = acct.account_id;
     let view = blocking(st.pool, move |conn| {
-        wallet::home(conn, &account_id, q.mcid.as_deref()).map_err(ApiError::from)
+        wallet::home(conn, &id)?.ok_or_else(|| ApiError::internal("authed account missing"))
     })
     .await?;
     Ok(Json(json!({
@@ -112,39 +237,38 @@ async fn home(
 
 #[derive(Deserialize)]
 struct HistoryQuery {
-    mc_uuid: Option<String>,
-    mcid: Option<String>,
     limit: Option<i64>,
     filter: Option<String>,
 }
 
 async fn history(
     State(st): State<AppState>,
+    acct: AuthedAccount,
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let account_id = require_account_id(q.mc_uuid.as_deref(), q.mcid.as_deref())?;
+    let id = acct.account_id;
     let limit = q.limit.unwrap_or(50);
     let filter = q.filter.unwrap_or_else(|| "all".to_string());
     let txns = blocking(st.pool, move |conn| {
-        wallet::history(conn, &account_id, limit, &filter).map_err(ApiError::from)
+        wallet::history(conn, &id, limit, &filter).map_err(ApiError::from)
     })
     .await?;
     Ok(Json(json!({ "ok": true, "txns": txns })))
 }
 
-async fn friends(
-    State(st): State<AppState>,
-    Query(q): Query<WhoQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let account_id = require_account_id(q.mc_uuid.as_deref(), q.mcid.as_deref())?;
+async fn friends(State(st): State<AppState>, acct: AuthedAccount) -> Result<Json<Value>, ApiError> {
+    let id = acct.account_id;
     let list = blocking(st.pool, move |conn| {
-        wallet::friends(conn, &account_id).map_err(ApiError::from)
+        wallet::friends(conn, &id).map_err(ApiError::from)
     })
     .await?;
     Ok(Json(json!({ "ok": true, "friends": list })))
 }
 
-async fn merchants(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn merchants(
+    State(st): State<AppState>,
+    _acct: AuthedAccount,
+) -> Result<Json<Value>, ApiError> {
     let list = blocking(st.pool, move |conn| {
         wallet::merchants(conn).map_err(ApiError::from)
     })
@@ -152,18 +276,34 @@ async fn merchants(State(st): State<AppState>) -> Result<Json<Value>, ApiError> 
     Ok(Json(json!({ "ok": true, "merchants": list })))
 }
 
+#[derive(Deserialize)]
+struct InventoryQuery {
+    mc_uuid: Option<String>,
+    #[allow(dead_code)]
+    mcid: Option<String>,
+}
+
 async fn inventory(
     State(st): State<AppState>,
-    Query(q): Query<WhoQuery>,
+    _acct: AuthedAccount,
+    Query(q): Query<InventoryQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let account_id = require_account_id(q.mc_uuid.as_deref(), q.mcid.as_deref())?;
     if !st.can_charge() {
         return Ok(Json(json!({
             "ok": false, "error": "mc_unavailable", "can_charge": false,
             "emeralds": 0, "blocks": 0, "chargeable": 0,
         })));
     }
-    let inv = st.charge.query_inventory(&account_id).await?;
+    let mc_uuid = match q.mc_uuid.as_deref().and_then(identity::normalize_uuid) {
+        Some(u) => u,
+        None => {
+            return Ok(Json(json!({
+                "ok": false, "error": "no_character", "can_charge": true,
+                "emeralds": 0, "blocks": 0, "chargeable": 0,
+            })))
+        }
+    };
+    let inv = st.charge.query_inventory(&mc_uuid).await?;
     Ok(Json(json!({
         "ok": true, "can_charge": true,
         "emeralds": inv.emeralds, "blocks": inv.blocks, "chargeable": inv.chargeable,
@@ -177,73 +317,59 @@ struct OpQuery {
 
 async fn op_status(
     State(st): State<AppState>,
+    acct: AuthedAccount,
     Query(q): Query<OpQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let id = acct.account_id;
     let op = blocking(st.pool, move |conn| {
         crate::charge::op_view(conn, &q.op_id).map_err(ApiError::from)
     })
     .await?;
+    // Only the owning account may poll an op (don't leak others' op state).
     match op {
-        Some(v) => Ok(Json(json!({ "ok": true, "op": v }))),
-        None => Ok(Json(json!({ "ok": false, "error": "unknown_op" }))),
+        Some((owner, view)) if owner == id => Ok(Json(json!({ "ok": true, "op": view }))),
+        _ => Ok(Json(json!({ "ok": false, "error": "unknown_op" }))),
     }
 }
 
-// ── POST handlers ────────────────────────────────────────────────────────────
+// ── wallet POST ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct SendReq {
     idem_key: String,
-    from_uuid: Option<String>,
-    from_mcid: Option<String>,
-    to_uuid: Option<String>,
-    to_mcid: Option<String>,
+    to_handle: String,
     amount: i64,
 }
 
 async fn send(
     State(st): State<AppState>,
+    acct: AuthedAccount,
     Json(req): Json<SendReq>,
 ) -> Result<Json<Value>, ApiError> {
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
-    let from_id = require_account_id(req.from_uuid.as_deref(), req.from_mcid.as_deref())?;
-    let to_id = match identity::resolve_account_id(req.to_uuid.as_deref(), req.to_mcid.as_deref()) {
-        Some(id) => id,
-        None => return Ok(Json(json!({ "ok": false, "error": "unknown_target" }))),
-    };
-    let to_name = req.to_mcid.clone();
-    let from_name = req.from_mcid.clone();
-    let label = to_name
-        .clone()
-        .map(|n| format!("{n} へ送金"))
-        .unwrap_or_else(|| "送金".to_string());
-
+    let from_id = acct.account_id;
     let value = blocking(st.pool, move |conn| {
-        // Single BEGIN IMMEDIATE: the idem check-reserve-execute-record is one
-        // atomic unit, so concurrent retries of the same idem_key serialize and
-        // the second one replays (no TOCTOU double-spend).
+        // Single BEGIN IMMEDIATE: idem check-reserve-execute-record is one atomic
+        // unit, so concurrent retries of the same idem_key serialize and the
+        // second one replays (no TOCTOU double-spend).
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(prev) = db::idem_get(&tx, &req.idem_key, "send")? {
             return Ok(replay(prev)); // tx drops → rollback (read-only path)
         }
-        let result = wallet::transfer(
-            &tx,
-            &from_id,
-            from_name.as_deref(),
-            &to_id,
-            to_name.as_deref(),
-            req.amount,
-            "send",
-            &label,
-        )?;
+        let to = match auth::lookup_handle(&tx, &req.to_handle)? {
+            Some(a) => a,
+            None => return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" })),
+        };
+        let label = format!("@{} へ送金", to.handle);
+        let result = wallet::transfer(&tx, &from_id, &to.account_id, req.amount, "send", &label)?;
         let (v, ok) = tx_result_json(result);
         if ok {
             db::idem_put(&tx, &req.idem_key, "send", &v.to_string())?;
         }
         tx.commit()?;
-        Ok::<Value, ApiError>(v)
+        Ok(v)
     })
     .await?;
     Ok(Json(value))
@@ -252,19 +378,19 @@ async fn send(
 #[derive(Deserialize)]
 struct PayReq {
     idem_key: String,
-    mc_uuid: Option<String>,
-    mcid: Option<String>,
     merchant_id: String,
     amount: i64,
 }
 
-async fn pay(State(st): State<AppState>, Json(req): Json<PayReq>) -> Result<Json<Value>, ApiError> {
+async fn pay(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PayReq>,
+) -> Result<Json<Value>, ApiError> {
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
-    let from_id = require_account_id(req.mc_uuid.as_deref(), req.mcid.as_deref())?;
-    let from_name = req.mcid.clone();
-
+    let from_id = acct.account_id;
     let value = blocking(st.pool, move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(prev) = db::idem_get(&tx, &req.idem_key, "pay")? {
@@ -272,24 +398,15 @@ async fn pay(State(st): State<AppState>, Json(req): Json<PayReq>) -> Result<Json
         }
         let (to_id, merchant_name) = match wallet::merchant_account(&tx, &req.merchant_id)? {
             Some(m) => m,
-            None => return Ok(json!({ "ok": false, "error": "unknown_target" })),
+            None => return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" })),
         };
-        let result = wallet::transfer(
-            &tx,
-            &from_id,
-            from_name.as_deref(),
-            &to_id,
-            Some(&merchant_name),
-            req.amount,
-            "pay",
-            &merchant_name,
-        )?;
+        let result = wallet::transfer(&tx, &from_id, &to_id, req.amount, "pay", &merchant_name)?;
         let (v, ok) = tx_result_json(result);
         if ok {
             db::idem_put(&tx, &req.idem_key, "pay", &v.to_string())?;
         }
         tx.commit()?;
-        Ok::<Value, ApiError>(v)
+        Ok(v)
     })
     .await?;
     Ok(Json(value))
@@ -298,37 +415,46 @@ async fn pay(State(st): State<AppState>, Json(req): Json<PayReq>) -> Result<Json
 #[derive(Deserialize)]
 struct ChargeReq {
     idem_key: String,
+    amount: i64,
     mc_uuid: Option<String>,
     mcid: Option<String>,
-    amount: i64,
 }
 
 async fn charge(
     State(st): State<AppState>,
+    acct: AuthedAccount,
     Json(req): Json<ChargeReq>,
 ) -> Result<Json<Value>, ApiError> {
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
-    let account_id = require_account_id(req.mc_uuid.as_deref(), req.mcid.as_deref())?;
     if !st.can_charge() {
         return Ok(Json(json!({ "ok": false, "error": "mc_unavailable" })));
     }
+    let mc_uuid = match req.mc_uuid.as_deref().and_then(identity::normalize_uuid) {
+        Some(u) => u,
+        None => return Ok(Json(json!({ "ok": false, "error": "no_character" }))),
+    };
     let value = st
         .charge
-        .begin_charge(&req.idem_key, &account_id, req.amount)
+        .begin_charge(
+            &req.idem_key,
+            &acct.account_id,
+            &mc_uuid,
+            req.mcid.as_deref(),
+            req.amount,
+        )
         .await?;
     Ok(Json(value))
 }
 
 #[derive(Deserialize)]
 struct DevCreditReq {
-    mc_uuid: Option<String>,
-    mcid: Option<String>,
+    handle: String,
     amount: i64,
 }
 
-/// Dev-only: credit an account directly (MC-less E2E funding). Gated by
+/// Dev-only: credit an account directly by handle (MC-less E2E funding). Gated by
 /// `MOYMOY_DEV_CREDIT=1`; returns 403 otherwise.
 async fn dev_credit(
     State(st): State<AppState>,
@@ -340,17 +466,24 @@ async fn dev_credit(
     if req.amount <= 0 || req.amount > wallet::MAX_AMOUNT {
         return Err(ApiError::bad_request("bad amount"));
     }
-    let account_id = require_account_id(req.mc_uuid.as_deref(), req.mcid.as_deref())?;
-    let mcid = req.mcid.clone();
-    let balance = blocking(st.pool, move |conn| {
+    let value = blocking(st.pool, move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        identity::get_or_create(&tx, &account_id, mcid.as_deref())?;
-        let after = wallet::credit_charge(&tx, &account_id, req.amount, db::now_ms(), "開発用クレジット")?;
+        let acct = match auth::lookup_handle(&tx, &req.handle)? {
+            Some(a) => a,
+            None => return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" })),
+        };
+        let after = wallet::credit_charge(
+            &tx,
+            &acct.account_id,
+            req.amount,
+            db::now_ms(),
+            "開発用クレジット",
+        )?;
         tx.commit()?;
-        Ok::<i64, ApiError>(after)
+        Ok(json!({ "ok": true, "balance": after }))
     })
     .await?;
-    Ok(Json(json!({ "ok": true, "balance": balance })))
+    Ok(Json(value))
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

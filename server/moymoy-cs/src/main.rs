@@ -11,6 +11,7 @@
 //!     bus; degrades to wallet-only when no MC cert is configured.
 
 mod api;
+mod auth;
 mod charge;
 mod command_bus;
 mod db;
