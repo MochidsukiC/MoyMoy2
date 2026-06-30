@@ -302,7 +302,10 @@ function MoyBottomNav({ tab, onTab }) {
 }
 
 /* ─── ヘッダ ─────────────────────────────────────────────────────── */
-function MoyHeader({ onClose }) {
+function MoyHeader({ onClose, account, onMenu }) {
+  const initial = account
+    ? (Array.from(account.display_name || account.handle || "?")[0] || "?")
+    : null;
   return (
     <div style={{ flexShrink: 0, paddingTop: 56, paddingLeft: 18, paddingRight: 18, paddingBottom: 12,
       display: "flex", alignItems: "center", justifyContent: "space-between",
@@ -323,7 +326,16 @@ function MoyHeader({ onClose }) {
         <span style={{ fontFamily: "'Archivo', var(--font-sans)", fontWeight: 800, fontSize: 18,
           letterSpacing: "-0.02em" }}>MoyMoy</span>
       </div>
-      <div style={{ width: 30 }} />
+      {onMenu && account ? (
+        <button onClick={onMenu} aria-label="account" style={{ position: "relative", zIndex: 1,
+          width: 32, height: 32, flexShrink: 0, border: "1.5px solid #fff", background: "rgba(255,255,255,0.18)",
+          color: "#fff", cursor: "pointer", display: "grid", placeItems: "center",
+          fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15, padding: 0 }}>
+          {initial}
+        </button>
+      ) : (
+        <div style={{ width: 32 }} />
+      )}
     </div>
   );
 }

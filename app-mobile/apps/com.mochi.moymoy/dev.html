@@ -38,10 +38,11 @@
     <script type="text/babel" src="wallet/crystal.jsx"></script>
     <script type="text/babel" src="wallet/moymoy.jsx"></script>
     <script type="text/babel" src="wallet/moymoy-screens.jsx"></script>
+    <script type="text/babel" src="wallet/moymoy-auth.jsx"></script>
 
     <script type="text/babel" data-presets="react">
       const root = ReactDOM.createRoot(document.getElementById("root"));
-      root.render(<MoyMoyApp onClose={() => alert("HOME (dev)")} />);
+      root.render(<MoyMoyRoot onClose={() => alert("HOME (dev)")} />);
     </script>
   </body>
 </html>

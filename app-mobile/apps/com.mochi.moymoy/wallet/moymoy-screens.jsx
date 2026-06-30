@@ -146,24 +146,59 @@ function MoyPay({ merchants = [], onPick }) {
   );
 }
 
-/* ─── 送る (友達) ───────────────────────────────────────────────── */
+/* ─── 送る (MoyMoy ID 指定 + 最近の相手) ────────────────────────── */
 function MoySend({ friends = [], onPick }) {
   const [qy, setQy] = msState("");
+  const [busy, setBusy] = msState(false);
+  const [err, setErr] = msState("");
+  const cleanHandle = qy.trim().replace(/^@/, "");
   const shown = qy
-    ? friends.filter(f => (f.name + " " + (f.sub || "")).toLowerCase().includes(qy.toLowerCase()))
+    ? friends.filter(f => (f.name + " " + (f.sub || "") + " " + (f.handle || "")).toLowerCase().includes(cleanHandle.toLowerCase()))
     : friends;
+
+  async function resolveAndPick() {
+    const h = cleanHandle;
+    if (h.length < 3) { setErr("MoyMoy ID（3文字以上）を入力してください"); return; }
+    setBusy(true); setErr("");
+    try {
+      const r = await MoyMoy.lookup(h);
+      if (r.ok && r.account) {
+        const name = r.account.display_name || ("@" + r.account.handle);
+        onPick({ id: r.account.account_id, handle: r.account.handle, name,
+          sub: "@" + r.account.handle, pal: "emerald", glyph: Array.from(name)[0] || "?" });
+      } else {
+        setErr("@" + h + " が見つかりません");
+      }
+    } catch (e) {
+      setErr("検索に失敗しました");
+    }
+    setBusy(false);
+  }
+
   return (
     <div style={{ padding: "0 0 120px" }}>
       <div style={{ padding: "16px 16px 10px" }}>
-        <div style={{ position: "relative" }}>
-          <input value={qy} onChange={e => setQy(e.target.value)} placeholder="名前 / @ID で検索"
-            style={{ width: "100%", padding: "12px 14px",
+        <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 6,
             border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)",
-            fontFamily: "var(--font-jp)", fontSize: 14, color: "var(--ink)", outline: "none" }} />
+            padding: "0 10px" }}>
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: 16, fontWeight: 700, color: "var(--ink-soft)" }}>@</span>
+            <input value={qy} onChange={e => { setQy(e.target.value); setErr(""); }}
+              onKeyDown={e => { if (e.key === "Enter") resolveAndPick(); }}
+              placeholder="MoyMoy ID で送る"
+              style={{ flex: 1, padding: "12px 4px", border: "none", background: "transparent",
+              fontFamily: "var(--font-jp)", fontSize: 14, color: "var(--ink)", outline: "none" }} />
+          </div>
+          <button disabled={busy || cleanHandle.length < 3} onClick={resolveAndPick} style={{
+            border: "1.5px solid #000", background: busy || cleanHandle.length < 3 ? "#bdbdbd" : "var(--moy)",
+            color: "#fff", boxShadow: busy || cleanHandle.length < 3 ? "none" : "3px 3px 0 #0B5A33",
+            cursor: busy || cleanHandle.length < 3 ? "default" : "pointer", padding: "0 16px",
+            fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15 }}>送る</button>
         </div>
+        {err && <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, color: "var(--carle-red)" }}>{err}</div>}
       </div>
       <div style={{ padding: "4px 16px 8px" }}>
-        <div className="h-section">フレンド</div>
+        <div className="h-section">最近の相手</div>
       </div>
       <div style={{ borderTop: "1.5px solid var(--ink)", borderBottom: "1.5px solid var(--ink)" }}>
         {shown.map(f => (
@@ -173,7 +208,7 @@ function MoySend({ friends = [], onPick }) {
         {shown.length === 0 && (
           <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",
             fontSize: 13, color: "var(--ink-soft)" }}>
-            {friends.length === 0 ? "まだ取引相手がいません" : "該当する相手がいません"}
+            {friends.length === 0 ? "まだ取引相手がいません。上の欄に MoyMoy ID を入力して送れます。" : "該当する相手がいません"}
           </div>
         )}
       </div>
@@ -432,14 +467,16 @@ const ERR_LABEL = {
   self_transfer: "自分自身には送れません",
   unknown_target: "相手が見つかりません",
   mc_unavailable: "Minecraft サーバーに接続されていません",
+  no_character: "Minecraft キャラクターが見つかりません",
   charge_pending: "チャージは保留中です（反映までお待ちください）",
+  unauthorized: "セッションが切れました。ログインし直してください",
 };
 function errLabel(code) {
   return ERR_LABEL[code] || "処理に失敗しました（" + (code || "error") + "）";
 }
 
 /* ─── オーケストレータ (moymoy.cs.mnn 配線) ─────────────────────── */
-function MoyMoyApp({ onClose }) {
+function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAccount, onLogoutAccount }) {
   const [balance, setBalance] = msState(0);
   const [profile, setProfile] = msState({ holder: "PLAYER", number: "•••• •••• •••• ••••", expiry: "07/29" });
   const [txns, setTxns] = msState([]);
@@ -455,6 +492,13 @@ function MoyMoyApp({ onClose }) {
   const [busy, setBusy] = msState(false);
   const [err, setErr] = msState(null);
   const [complete, setComplete] = msState(null);
+  const [menuOpen, setMenuOpen] = msState(false);
+  const [settingsOpen, setSettingsOpen] = msState(false);
+
+  // A session that expired mid-use ⇒ drop this account and re-authenticate.
+  function onExpired() {
+    if (account && onLogoutAccount) onLogoutAccount(account.account_id);
+  }
 
   const rootStyle = {
     "--moy": "#16A35A",
@@ -471,6 +515,8 @@ function MoyMoyApp({ onClose }) {
         setProfile(h.profile);
         setTxns(mapTxns(h.txns));
         setCanCharge(!!h.can_charge);
+      } else if (h.error === "unauthorized") {
+        onExpired();
       }
     } catch (e) { /* keep last good state */ }
   }
@@ -521,7 +567,7 @@ function MoyMoyApp({ onClose }) {
     try {
       let res;
       if (kind === "send") {
-        res = await MoyMoy.send({ uuid: target.id, mcid: target.mcid }, amount);
+        res = await MoyMoy.send(target.handle, amount);
       } else if (kind === "pay") {
         res = await MoyMoy.pay(target.id, amount);
       } else {
@@ -529,6 +575,7 @@ function MoyMoyApp({ onClose }) {
       }
 
       if (!res.ok) {
+        if (res.error === "unauthorized") { setBusy(false); setConfirm(null); onExpired(); return; }
         setErr(errLabel(res.error));
         setBusy(false);
         return;
@@ -567,7 +614,7 @@ function MoyMoyApp({ onClose }) {
   return (
     <div className="screen fade-in" style={{ position: "absolute", inset: 0, zIndex: 20,
       background: "var(--bg-white)", display: "flex", flexDirection: "column", ...rootStyle }}>
-      <MoyHeader onClose={onClose} />
+      <MoyHeader onClose={onClose} account={account} onMenu={() => setMenuOpen(true)} />
 
       <div style={{ flex: 1, overflow: "auto", position: "relative" }}>
         {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={setTab} />}
@@ -598,6 +645,17 @@ function MoyMoyApp({ onClose }) {
       {complete && (
         <CompleteOverlay {...complete} sound onClose={() => setComplete(null)} />
       )}
+
+      {/* account switcher + settings */}
+      <AccountMenu open={menuOpen} accounts={accounts} activeId={account ? account.account_id : null}
+        onSwitch={(id) => { setMenuOpen(false); if (onSwitchAccount) onSwitchAccount(id); }}
+        onAdd={() => { setMenuOpen(false); if (onAddAccount) onAddAccount(); }}
+        onLogout={(id) => { setMenuOpen(false); if (onLogoutAccount) onLogoutAccount(id); }}
+        onSettings={() => { setMenuOpen(false); setSettingsOpen(true); }}
+        onClose={() => setMenuOpen(false)} />
+      <SettingsSheet open={settingsOpen} account={account}
+        onLogout={() => { setSettingsOpen(false); if (account && onLogoutAccount) onLogoutAccount(account.account_id); }}
+        onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

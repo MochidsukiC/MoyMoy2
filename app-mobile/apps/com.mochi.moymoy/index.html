@@ -34,9 +34,12 @@
     <script type="text/babel" src="wallet/crystal.jsx"></script>
     <script type="text/babel" src="wallet/moymoy.jsx"></script>
     <script type="text/babel" src="wallet/moymoy-screens.jsx"></script>
+    <!-- Auth shell + multi-account (independent MoyMoy accounts). Loaded last so
+         it can wrap MoyMoyApp. -->
+    <script type="text/babel" src="wallet/moymoy-auth.jsx"></script>
 
-    <!-- Mount. MoyMoy is the whole app surface; the header HOME button asks the
-         OS to exit back to the launcher. -->
+    <!-- Mount. MoyMoyRoot gates the wallet behind handle+PIN auth; the header
+         HOME button asks the OS to exit back to the launcher. -->
     <script type="text/babel" data-presets="react">
       function exitToHome() {
         try {
@@ -47,7 +50,7 @@
         } catch (e) { /* in-world only */ }
       }
       const root = ReactDOM.createRoot(document.getElementById("root"));
-      root.render(<MoyMoyApp onClose={exitToHome} />);
+      root.render(<MoyMoyRoot onClose={exitToHome} />);
     </script>
   </body>
 </html>
