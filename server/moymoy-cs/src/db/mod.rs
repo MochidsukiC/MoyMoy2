@@ -64,6 +64,9 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     if version < 1 {
         let tx = conn.transaction()?;
         tx.execute_batch(SCHEMA_V1)?;
+        // Stamp version inside the same tx so a crash between commit and the
+        // old out-of-tx pragma_update can't leave the DB in a re-migratable state.
+        tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
         version = 1;
         tracing::info!("sqlite migrated to schema v1");
@@ -71,12 +74,14 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     if version < 2 {
         let tx = conn.transaction()?;
         tx.execute_batch(SCHEMA_V2)?;
+        tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
         version = 2;
         tracing::info!("sqlite migrated to schema v2 (independent MoyMoy accounts)");
     }
-    // Future: `if version < 3 { ...; version = 3; }`
-    conn.pragma_update(None, "user_version", version)?;
+    // Future: `if version < 3 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V3)?;
+    //          tx.pragma_update(None, "user_version", 3)?; tx.commit()?; version = 3; }`
+    tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }
 

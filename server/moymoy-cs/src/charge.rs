@@ -160,18 +160,31 @@ impl ChargeCoordinator {
         let ops: Vec<(String, String, String, i64)> = match tokio::task::spawn_blocking(move || {
             let conn = match pool.get() {
                 Ok(c) => c,
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    tracing::error!(error = %e, "reconcile: pool.get failed");
+                    return Vec::new();
+                }
             };
             let mut stmt = match conn.prepare(
                 "SELECT op_id, idem_key, mc_uuid, requested_amount FROM emerald_ops \
                  WHERE state IN ('pending','sent') ORDER BY created_unix_ms ASC LIMIT 50",
             ) {
                 Ok(s) => s,
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    tracing::error!(error = %e, "reconcile: prepare failed");
+                    return Vec::new();
+                }
             };
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            match stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
-                .unwrap_or_default()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, "reconcile: query failed");
+                    Vec::new()
+                }
+            }
         })
         .await
         {

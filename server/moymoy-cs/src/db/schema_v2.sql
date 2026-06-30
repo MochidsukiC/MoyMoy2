@@ -52,7 +52,12 @@ CREATE TABLE IF NOT EXISTS account_mc_links (
 );
 CREATE INDEX IF NOT EXISTS idx_mc_links_uuid ON account_mc_links (mc_uuid);
 
--- 4. Reset legacy mc_uuid-keyed wallet data (children before parents for FK).
+-- 4. Drop the legacy accounts.mcid index — mcid now lives in account_mc_links and
+--    accounts.mcid is never read post-v2. Keeping the index would make every
+--    accounts write maintain a stale, unused B-tree entry.
+DROP INDEX IF EXISTS idx_accounts_mcid;
+
+-- 5. Reset legacy mc_uuid-keyed wallet data (children before parents for FK).
 --    Demo merchants re-seed at startup; user accounts re-register.
 DELETE FROM transactions;
 DELETE FROM emerald_ops;

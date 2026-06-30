@@ -58,10 +58,11 @@ CREATE TABLE IF NOT EXISTS merchants (
 -- HTTP-layer idempotency: a client-supplied idem_key maps to the frozen JSON
 -- response so a retried POST replays the exact prior outcome (no double-spend).
 CREATE TABLE IF NOT EXISTS idempotency (
-    idem_key        TEXT PRIMARY KEY,
+    idem_key        TEXT NOT NULL,
     scope           TEXT NOT NULL,                    -- "send" | "pay" | "charge"
     response_json   TEXT NOT NULL,
-    created_unix_ms INTEGER NOT NULL
+    created_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY (idem_key, scope)                     -- composite: same key reused across send/pay/charge stays isolated
 );
 
 -- Emerald-charge ledger: the bridge between the mod (truth of consumption) and

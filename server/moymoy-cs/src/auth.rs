@@ -221,8 +221,10 @@ pub fn resolve_session(conn: &Connection, token: &str) -> rusqlite::Result<Optio
             Ok(Some(account_id))
         }
         Some(_) => {
-            // Expired — clean it up so the table doesn't accumulate dead rows.
-            let _ = conn.execute("DELETE FROM moymoy_sessions WHERE token_hash = ?1", [&th]);
+            // Expired — best-effort cleanup so the table doesn't accumulate dead rows.
+            if let Err(e) = conn.execute("DELETE FROM moymoy_sessions WHERE token_hash = ?1", [&th]) {
+                tracing::debug!(error = %e, "resolve_session: expired-row cleanup failed");
+            }
             Ok(None)
         }
         None => Ok(None),
@@ -281,10 +283,11 @@ pub fn register(
     let holder = display.to_uppercase();
     conn.execute(
         "INSERT INTO accounts \
-           (account_id, balance, holder, card_number, card_expiry, is_merchant, \
+           (account_id, balance, holder, card_number, is_merchant, \
             handle, handle_lower, display_name, pin_hash, failed_pin_attempts, \
             created_unix_ms, updated_unix_ms) \
-         VALUES (?1, 0, ?2, ?3, '07/29', 0, ?4, ?5, ?6, ?7, 0, ?8, ?8)",
+         VALUES (?1, 0, ?2, ?3, 0, ?4, ?5, ?6, ?7, 0, ?8, ?8)",
+        // card_expiry omitted — the schema DEFAULT '07/29' is the single source of truth.
         params![account_id, holder, card, handle, handle_lower, display, pin_hash, now],
     )?;
     let token = create_session(conn, &account_id, phone_id)?;

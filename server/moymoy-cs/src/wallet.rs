@@ -265,6 +265,11 @@ pub fn credit_charge(
     now: i64,
     label: &str,
 ) -> rusqlite::Result<i64> {
+    // Defense-in-depth: mirror the bounds check in `transfer` so future call
+    // sites can't accidentally credit zero or a pathological amount.
+    if amount <= 0 || amount > MAX_AMOUNT {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(0, amount));
+    }
     let bal: i64 = tx.query_row(
         "SELECT balance FROM accounts WHERE account_id = ?1",
         [account_id],
@@ -397,8 +402,9 @@ pub fn seed_demo_merchants(conn: &mut Connection) -> rusqlite::Result<()> {
         // receive `pay` transfers and display by `display_name`.
         tx.execute(
             "INSERT OR IGNORE INTO accounts \
-               (account_id, display_name, balance, holder, card_number, card_expiry, is_merchant, created_unix_ms, updated_unix_ms) \
-             VALUES (?1, ?2, 0, ?3, ?4, '07/29', 1, ?5, ?5)",
+               (account_id, display_name, balance, holder, card_number, is_merchant, created_unix_ms, updated_unix_ms) \
+             VALUES (?1, ?2, 0, ?3, ?4, 1, ?5, ?5)",
+            // card_expiry omitted — the schema DEFAULT '07/29' is the single source of truth.
             params![
                 account_id,
                 name,
