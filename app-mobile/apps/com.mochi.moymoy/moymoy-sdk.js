@@ -40,8 +40,13 @@
   function setSession(tok) {
     _session = tok || null;
   }
-  function authHeaders() {
-    return _session ? { "X-MoyMoy-Session": _session } : {};
+  // Resolve the token for a call: an explicit per-call `session` wins over the
+  // active global one. Per-call tokens let logout/switch verify a SPECIFIC
+  // account without mutating the shared _session, so a concurrent wallet call
+  // never sends the wrong account's header (R05/R06).
+  function authHeaders(session) {
+    const tok = session || _session;
+    return tok ? { "X-MoyMoy-Session": tok } : {};
   }
 
   // ── Minecraft character identity (charge / inventory only) ──────────────────
@@ -100,18 +105,25 @@
         return null;
       }
     },
+    // Returns true on success, false on failure (R13 — surface persistence
+    // failures instead of swallowing them, so the caller can warn the user that
+    // their account list may not survive a restart).
     async set(k, v) {
       if (hasMochiStorage()) {
         try {
-          return await mochi.storage.set(k, v);
+          await mochi.storage.set(k, v);
+          return true;
         } catch (e) {
-          return;
+          console.error("MoyMoy.store.set (mochi.storage) failed", e);
+          return false;
         }
       }
       try {
         localStorage.setItem(k, v);
+        return true;
       } catch (e) {
-        /* ignore */
+        console.error("MoyMoy.store.set (localStorage) failed", e);
+        return false;
       }
     },
     async remove(k) {
@@ -138,21 +150,21 @@
       .join("&");
   }
 
-  async function getJson(path, params) {
+  async function getJson(path, params, session) {
     const query = qstr(params || {});
     const res = await fetch(base() + path + (query ? "?" + query : ""), {
       method: "GET",
-      headers: authHeaders(),
+      headers: authHeaders(session),
     });
     if (res.status === 401) return { ok: false, error: "unauthorized", status: 401 };
     if (!res.ok) throw new Error("moymoy GET " + path + " → HTTP " + res.status);
     return res.json();
   }
 
-  async function postJson(path, body) {
+  async function postJson(path, body, session) {
     const res = await fetch(base() + path, {
       method: "POST",
-      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders(session)),
       body: JSON.stringify(body || {}),
     });
     if (res.status === 401) return { ok: false, error: "unauthorized", status: 401 };
@@ -179,8 +191,11 @@
       postJson("/auth/register", { handle, display_name, pin, phone_id: await phoneId() }),
     login: async ({ handle, pin }) =>
       postJson("/auth/login", { handle, pin, phone_id: await phoneId() }),
-    logout: () => postJson("/auth/logout", {}),
-    me: () => getJson("/auth/me"),
+    // logout/me accept an optional per-call session so the app shell can act on
+    // a SPECIFIC account (switch-verify, logout-other) without disturbing the
+    // active session (R05/R06).
+    logout: (session) => postJson("/auth/logout", {}, session),
+    me: (session) => getJson("/auth/me", null, session),
     lookup: (handle) => getJson("/auth/lookup", { handle }),
 
     // ── wallet (session-authenticated) ──
@@ -205,11 +220,12 @@
       postJson("/wallet/pay", { idem_key: newIdem(), merchant_id: merchantId, amount }),
 
     // Charge from the current character's inventory emeralds (mod-backed).
-    // Returns a pending op; poll op().
-    charge: async (amount) => {
+    // Returns a pending op; poll op(). Pass a stable `idemKey` so a retry of the
+    // SAME charge attempt replays the same op instead of consuming twice.
+    charge: async (amount, idemKey) => {
       const i = await ident();
       return postJson("/wallet/charge", {
-        idem_key: newIdem(),
+        idem_key: idemKey || newIdem(),
         amount,
         mc_uuid: i.mc_uuid,
         mcid: i.mcid,

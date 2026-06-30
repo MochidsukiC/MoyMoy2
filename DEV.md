@@ -22,7 +22,7 @@ MochiOS2.0 プラットフォーム向けの電子マネー / ウォレット / 
 
 ## 現在の仕様（デザイン「MochiOS Mobile.html」駆動で確定）
 
-デザインは PayPay×クレジットカード風のエメラルド決済アプリ。タブは **home / send(送る) / pay(支払う) / charge(チャージ) / history(履歴)**。
+デザインは 電子マネー×クレジットカード風のエメラルド決済アプリ。タブは **home / send(送る) / pay(支払う) / charge(チャージ) / history(履歴)**。
 通貨は整数「エメ」、**9エメ = 1エメラルドブロック**（Minecraft）。
 取引種別 `kind`: `pay`(支払い) / `send`(送金) / `receive`(受取) / `charge`(チャージ)。各取引 `{id, kind, label, amount(符号付), ts}`。
 **請求/承認(request/approve)機能はデザインに無い** → 実装しない。
@@ -35,7 +35,7 @@ UIフロー:
 - **history**: 全取引リスト(フィルタ: すべて/支払い/送金/チャージ)。
 
 ### アカウントモデル（v2・独立アカウント + PIN）
-**PayPay 型の独立 MoyMoy アカウント**。`account_id` はサーバ生成 UUID で、Minecraft UUID とは独立。
+**独立した MoyMoy アカウント（電子マネー型）**。`account_id` はサーバ生成 UUID で、Minecraft UUID とは独立。
 
 - **資格情報**: `handle`（一意・小文字正規化・`[A-Za-z0-9_]` 3〜20）＋ `PIN`（4〜6桁数字, **Argon2id** ハッシュ保存）。handle は送金宛先（`@handle`）に兼用。
 - **セッション**: register/login で 256bit ランダムトークンを発行し、HTTP ヘッダ `X-MoyMoy-Session` で送る。DB には **SHA-256 ハッシュ**で保存（期限 30日・logout で失効）。**backend が全ウォレットリクエストの本人を検証**（旧 mc_uuid 自己申告を解消）。

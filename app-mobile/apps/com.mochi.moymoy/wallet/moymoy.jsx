@@ -1,6 +1,6 @@
 /* global React, CrystalIcon */
 /* =====================================================================
-   MoyMoy — ゲーム内エメラルド決済 (PayPay × クレジットカード)
+   MoyMoy — ゲーム内エメラルド決済 (電子マネー × クレジットカード)
    Core: 宝石グリフ / エメラルドブロック質感カード / 残高ホーム /
          ボトムナビ / モイモイ♪ 決済完了演出 (Web Audio)
    (verbatim presentational layer from Claude Design "MochiOS Mobile.html")
@@ -84,7 +84,7 @@ function EmeraldBlockBg({ idSuffix = "a" }) {
   );
 }
 
-/* ─── MoyMoy カード (PayPay × クレカ) ─────────────────────────────── */
+/* ─── MoyMoy カード (電子マネー × クレカ) ─────────────────────────── */
 function MoyMoyCard({ number = "5089 2271 0043 6618", holder = "STEVE", expiry = "07/29",
   balance, compact = false }) {
   return (
@@ -205,7 +205,7 @@ function playMoyChime() {
   } catch (e) { /* no audio */ }
 }
 
-/* ─── 決済完了オーバーレイ (PayPay音的演出) ───────────────────────── */
+/* ─── 決済完了オーバーレイ (決済音演出) ───────────────────────────── */
 function CompleteOverlay({ kind, target, amount, sound, onClose }) {
   mmEffect(() => {
     if (sound) playMoyChime();

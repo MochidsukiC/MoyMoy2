@@ -469,6 +469,7 @@ const ERR_LABEL = {
   unknown_target: "相手が見つかりません",
   mc_unavailable: "Minecraft サーバーに接続されていません",
   no_character: "Minecraft キャラクターが見つかりません",
+  character_claimed: "このキャラクターは別のアカウントに連携されています",
   charge_pending: "チャージは保留中です（反映までお待ちください）",
   charge_failed: "チャージに失敗しました。もう一度お試しください",
   unauthorized: "セッションが切れました。ログインし直してください",
@@ -488,6 +489,9 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   const [canCharge, setCanCharge] = msState(false);
   const [loaded, setLoaded] = msState(false);
   const mountedRef = msRef(true);
+  // A stable idem_key for the in-flight charge attempt: a retry after a poll
+  // timeout reuses it so the server replays the same op (no double consume).
+  const chargeIdemRef = msRef(null);
 
   const [tab, setTab] = msState("home");
   const [flow, setFlow] = msState(null);       // {kind, target}  amount-entry
@@ -562,7 +566,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       try {
         const r = await MoyMoy.op(opId);
         if (r.error === "unauthorized") return { unauthorized: true };
-        if (r.ok && r.op && (r.op.state === "settled" || r.op.state === "failed")) return r.op;
+        if (r.ok && r.op && (r.op.state === "settled" || r.op.state === "failed" || r.op.state === "stuck")) return r.op;
       } catch (e) { /* retry */ }
       await new Promise(res => setTimeout(res, 600));
     }
@@ -581,7 +585,10 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       } else if (kind === "pay") {
         res = await MoyMoy.pay(target.id, amount);
       } else {
-        res = await MoyMoy.charge(amount);
+        // Reuse one idem_key across retries of this charge attempt so a retry
+        // after a poll timeout replays the same op (never consumes twice).
+        if (!chargeIdemRef.current) chargeIdemRef.current = MoyMoy.newIdem();
+        res = await MoyMoy.charge(amount, chargeIdemRef.current);
       }
 
       if (!res.ok) {
@@ -598,7 +605,10 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
         if (op && op.unauthorized) { setBusy(false); setConfirm(null); onExpired(); return; }
         if (!op || op.state !== "settled") {
           if (!mountedRef.current) return;
-          setErr(errLabel(op && op.state === "failed" ? "charge_failed" : "charge_pending"));
+          const terminal = op && (op.state === "failed" || op.state === "stuck");
+          // Terminal failure ⇒ this op is dead; let a retry start a fresh op.
+          if (terminal) chargeIdemRef.current = null;
+          setErr(errLabel(terminal ? "charge_failed" : "charge_pending"));
           setBusy(false);
           await refresh(() => mountedRef.current);
           return;
@@ -614,6 +624,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       } catch (e) { /* ignore */ }
       if (!mountedRef.current) return;
 
+      chargeIdemRef.current = null; // settled — the next charge starts a fresh op
       setBusy(false);
       setConfirm(null);
       setFlow(null);
@@ -652,7 +663,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       {/* confirm sheet */}
       {confirm && (
         <MoyConfirmSheet {...confirm} balance={balance} busy={busy} error={err}
-          onCancel={() => { setConfirm(null); setErr(null); }}
+          onCancel={() => { chargeIdemRef.current = null; setConfirm(null); setErr(null); }}
           onConfirm={doConfirm} />
       )}
 

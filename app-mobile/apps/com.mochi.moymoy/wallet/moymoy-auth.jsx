@@ -31,7 +31,9 @@ async function loadAccounts() {
   }
 }
 async function saveAccounts(accounts, activeId) {
-  await MoyMoy.store.set(STORE_KEY, JSON.stringify({ accounts, activeId }));
+  const ok = await MoyMoy.store.set(STORE_KEY, JSON.stringify({ accounts, activeId }));
+  if (!ok) console.error("MoyMoy: failed to persist the account list — accounts may not survive an app restart");
+  return ok;
 }
 
 /* ─── error labels ───────────────────────────────────────────────────── */
@@ -125,7 +127,7 @@ function AuthWelcome({ canCancel, onRegister, onLogin, onCancel }) {
     <AuthScene title="MoyMoy" sub="ゲーム内エメラルド決済ウォレット" onBack={canCancel ? onCancel : null}>
       <div style={{ padding: "28px 22px", display: "flex", flexDirection: "column", gap: 16 }}>
         <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, color: "var(--ink-soft)", lineHeight: 1.8 }}>
-          MoyMoy の口座を{canCancel ? "追加" : "作成"}します。口座は PayPay のように MoyMoy 独自のアカウントで、
+          MoyMoy の口座を{canCancel ? "追加" : "作成"}します。口座は MoyMoy 独自のアカウントで、
           ID と PIN で保護されます。
         </div>
         <button onClick={onRegister} style={ctaStyle(false)}>
@@ -485,39 +487,37 @@ function MoyMoyRoot({ onClose }) {
   async function switchTo(id) {
     const acc = accounts.find((a) => a.account_id === id);
     if (!acc || id === activeId) return;
-    const prev = accounts.find((a) => a.account_id === activeId) || null;
-    MoyMoy.setSession(acc.session);
+    // Verify the target with a PER-CALL token so the active session is never
+    // disturbed mid-verify (R05/R06) — only adopt it once verified.
     let verdict = "unknown";
     try {
-      const me = await MoyMoy.me();
+      const me = await MoyMoy.me(acc.session);
       verdict = me.ok ? "ok" : (me.error === "unauthorized" ? "expired" : "unknown");
     } catch (e) { verdict = "unknown"; }
     if (verdict === "ok") {
+      MoyMoy.setSession(acc.session);
       setActiveId(id);
       await saveAccounts(accounts, id);
       return;
     }
     if (verdict === "unknown") {
-      // Couldn't verify (network/server/parse) — abort the switch, keep both
-      // accounts, restore the current session. Never delete on a transient error.
-      MoyMoy.setSession(prev ? prev.session : null);
+      // Couldn't verify (network/server/parse) — abort the switch. The active
+      // session was never touched, so there's nothing to restore.
       return;
     }
-    // verdict === "expired" (401): that session is truly invalid — drop it.
+    // verdict === "expired" (401): the target's session is invalid — drop it and
+    // stay on the current (still-valid) account.
     const rest = accounts.filter((a) => a.account_id !== id);
     setAccounts(rest);
-    if (activeId) { const cur = rest.find((a) => a.account_id === activeId); MoyMoy.setSession(cur ? cur.session : null); }
-    await saveAccounts(rest, activeId && rest.find((a) => a.account_id === activeId) ? activeId : null);
-    setAdding(true);
-    setAuthMode("login");
-    setPhase("auth");
+    await saveAccounts(rest, activeId);
   }
 
   async function logoutAccount(id) {
     const acc = accounts.find((a) => a.account_id === id);
     if (acc) {
-      MoyMoy.setSession(acc.session);
-      try { await MoyMoy.logout(); } catch (e) { /* ignore */ }
+      // Per-call token: revoke THIS account's session without clobbering the
+      // active one (R05/R06).
+      try { await MoyMoy.logout(acc.session); } catch (e) { /* ignore */ }
     }
     const rest = accounts.filter((a) => a.account_id !== id);
     let nextActive = activeId;
