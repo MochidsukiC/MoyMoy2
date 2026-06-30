@@ -55,14 +55,14 @@ cargo run -p mochi-hub-mc-pki --bin mochi-mc-ca -- issue --mcserver-id moymoy --
 tools\run-cs.ps1
 # 端末2: バンドル静的サーバー
 tools\dev-serve.ps1
-# ブラウザ:
+# ブラウザ（?mcid= は charge 用の MC キャラ。MoyMoy 口座は UI の「口座開設」で handle+PIN 作成）:
 #   http://127.0.0.1:8099/dev.html?moymoy_http=http://127.0.0.1:7433&mcid=Steve
-# 残高投入:
+# 残高投入（UI で @alice を開設後、dev-credit は handle 指定）:
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:7433/wallet/_dev/credit `
-  -ContentType application/json -Body (@{mcid='Steve';amount=12480}|ConvertTo-Json)
+  -ContentType application/json -Body (@{handle='alice';amount=12480}|ConvertTo-Json)
 ```
 
 ## E2E 検証
-- **A. ウォレット単体（MC不要）**: `/wallet/status` → `can_charge:false`。アプリで残高・送金（相手に receive）・支払い・履歴。同一 idem_key で二重送金されない。backend 再起動で SQLite から復元。
+- **A. ウォレット単体（MC不要）**: 口座開設(handle+PIN)→ `/wallet/status` `can_charge:false`。dev-credit(handle) で残高投入 → ホーム反映。`@相手` へ送金（相手に receive）・加盟店支払い・履歴。同一 idem_key で二重送金されない。**1端末に2口座を開設→切替で残高が独立**。リロードで保存セッション自動ログイン。PIN 連続失敗でロックアウト。backend 再起動で SQLite から復元。
 - **B. チャージ（mod + 証明書あり）**: `/wallet/status` → `can_charge:true`。プレイヤー在線中にアプリの「チャージ」→ 在世エメラルド消費 → 残高加算。`/eme` でローカルの換金可能量表示。
 - **C. 整合・冪等**: ack 一時喪失 → `emerald_ops` が sent 滞留 → reconcile 再送 → mod が duplicate 再ack（再消費なし）→ settled。MCサーバ再起動を跨いで二重消費なし（EmeraldOpStore）。

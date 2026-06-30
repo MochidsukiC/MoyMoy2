@@ -34,21 +34,31 @@ UIフロー:
 - **charge**: インベントリ(手持ちエメラルド + ブロック、9エメ=1ブロック)を換算 → 金額 → 確認 → 完了。エメラルド消費し残高加算。**MC mod 依存**。
 - **history**: 全取引リスト(フィルタ: すべて/支払い/送金/チャージ)。
 
+### アカウントモデル（v2・独立アカウント + PIN）
+**PayPay 型の独立 MoyMoy アカウント**。`account_id` はサーバ生成 UUID で、Minecraft UUID とは独立。
+
+- **資格情報**: `handle`（一意・小文字正規化・`[A-Za-z0-9_]` 3〜20）＋ `PIN`（4〜6桁数字, **Argon2id** ハッシュ保存）。handle は送金宛先（`@handle`）に兼用。
+- **セッション**: register/login で 256bit ランダムトークンを発行し、HTTP ヘッダ `X-MoyMoy-Session` で送る。DB には **SHA-256 ハッシュ**で保存（期限 30日・logout で失効）。**backend が全ウォレットリクエストの本人を検証**（旧 mc_uuid 自己申告を解消）。
+- **マルチアカウント**: 1端末に複数口座をリンク。クライアント保持リスト（`mochi.storage` / dev は localStorage）が正本で、ヘッダのアバターから切替・追加・ログアウト。サーバは `moymoy_sessions.phone_id` をメタデータ記録のみ。
+- **MCキャラ連携**: チャージ時に現在の `gameUuid`（os.gameUuid）を `account_mc_links` へ自動リンク（1口座に複数キャラ可）。MC UUID は「チャージ用の連携リソース」。
+
 ### バックエンド HTTP API
-- `GET /healthz`
-- `GET /wallet/status` → `{ok, app:"moymoy", can_charge}`
-- `GET /wallet/home?mc_uuid=&mcid=` → `{ok, balance, profile:{holder,number,expiry}, txns:[...recent], can_charge}`（home集約）
-- `GET /wallet/history?mc_uuid=&limit=&filter=all|pay|send|charge` → `{ok, txns}`
-- `GET /wallet/friends?mc_uuid=` → `{ok, friends}`（最近の相手 + コンタクト）
-- `GET /wallet/merchants?mc_uuid=` → `{ok, merchants}`（登録加盟店。距離はMC presence依存）
-- `GET /wallet/inventory?mc_uuid=` → `{ok, emeralds, blocks, chargeable}`（**MC mod 依存**。無ければ can_charge=false）
-- `POST /wallet/send {idem_key, from_uuid, to_uuid|to_mcid, amount, memo?}` → P2P送金
-- `POST /wallet/pay {idem_key, mc_uuid, merchant_id, amount, memo?}` → 加盟店支払い
-- `POST /wallet/charge {idem_key, mc_uuid, amount}` → エメラルド→エメ（MC mod 消費、§チャージ整合）
-- `GET /wallet/op?op_id=` → チャージ進捗（pending/sent/settled/failed）
+全レスポンス `{ok:bool, ...}`。ウォレット系は `X-MoyMoy-Session` でセッション認証（無効は 401）。
+- `GET /healthz` / `GET /wallet/status` → `{ok, app:"moymoy", can_charge}`（公開）
+- `POST /auth/register {handle, display_name, pin, phone_id?}` → `{ok, session, account}`（ロックアウト/列挙防止）
+- `POST /auth/login {handle, pin, phone_id?}` → `{ok, session, account}` ／ `POST /auth/logout`（session）
+- `GET /auth/me` → `{ok, account, linked_mc:[{mc_uuid,mcid}]}` ／ `GET /auth/lookup?handle=` → 送金宛先解決
+- `GET /wallet/home` → `{ok, balance, profile:{holder,number,expiry}, txns:[...recent], can_charge}`
+- `GET /wallet/history?limit=&filter=all|pay|send|charge` ／ `GET /wallet/friends`（最近の相手・handle 付）／ `GET /wallet/merchants`
+- `GET /wallet/inventory?mc_uuid=&mcid=` → `{ok, emeralds, blocks, chargeable}`（**MC mod 依存**）
+- `POST /wallet/send {idem_key, to_handle, amount}` → `@handle` 宛 P2P 送金
+- `POST /wallet/pay {idem_key, merchant_id, amount}` → 加盟店支払い
+- `POST /wallet/charge {idem_key, amount, mc_uuid, mcid?}` → エメラルド→エメ（着金=account_id / 消費ルーティング=mc_uuid、自動リンク、§チャージ整合）
+- `GET /wallet/op?op_id=` → チャージ進捗（所有権検証付き）
+- `POST /wallet/_dev/credit {handle, amount}` → dev 専用クレジット（`MOYMOY_DEV_CREDIT=1` ゲート）
 
 ### SQLite スキーマ
-`accounts`(account_id=mc_uuid, mcid, balance, holder, card_number, card_expiry) / `transactions`(kind, label, counterparty, amount符号付, balance_after, ts) / `merchants`(merchant_id, account_id, name, …) / `idempotency` / `emerald_ops`。詳細は `server/moymoy-cs/src/db/schema.sql`。
+`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires) / `account_mc_links`(account_id, mc_uuid, mcid) / `transactions`(kind, label, counterparty, amount符号付, balance_after, ts) / `merchants`(merchant_id, account_id, …) / `idempotency` / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, …)。v1→v2 マイグレーションは `db/schema_v2.sql`（旧 mc_uuid キーのウォレット行はリセット）。詳細は `server/moymoy-cs/src/db/`。
 
 ### コマンドバス verb（backend→mod / mod→backend ack）
 - `emerald.charge {op_id, idem_key, target_uuid, amount}` → mod 消費(インベントリのエメラルド+ブロック) → ack `{op_id, status, settled:consumed}`
@@ -58,9 +68,12 @@ UIフロー:
 
 ## 問題 / 課題
 
-- **in-game チャットコマンドからの backend 報告は不可**: `mochi` connector(`MochiMod`)は `DISPATCH`(inbound ルーティング)のみ公開で、ハンドラ外からの unsolicited 送信API が無い。よってエメラルドチャージは**アプリ起点**（プレイヤー在線中にアプリのチャージタブ使用→backend が MOD に在世エメラルド消費を指示）で完結する。真の `/eme deposit` チャットコマンドが必要なら mochi connector に outbound 送信API追加が必要で、それは承認の要る MochiOS2.0 改変。`/eme` は読み取り専用ヘルパ(換金可能量表示)のみ。
+- **本人検証の到達点**: v2 で「自己申告 mc_uuid」→「backend が検証する handle+PIN セッション」へ移行し、ウォレットの本人性は MoyMoy 内で完結して検証可能になった。MochiOS のゲートウェイは cs.mnn 宛に検証済みアカウントを注入しない（調査確認済）ため、OS アカウント連携ではなく **MoyMoy 独自資格情報**で本人を担保している。
+- **セッショントークンの保存**: クライアントは `mochi.storage`（in-world は per-app 隔離・再起動跨ぎ永続）/ dev は localStorage にトークンを保持。盗用時の被害は当該口座に限定され、logout・期限切れで失効。より強固にするなら端末バインドや短命トークン+リフレッシュを将来検討。
+- **memo 未実装**: デザインの送金/支払いフローに memo 入力欄が無いため、API からも除外（受理して捨てる挙動は不採用）。必要時は transactions.memo への配線を追加。
+- **in-game チャットコマンドからの backend 報告は不可**: `mochi` connector(`MochiMod`)は `DISPATCH`(inbound ルーティング)のみ公開で、ハンドラ外からの unsolicited 送信API が無い。よってエメラルドチャージは**アプリ起点**で完結する。真の `/eme deposit` には mochi connector への outbound 送信API追加（承認の要る MochiOS2.0 改変）が必要。
 - エメラルドチャージの致命ウィンドウ（consume成功・ack喪失・SavedDataフラッシュ前クラッシュ）は台帳+reconciliation+`setDirty()`直後フラッシュで最小化（exactly-once は原理的限界）。
-- **CodeX レビュー保留**: recursive-codex-reviewer の CodeX 本体がレート制限（〜2026-06-28）で起動不可。e1931fd 以降は Claude 自己レビューのみ（指摘 A/B/C/E は反映済）。リセット後に CodeX 再レビュー推奨。
+- **CodeX 再レビュー**: v2 再設計（backend `6b85dc5` / frontend `9cc6c18`）は recursive-codex-reviewer をバックグラウンド起動済み。指摘は検証のうえ反映する。
 
 ---
 
@@ -75,5 +88,8 @@ UIフロー:
 - [x] 段階3: コマンドバス + チャージ整合（emerald_ops 台帳）
 - [x] 段階3: MC サーバーサイドmod（Forge、moymoy-0.1.0.jar ビルド済）
 - [x] 段階4: 配置・公開ツール（tools/, deploy/, icon.png）
-- [ ] 段階4: フル E2E（devstack + MC server 稼働下でのチャージ実機検証）— 運用環境で実施
-- [ ] (任意) CodeX リセット後の再レビュー
+- [x] **再設計**: 独立アカウント(handle+PIN)+セッション検証 — backend（`6b85dc5`、HTTPスモーク緑）
+- [x] **再設計**: マルチアカウント(1端末=複数口座)+1口座=複数MCキャラ — frontend（`9cc6c18`、Babel透過）
+- [ ] 再公開: バンドル再パック＋registry再登録（`tools/register-hub.ps1`）、backend 再配置（`tools/deploy-backend.ps1`）
+- [ ] フル E2E（in-world / ブラウザ harness で 口座開設→切替→送金→チャージ自動リンク の実機検証）
+- [ ] CodeX 再レビュー指摘の反映（backend/frontend 両 reviewer 完了待ち）
