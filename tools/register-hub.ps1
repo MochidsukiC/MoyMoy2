@@ -67,7 +67,8 @@ Write-Host "session token acquired" -ForegroundColor DarkGray
 # --- 4. Verify it stuck.
 try {
     $apps = Invoke-RestMethod -Method Get -Uri "$RegistryUrl/apps" -TimeoutSec 8
-    $ids = @($apps.apps | ForEach-Object { $_.id })
+    # The list endpoint returns `app_id` (the full manifest uses `id`).
+    $ids = @($apps.apps | ForEach-Object { $_.app_id })
     if ($ids -contains 'com.mochi.moymoy') {
         Write-Host "verified: com.mochi.moymoy is registered ($RegistryUrl/apps)" -ForegroundColor Green
     } else {
