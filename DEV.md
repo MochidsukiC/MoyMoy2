@@ -105,7 +105,11 @@ UIフロー:
 - [x] 再公開 **v0.2.1**（R007/R008・frontend修正・メール認証・レビュー反映を束ねた最終バンドル）を GitHub リリース＋HUB 再登録（sha256 `1b54d370`）
 - [x] メール送信を **MNN メール（`@*.mnn`）限定**に切替（`MnnMailSender`、外部SMTP廃止） `d6d8645`
 - [ ] 本番設定: `MOCHI_MAIL_SERVICE_BEARER`（＋任意 `MOYMOY_OTP_PEPPER`）を運用者が env で設定 — 未設定なら degrade
-- [x] **チャージ有効化の根治**: 「チャージは現在利用できません」= `can_charge=false` の原因は backend に MC クライアント証明書が無く command bus に繋がらないこと。`deploy-backend.ps1 -EnableCharge` で Hub の mc-pki CA から `--mcserver-id moymoy` の leaf を発行し `MOCHI_MC_CERT_DIR` を設定（検証: cert 付き起動で `can_charge=true`、`run/app_backends/moymoy` に適用済）。**チャージ成立にはもう一方の要件**: MC サーバに moymoy mod jar（`mod/build/libs/moymoy-*.jar`）を mochi connector mod と一緒に読み込ませ、`mochi-server.toml` の `mcserver_id` を非空に設定（空だと connector 不起動）。※`hosted_app_ids` は**廃止**（connector が登録ハンドラを自動広告するため手動設定不要）。
+- **チャージ成立の全チェーン**（`app → backend → Hub :7421 → mc-connector → mod → 消費 → ack → 着金`）。どれか欠けると在庫0/保留になる:
+  - [x] **① 症状の可視化**: 在庫クエリの「応答なし/未発見/真の0」を潰さず区別（`character_unreachable`/`character_offline`＋両側ログ）`f3e8f40`。
+  - [x] **② backend cert**: `deploy-backend.ps1 -EnableCharge` で mc-pki CA から `--mcserver-id moymoy` leaf 発行＋`MOCHI_MC_CERT_DIR` 設定。`run/app_backends/moymoy` に適用済（`can_charge=true`）。
+  - [x] **③ Hub の :7421 有効化（真の根本原因）**: Hub が `MOCHI_HUB_MC_PKI_DIR` 未設定で「MC command bus (mTLS :7421) disabled」→ backend が connect timeout を繰り返し在庫0。`run/` の起動元 `MochiOS2.0/tools/win-hub-dev.ps1` に `MOCHI_HUB_MC_PKI_DIR=<repo>\.devstack\mc-pki\ca`＋`MOCHI_HUB_MC_PKI_FLAT=1` を追加（backend cert と同一 CA）。**Hub 再起動が必要**。
+  - [ ] **④ MC サーバ側**: moymoy mod jar（`mod/build/libs/moymoy-*.jar`）＋ mochi connector mod を導入、`mochi-server.toml` の `mcserver_id` を非空に、mochi-mc-connector サイドカー稼働。※`hosted_app_ids` は**廃止**（自動広告）。
 - [ ] backend 再配置（`deploy-backend.ps1 -EnableCharge` で moymoy-cs＋MC証明書を Hub workdir へ）
 - [ ] フル E2E（in-world で 0.2.2 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
 - [ ] 承認ゲート保留: `MOYMOY_OTP_PEPPER` の本番 fail-closed 化 / `AccountInfo` の email 型統合 / refresh 失敗の UI エラー状態化 / `run_inbound` 切断理由の可視化（mc-sdk 共有層）
