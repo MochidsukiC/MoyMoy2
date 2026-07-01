@@ -93,7 +93,9 @@ if ($EnableCharge) {
     }
     # Set MOCHI_MC_CERT_DIR in the staged app.toml (relative to the backend's
     # workdir = app_backends/moymoy). Uncomment the template line, else append.
-    $toml = Get-Content $tomlDest -Raw
+    # Read as UTF-8 explicitly — PS 5.1 Get-Content defaults to ANSI, which would
+    # round-trip non-ASCII comments (§ → —) into mojibake on the WriteAllText below.
+    $toml = Get-Content $tomlDest -Raw -Encoding UTF8
     if ($toml -match '(?m)^\s*#\s*MOCHI_MC_CERT_DIR\s*=') {
         $toml = $toml -replace '(?m)^\s*#\s*MOCHI_MC_CERT_DIR\s*=.*$', 'MOCHI_MC_CERT_DIR  = "mc-cert"'
     } elseif ($toml -notmatch '(?m)^\s*MOCHI_MC_CERT_DIR\s*=') {
