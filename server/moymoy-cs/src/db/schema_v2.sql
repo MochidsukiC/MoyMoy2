@@ -2,7 +2,7 @@
 -- sessions, and per-account MC-character links.
 --
 -- Identity redesign: account_id stops meaning "the Minecraft UUID" and becomes a
--- server-generated MoyMoy account id (PayPay-style). A person logs in with a
+-- server-generated MoyMoy account id (an independent e-money account). A person logs in with a
 -- handle + PIN; the wallet is keyed by their MoyMoy account. The Minecraft UUID
 -- is demoted to a *linked resource* used only for emerald charging (recorded in
 -- account_mc_links, routed by emerald_ops.mc_uuid).

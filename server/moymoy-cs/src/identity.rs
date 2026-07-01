@@ -119,6 +119,19 @@ pub fn link_mc(
     Ok(())
 }
 
+/// The account that owns Minecraft character `mc_uuid`, if any. Since schema v3
+/// a character belongs to exactly one account (UNIQUE index), so this is the
+/// single owner. Used to reject charges/inventory for a character claimed by a
+/// different account.
+pub fn mc_link_owner(conn: &Connection, mc_uuid: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT account_id FROM account_mc_links WHERE mc_uuid = ?1",
+        [mc_uuid],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+}
+
 /// The Minecraft characters linked to an account (most recent first).
 pub fn linked_mc(conn: &Connection, account_id: &str) -> rusqlite::Result<Vec<LinkedMc>> {
     let mut stmt = conn.prepare(

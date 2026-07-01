@@ -21,6 +21,22 @@ use crate::wallet;
 /// Charge-txn label so a real emerald charge is distinguishable in the ledger.
 const CHARGE_LABEL: &str = "インベントリのエメラルド";
 
+/// A non-terminal op older than this is dead-lettered by reconciliation (R008):
+/// a never-delivered `pending` op becomes `failed` (no emeralds consumed), while
+/// a `sent` op (consumption ambiguous) becomes `stuck` for manual review — never
+/// silently failed, so consumed emeralds are not written off.
+const DEAD_LETTER_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Internal outcome of the begin-charge transaction.
+enum BeginCharge {
+    /// The character is already claimed by a *different* MoyMoy account (R007).
+    Claimed,
+    /// A prior op exists for this idem_key — replay it.
+    Existing(String),
+    /// A fresh op was created (and the character linked).
+    Fresh(String),
+}
+
 /// Player inventory snapshot for the charge screen (9 eme = 1 block).
 #[derive(Debug)]
 pub struct Inventory {
@@ -98,13 +114,21 @@ impl ChargeCoordinator {
         let aid = account_id.to_string();
         let muuid = mc_uuid.to_string();
         let mcid_owned = mcid.map(str::to_string);
-        let (op_id, fresh) = tokio::task::spawn_blocking(move || -> Result<(String, bool), ApiError> {
+        let outcome = tokio::task::spawn_blocking(move || -> Result<BeginCharge, ApiError> {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if let Some(prev) = db::idem_get(&tx, &ik, "charge")? {
                 let v: Value = serde_json::from_str(&prev).unwrap_or_else(|_| json!({}));
                 let op = v.get("op_id").and_then(Value::as_str).unwrap_or("").to_string();
-                return Ok((op, false));
+                return Ok(BeginCharge::Existing(op));
+            }
+            // R007: a character belongs to exactly one account. Reject a charge
+            // from a character already claimed by someone else — never consume
+            // their emeralds. (Unclaimed or self-owned proceeds and links below.)
+            if let Some(owner) = crate::identity::mc_link_owner(&tx, &muuid)? {
+                if owner != aid {
+                    return Ok(BeginCharge::Claimed);
+                }
             }
             let op_id = Uuid::new_v4().to_string();
             let now = now_ms();
@@ -115,14 +139,22 @@ impl ChargeCoordinator {
                 params![op_id, ik, aid, muuid, amount, now],
             )?;
             // Auto-link the character to this account (verified: the gameUuid is
-            // runtime-attested in-world).
+            // runtime-attested in-world). The v3 UNIQUE(mc_uuid) backstops a race.
             crate::identity::link_mc(&tx, &aid, &muuid, mcid_owned.as_deref())?;
             let resp = json!({ "ok": true, "op_id": op_id, "state": "pending" });
             db::idem_put(&tx, &ik, "charge", &resp.to_string())?;
             tx.commit()?;
-            Ok((op_id, true))
+            Ok(BeginCharge::Fresh(op_id))
         })
         .await??;
+
+        let (op_id, fresh) = match outcome {
+            BeginCharge::Claimed => {
+                return Ok(json!({ "ok": false, "error": "character_claimed" }))
+            }
+            BeginCharge::Existing(op) => (op, false),
+            BeginCharge::Fresh(op) => (op, true),
+        };
 
         if op_id.is_empty() {
             return Ok(json!({ "ok": false, "error": "charge_failed" }));
@@ -165,6 +197,34 @@ impl ChargeCoordinator {
                     return Vec::new();
                 }
             };
+            // R008: dead-letter ops too old to keep retrying. A never-delivered
+            // `pending` op (no emeralds consumed) is safe to fail; a `sent` op
+            // (consumption ambiguous) goes to `stuck` for manual review — never
+            // auto-failed, so consumed emeralds aren't written off. A late ack can
+            // still settle a `stuck` op (settle_ack doesn't skip it).
+            let cutoff = now_ms() - DEAD_LETTER_MS;
+            match conn.execute(
+                "UPDATE emerald_ops SET state = 'failed', updated_unix_ms = ?2 \
+                 WHERE state = 'pending' AND created_unix_ms < ?1",
+                params![cutoff, now_ms()],
+            ) {
+                Ok(n) if n > 0 => {
+                    tracing::warn!(count = n, "reconcile: dead-lettered stale pending ops -> failed (never delivered)")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "reconcile: dead-letter pending failed"),
+            }
+            match conn.execute(
+                "UPDATE emerald_ops SET state = 'stuck', updated_unix_ms = ?2 \
+                 WHERE state = 'sent' AND created_unix_ms < ?1",
+                params![cutoff, now_ms()],
+            ) {
+                Ok(n) if n > 0 => {
+                    tracing::error!(count = n, "reconcile: dead-lettered stale sent ops -> stuck (consumption ambiguous; needs manual review)")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "reconcile: dead-letter sent failed"),
+            }
             let mut stmt = match conn.prepare(
                 "SELECT op_id, idem_key, mc_uuid, requested_amount FROM emerald_ops \
                  WHERE state IN ('pending','sent') ORDER BY created_unix_ms ASC LIMIT 50",
@@ -212,7 +272,7 @@ impl ChargeCoordinator {
             if let Ok(conn) = pool.get() {
                 let _ = conn.execute(
                     "UPDATE emerald_ops SET state = ?2, updated_unix_ms = ?3 \
-                     WHERE op_id = ?1 AND state NOT IN ('settled','failed')",
+                     WHERE op_id = ?1 AND state NOT IN ('settled','failed','stuck')",
                     params![op_id, state, now_ms()],
                 );
             }

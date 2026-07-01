@@ -22,8 +22,11 @@ const SCHEMA_V1: &str = include_str!("schema.sql");
 /// The v2 delta: independent MoyMoy accounts (handle + PIN), sessions, MC links
 /// (additive ALTERs + new tables; resets legacy mc_uuid-keyed wallet data).
 const SCHEMA_V2: &str = include_str!("schema_v2.sql");
+/// The v3 delta: one Minecraft character belongs to exactly one MoyMoy account
+/// (UNIQUE index on account_mc_links.mc_uuid).
+const SCHEMA_V3: &str = include_str!("schema_v3.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -79,8 +82,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 2;
         tracing::info!("sqlite migrated to schema v2 (independent MoyMoy accounts)");
     }
-    // Future: `if version < 3 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V3)?;
-    //          tx.pragma_update(None, "user_version", 3)?; tx.commit()?; version = 3; }`
+    if version < 3 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V3)?;
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+        version = 3;
+        tracing::info!("sqlite migrated to schema v3 (one character ↔ one account)");
+    }
+    // Future: `if version < 4 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V4)?;
+    //          tx.pragma_update(None, "user_version", 4)?; tx.commit()?; version = 4; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }

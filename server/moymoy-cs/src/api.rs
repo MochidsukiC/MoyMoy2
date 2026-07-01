@@ -285,7 +285,7 @@ struct InventoryQuery {
 
 async fn inventory(
     State(st): State<AppState>,
-    _acct: AuthedAccount,
+    acct: AuthedAccount,
     Query(q): Query<InventoryQuery>,
 ) -> Result<Json<Value>, ApiError> {
     if !st.can_charge() {
@@ -303,6 +303,20 @@ async fn inventory(
             })))
         }
     };
+    // R007: don't reveal a character's inventory to an account that doesn't own
+    // it. Unclaimed (first charge) or self-owned is fine; another account's is not.
+    let id = acct.account_id.clone();
+    let mu = mc_uuid.clone();
+    let claimed_by_other = blocking(st.pool.clone(), move |conn| {
+        Ok::<bool, ApiError>(matches!(identity::mc_link_owner(conn, &mu)?, Some(o) if o != id))
+    })
+    .await?;
+    if claimed_by_other {
+        return Ok(Json(json!({
+            "ok": false, "error": "character_claimed", "can_charge": true,
+            "emeralds": 0, "blocks": 0, "chargeable": 0,
+        })));
+    }
     let inv = st.charge.query_inventory(&mc_uuid).await?;
     Ok(Json(json!({
         "ok": true, "can_charge": true,
