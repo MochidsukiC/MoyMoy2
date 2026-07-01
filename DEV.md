@@ -101,7 +101,9 @@ UIフロー:
 - [x] 承認ゲート課題の実装（R007 1キャラ1口座 / R008 dead-letter `1b95b62`、R05/R06/R13/charge再試行 `21d98cc`）
 - [x] 再公開: バンドル v0.2.0 を GitHub リリース化＋registry再登録
 - [x] **メール認証**: 検証/2FA/PINリカバリ/1メール1口座＋SMTP無しdegrade — backend `01a4b0f`(schema v4, スモーク緑) / frontend `cf702d6`(Babel透過)
-- [ ] CodeX 再レビュー反映（R007/R008・frontend-followups、メール認証）— reviewer 実行中
-- [ ] SMTP 本番設定（`MOCHI_SMTP_*` を運用者が env で設定。gmail/Resend/Brevo/SES 等）
-- [ ] 再公開 v0.2.1（R007/R008・frontend修正・メール認証を反映した最終バンドル）＋ backend 再配置（`deploy-backend.ps1`）
+- [x] CodeX 再レビュー反映（R007/R008・frontend-followups `cc15389` ＋ メール認証 `9b910e5`）— 資産損失floatバグ・dead-letter・OTPロールバック・pepper 等
+- [x] 再公開 **v0.2.1**（R007/R008・frontend修正・メール認証・レビュー反映を束ねた最終バンドル）を GitHub リリース＋HUB 再登録（sha256 `1b54d370`）
+- [ ] SMTP 本番設定（`MOCHI_SMTP_*` ＋任意 `MOYMOY_OTP_PEPPER` を運用者が env で設定。gmail/Resend/Brevo/SES 等）— 未設定なら degrade
+- [ ] backend 再配置（`deploy-backend.ps1` で v0.2.1 の moymoy-cs を Hub workdir へ）
 - [ ] フル E2E（in-world で 0.2.1 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
+- [ ] 承認ゲート保留: `MOYMOY_OTP_PEPPER` の本番 fail-closed 化 / `AccountInfo` の email 型統合 / refresh 失敗の UI エラー状態化 / `run_inbound` 切断理由の可視化（mc-sdk 共有層）
