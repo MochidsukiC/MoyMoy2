@@ -187,10 +187,22 @@
     store,
 
     // ── auth (independent MoyMoy accounts) ──
-    register: async ({ handle, display_name, pin }) =>
-      postJson("/auth/register", { handle, display_name, pin, phone_id: await phoneId() }),
+    // Whether email verification / 2FA / recovery are active (SMTP configured).
+    config: () => getJson("/auth/config"),
+    // register: with email enabled → {pending:"verify_email"}; else → {session}.
+    register: async ({ handle, display_name, pin, email }) =>
+      postJson("/auth/register", { handle, display_name, pin, email, phone_id: await phoneId() }),
+    registerVerify: async ({ email, code }) =>
+      postJson("/auth/register/verify", { email, code, phone_id: await phoneId() }),
+    // login: with 2FA → {pending:"2fa"}; else → {session}.
     login: async ({ handle, pin }) =>
       postJson("/auth/login", { handle, pin, phone_id: await phoneId() }),
+    loginVerify: async ({ handle, code }) =>
+      postJson("/auth/login/verify", { handle, code, phone_id: await phoneId() }),
+    // PIN recovery via an emailed code.
+    recoverStart: ({ handle }) => postJson("/auth/recover/start", { handle }),
+    recoverVerify: async ({ handle, code, new_pin }) =>
+      postJson("/auth/recover/verify", { handle, code, new_pin, phone_id: await phoneId() }),
     // logout/me accept an optional per-call session so the app shell can act on
     // a SPECIFIC account (switch-verify, logout-other) without disturbing the
     // active session (R05/R06).

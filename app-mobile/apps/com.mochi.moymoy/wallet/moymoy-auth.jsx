@@ -42,11 +42,23 @@ const REG_ERR = {
   bad_handle: "ID は半角英数字と _ の3〜20文字です",
   bad_pin: "PIN は4〜6桁の数字です",
   bad_display_name: "名前を入力してください",
+  bad_email: "メールアドレスの形式が正しくありません",
+  email_taken: "このメールアドレスはすでに使われています",
+  too_soon: "コードを送信済みです。少し待ってから再送してください",
+  invalid_code: "確認コードが正しくありません",
 };
 const LOGIN_ERR = {
   invalid_credentials: "ID または PIN が違います",
   locked: "試行回数が多すぎます。しばらく待ってから再試行してください",
+  invalid_code: "確認コードが正しくありません",
+  recovery_unavailable: "この環境では PIN の再設定は利用できません",
 };
+
+/// Loose email check for the input field (the server validates authoritatively).
+function emailLooksOk(s) {
+  const t = (s || "").trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
+}
 
 /* ─── small UI atoms ─────────────────────────────────────────────────── */
 function PinDots({ len, max = 6 }) {
@@ -143,18 +155,52 @@ function AuthWelcome({ canCancel, onRegister, onLogin, onCancel }) {
   );
 }
 
+/* ─── emailed-code entry (signup verify / 2FA / recovery) ────────────── */
+function CodeEntry({ title, sub, email, hint, cta, onSubmit, onResend, onBack, busy, err }) {
+  const [code, setCode] = maState("");
+  const press = (k) => setCode((c) => (k === "⌫" ? c.slice(0, -1) : c.length >= 6 ? c : c + k));
+  return (
+    <AuthScene title={title} sub={sub} onBack={onBack}>
+      <div style={{ padding: "24px 22px", display: "flex", flexDirection: "column", alignItems: "center", gap: 18 }}>
+        {(email || hint) && (
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", textAlign: "center", lineHeight: 1.7 }}>
+            {email ? <>{email} に確認コードを送信しました。<br />メールの6桁コードを入力してください。</> : hint}
+          </div>
+        )}
+        <PinDots len={code.length} />
+        {err && <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, color: "var(--carle-red)", textAlign: "center" }}>{err}</div>}
+        <div style={{ width: "100%", maxWidth: 320 }}>
+          <PinKeypad onPress={press} />
+          <button disabled={code.length < 6 || busy} onClick={() => { const c = code; setCode(""); onSubmit(c); }} style={{ ...ctaStyle(code.length < 6 || busy), marginTop: 14 }}>
+            {busy ? "確認中…" : cta || "確認する"}
+          </button>
+          {onResend && (
+            <button onClick={onResend} disabled={busy} style={{ width: "100%", marginTop: 10, border: "none", background: "transparent",
+              cursor: busy ? "default" : "pointer", fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 600, color: "var(--ink-soft)" }}>
+              コードを再送する
+            </button>
+          )}
+        </div>
+      </div>
+    </AuthScene>
+  );
+}
+
 /* ─── register (口座開設) ────────────────────────────────────────────── */
-function AuthRegister({ onDone, onBack }) {
-  const [step, setStep] = maState("form"); // form | pin | confirm
+function AuthRegister({ emailEnabled, onDone, onBack }) {
+  const [step, setStep] = maState("form"); // form | pin | confirm | code
   const [name, setName] = maState("");
   const [handle, setHandle] = maState("");
+  const [email, setEmail] = maState("");
   const [pin, setPin] = maState("");
   const [pin2, setPin2] = maState("");
+  const [pendingEmail, setPendingEmail] = maState("");
   const [busy, setBusy] = maState(false);
   const [err, setErr] = maState("");
 
   const handleOk = /^[A-Za-z0-9_]{3,20}$/.test(handle.trim());
   const nameOk = name.trim().length >= 1 && name.trim().length <= 24;
+  const emailOk = !emailEnabled || emailLooksOk(email);
 
   function pressPin(k) {
     setErr("");
@@ -162,26 +208,50 @@ function AuthRegister({ onDone, onBack }) {
     else setPin2((p) => (k === "⌫" ? p.slice(0, -1) : p.length >= 6 ? p : p + k));
   }
 
+  function backToForm(msg) {
+    setErr(msg || "");
+    setStep("form");
+    setPin("");
+    setPin2("");
+  }
+
   async function submit() {
     setBusy(true);
     setErr("");
     try {
-      const r = await MoyMoy.register({ handle: handle.trim(), display_name: name.trim(), pin });
-      if (r.ok && r.session) {
-        onDone(r.account, r.session);
-        return;
-      }
-      setErr(REG_ERR[r.error] || "登録に失敗しました");
-      setStep("form");
-      setPin("");
-      setPin2("");
+      const r = await MoyMoy.register({
+        handle: handle.trim(),
+        display_name: name.trim(),
+        pin,
+        email: emailEnabled ? email.trim() : undefined,
+      });
+      if (r.ok && r.session) { onDone(r.account, r.session); return; }
+      if (r.ok && r.pending === "verify_email") { setPendingEmail(r.email || email.trim()); setStep("code"); setBusy(false); return; }
+      backToForm(REG_ERR[r.error] || "登録に失敗しました");
     } catch (e) {
-      setErr("通信に失敗しました");
-      setStep("form");
-      setPin("");
-      setPin2("");
+      backToForm("通信に失敗しました");
     }
     setBusy(false);
+  }
+
+  async function verifyCode(code) {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await MoyMoy.registerVerify({ email: pendingEmail, code });
+      if (r.ok && r.session) { onDone(r.account, r.session); return; }
+      setErr(REG_ERR[r.error] || "確認に失敗しました");
+    } catch (e) {
+      setErr("通信に失敗しました");
+    }
+    setBusy(false);
+  }
+
+  if (step === "code") {
+    return (
+      <CodeEntry title="メール確認" sub={"@" + handle.trim()} email={pendingEmail} cta="口座を開設"
+        onSubmit={verifyCode} onResend={submit} busy={busy} err={err} onBack={() => backToForm("")} />
+    );
   }
 
   if (step === "pin" || step === "confirm") {
@@ -189,16 +259,9 @@ function AuthRegister({ onDone, onBack }) {
     const title = step === "pin" ? "PIN を設定" : "PIN を再入力";
     const canNext = cur.length >= 4;
     const onNext = () => {
-      if (step === "pin") {
-        setStep("confirm");
-      } else if (pin === pin2) {
-        submit();
-      } else {
-        setErr("PIN が一致しません");
-        setStep("pin");
-        setPin("");
-        setPin2("");
-      }
+      if (step === "pin") setStep("confirm");
+      else if (pin === pin2) submit();
+      else { setErr("PIN が一致しません"); setStep("pin"); setPin(""); setPin2(""); }
     };
     return (
       <AuthScene title="口座を開設" sub={"@" + (handle || "id")} onBack={() => { setStep("form"); setPin(""); setPin2(""); setErr(""); }}>
@@ -210,7 +273,7 @@ function AuthRegister({ onDone, onBack }) {
           <div style={{ width: "100%", maxWidth: 320 }}>
             <PinKeypad onPress={pressPin} />
             <button disabled={!canNext || busy} onClick={onNext} style={{ ...ctaStyle(!canNext || busy), marginTop: 14 }}>
-              {busy ? "処理中…" : step === "pin" ? "次へ" : "口座を開設"}
+              {busy ? "処理中…" : step === "pin" ? "次へ" : emailEnabled ? "確認コードを送る" : "口座を開設"}
             </button>
           </div>
         </div>
@@ -219,7 +282,7 @@ function AuthRegister({ onDone, onBack }) {
   }
 
   return (
-    <AuthScene title="口座を開設" sub="名前と ID を決めてください" onBack={onBack}>
+    <AuthScene title="口座を開設" sub={emailEnabled ? "名前・ID・メールを設定" : "名前と ID を決めてください"} onBack={onBack}>
       <div style={{ padding: "24px 22px", display: "flex", flexDirection: "column", gap: 18 }}>
         <div>
           <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>表示名</div>
@@ -231,12 +294,17 @@ function AuthRegister({ onDone, onBack }) {
             <span style={{ fontFamily: "var(--font-mono)", fontSize: 18, fontWeight: 700, color: "var(--ink-soft)" }}>@</span>
             <input value={handle} onChange={(e) => setHandle(e.target.value)} placeholder="alice" maxLength={20} style={fieldStyle} />
           </div>
-          <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", marginTop: 6 }}>
-            半角英数字と _ の3〜20文字
-          </div>
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", marginTop: 6 }}>半角英数字と _ の3〜20文字</div>
         </div>
+        {emailEnabled && (
+          <div>
+            <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>メールアドレス（本人確認・PIN再設定）</div>
+            <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" type="email" maxLength={254} style={fieldStyle} />
+            <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", marginTop: 6 }}>確認コードを送信します。1メール＝1口座。</div>
+          </div>
+        )}
         {err && <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)" }}>{err}</div>}
-        <button disabled={!handleOk || !nameOk} onClick={() => { setErr(""); setStep("pin"); }} style={ctaStyle(!handleOk || !nameOk)}>
+        <button disabled={!handleOk || !nameOk || !emailOk} onClick={() => { setErr(""); setStep("pin"); }} style={ctaStyle(!handleOk || !nameOk || !emailOk)}>
           PIN の設定へ
         </button>
       </div>
@@ -245,10 +313,11 @@ function AuthRegister({ onDone, onBack }) {
 }
 
 /* ─── login ──────────────────────────────────────────────────────────── */
-function AuthLogin({ onDone, onBack }) {
-  const [step, setStep] = maState("form"); // form | pin
+function AuthLogin({ emailEnabled, onDone, onBack, onForgot }) {
+  const [step, setStep] = maState("form"); // form | pin | code
   const [handle, setHandle] = maState("");
   const [pin, setPin] = maState("");
+  const [pendingEmail, setPendingEmail] = maState("");
   const [busy, setBusy] = maState(false);
   const [err, setErr] = maState("");
 
@@ -264,10 +333,8 @@ function AuthLogin({ onDone, onBack }) {
     setErr("");
     try {
       const r = await MoyMoy.login({ handle: handle.trim(), pin });
-      if (r.ok && r.session) {
-        onDone(r.account, r.session);
-        return;
-      }
+      if (r.ok && r.session) { onDone(r.account, r.session); return; }
+      if (r.ok && r.pending === "2fa") { setPendingEmail(r.email || ""); setStep("code"); setBusy(false); return; }
       setErr(LOGIN_ERR[r.error] || "ログインに失敗しました");
       setPin("");
     } catch (e) {
@@ -275,6 +342,26 @@ function AuthLogin({ onDone, onBack }) {
       setPin("");
     }
     setBusy(false);
+  }
+
+  async function verifyCode(code) {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await MoyMoy.loginVerify({ handle: handle.trim(), code });
+      if (r.ok && r.session) { onDone(r.account, r.session); return; }
+      setErr(LOGIN_ERR[r.error] || "確認に失敗しました");
+    } catch (e) {
+      setErr("通信に失敗しました");
+    }
+    setBusy(false);
+  }
+
+  if (step === "code") {
+    return (
+      <CodeEntry title="2段階認証" sub={"@" + handle.trim()} email={pendingEmail} cta="ログイン"
+        onSubmit={verifyCode} onResend={submit} busy={busy} err={err} onBack={() => { setStep("pin"); setErr(""); }} />
+    );
   }
 
   if (step === "pin") {
@@ -289,6 +376,12 @@ function AuthLogin({ onDone, onBack }) {
             <button disabled={pin.length < 4 || busy} onClick={submit} style={{ ...ctaStyle(pin.length < 4 || busy), marginTop: 14 }}>
               {busy ? "確認中…" : "ログイン"}
             </button>
+            {emailEnabled && onForgot && (
+              <button onClick={onForgot} disabled={busy} style={{ width: "100%", marginTop: 10, border: "none", background: "transparent",
+                cursor: "pointer", fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 600, color: "var(--ink-soft)" }}>
+                PIN をお忘れですか？
+              </button>
+            )}
           </div>
         </div>
       </AuthScene>
@@ -308,6 +401,105 @@ function AuthLogin({ onDone, onBack }) {
         {err && <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)" }}>{err}</div>}
         <button disabled={!handleOk} onClick={() => { setErr(""); setStep("pin"); }} style={ctaStyle(!handleOk)}>
           次へ
+        </button>
+        {emailEnabled && onForgot && (
+          <button onClick={onForgot} style={{ width: "100%", border: "none", background: "transparent", cursor: "pointer",
+            fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 600, color: "var(--ink-soft)" }}>
+            PIN をお忘れですか？
+          </button>
+        )}
+      </div>
+    </AuthScene>
+  );
+}
+
+/* ─── recovery (PIN 再設定) ──────────────────────────────────────────── */
+function AuthRecover({ onDone, onBack }) {
+  const [step, setStep] = maState("handle"); // handle | code | newpin
+  const [handle, setHandle] = maState("");
+  const [code, setCode] = maState("");
+  const [pin, setPin] = maState("");
+  const [busy, setBusy] = maState(false);
+  const [err, setErr] = maState("");
+
+  const handleOk = /^[A-Za-z0-9_]{3,20}$/.test(handle.trim());
+
+  async function start() {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await MoyMoy.recoverStart({ handle: handle.trim() });
+      if (r.ok) { setStep("code"); setBusy(false); return; }
+      setErr(LOGIN_ERR[r.error] || "送信に失敗しました");
+    } catch (e) {
+      setErr("通信に失敗しました");
+    }
+    setBusy(false);
+  }
+
+  async function finish() {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await MoyMoy.recoverVerify({ handle: handle.trim(), code, new_pin: pin });
+      if (r.ok && r.session) { onDone(r.account, r.session); return; }
+      if (r.error === "bad_pin") { setErr("PIN は4〜6桁の数字です"); setPin(""); }
+      else { setErr(REG_ERR[r.error] || "確認に失敗しました"); setStep("code"); setCode(""); setPin(""); }
+    } catch (e) {
+      setErr("通信に失敗しました");
+    }
+    setBusy(false);
+  }
+
+  function pressPin(k) {
+    setErr("");
+    setPin((p) => (k === "⌫" ? p.slice(0, -1) : p.length >= 6 ? p : p + k));
+  }
+
+  if (step === "code") {
+    return (
+      <CodeEntry title="PIN 再設定" sub={"@" + handle.trim()}
+        hint={"@" + handle.trim() + " に登録があれば確認コードを送信しました。コードを入力してください。"} cta="次へ"
+        onSubmit={(c) => { setCode(c); setErr(""); setStep("newpin"); }} onResend={start} busy={busy} err={err}
+        onBack={() => { setStep("handle"); setErr(""); }} />
+    );
+  }
+
+  if (step === "newpin") {
+    return (
+      <AuthScene title="PIN 再設定" sub="新しい PIN" onBack={() => { setStep("code"); setPin(""); setErr(""); }}>
+        <div style={{ padding: "30px 22px", display: "flex", flexDirection: "column", alignItems: "center", gap: 22 }}>
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 15, fontWeight: 700 }}>新しい PIN を設定</div>
+          <PinDots len={pin.length} />
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)" }}>4〜6桁の数字</div>
+          {err && <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, color: "var(--carle-red)", textAlign: "center" }}>{err}</div>}
+          <div style={{ width: "100%", maxWidth: 320 }}>
+            <PinKeypad onPress={pressPin} />
+            <button disabled={pin.length < 4 || busy} onClick={finish} style={{ ...ctaStyle(pin.length < 4 || busy), marginTop: 14 }}>
+              {busy ? "設定中…" : "PIN を再設定してログイン"}
+            </button>
+          </div>
+        </div>
+      </AuthScene>
+    );
+  }
+
+  return (
+    <AuthScene title="PIN 再設定" sub="メールで本人確認します" onBack={onBack}>
+      <div style={{ padding: "24px 22px", display: "flex", flexDirection: "column", gap: 18 }}>
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", lineHeight: 1.8 }}>
+          登録済みのメールアドレスに確認コードを送り、新しい PIN を設定します。
+        </div>
+        <div>
+          <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>MoyMoy ID</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontFamily: "var(--font-mono)", fontSize: 18, fontWeight: 700, color: "var(--ink-soft)" }}>@</span>
+            <input value={handle} onChange={(e) => setHandle(e.target.value.replace(/^@/, ""))} placeholder="alice" maxLength={20} style={fieldStyle} />
+          </div>
+        </div>
+        {err && <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)" }}>{err}</div>}
+        <button disabled={!handleOk || busy} onClick={start} style={ctaStyle(!handleOk || busy)}>
+          {busy ? "送信中…" : "確認コードを送る"}
         </button>
       </div>
     </AuthScene>
@@ -364,6 +556,7 @@ function AccountMenu({ open, accounts, activeId, onSwitch, onAdd, onLogout, onSe
 /* ─── settings (linked MC characters + logout) ───────────────────────── */
 function SettingsSheet({ open, account, onLogout, onClose }) {
   const [links, setLinks] = maState([]);
+  const [email, setEmail] = maState(null);
   const [loaded, setLoaded] = maState(false);
   const [failed, setFailed] = maState(false);
   maEffect(() => {
@@ -374,7 +567,7 @@ function SettingsSheet({ open, account, onLogout, onClose }) {
     MoyMoy.me()
       .then((r) => {
         if (!alive) return;
-        if (r.ok) setLinks(r.linked_mc || []);
+        if (r.ok) { setLinks(r.linked_mc || []); setEmail(r.email || null); }
         else setFailed(true);
       })
       .catch(() => { if (alive) setFailed(true); })
@@ -393,6 +586,11 @@ function SettingsSheet({ open, account, onLogout, onClose }) {
           <div style={{ textAlign: "center", marginTop: 12 }}>
             <div style={{ fontFamily: "var(--font-jp)", fontSize: 16, fontWeight: 700 }}>{account.display_name || ("@" + account.handle)}</div>
             <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink-soft)" }}>@{account.handle}</div>
+            {email && (
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--moy-deep)", marginTop: 4 }}>
+                ✓ {email}
+              </div>
+            )}
           </div>
         )}
         <div className="h-section" style={{ marginTop: 20, marginBottom: 8 }}>連携キャラクター</div>
@@ -431,8 +629,18 @@ function MoyMoyRoot({ onClose }) {
   const [phase, setPhase] = maState("loading"); // loading | auth | app
   const [accounts, setAccounts] = maState([]);
   const [activeId, setActiveId] = maState(null);
-  const [authMode, setAuthMode] = maState("welcome"); // welcome | register | login
+  const [authMode, setAuthMode] = maState("welcome"); // welcome | register | login | recover
   const [adding, setAdding] = maState(false);
+  const [emailEnabled, setEmailEnabled] = maState(false);
+
+  // Whether the backend has email verification / 2FA / recovery active.
+  maEffect(() => {
+    let alive = true;
+    MoyMoy.config()
+      .then((r) => { if (alive && r && r.ok) setEmailEnabled(!!r.email_enabled); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
 
   // Boot: restore the persisted session list and validate the active one.
   maEffect(() => {
@@ -559,8 +767,9 @@ function MoyMoyRoot({ onClose }) {
   }
 
   if (phase === "auth") {
-    if (authMode === "register") return <AuthRegister onDone={onAuthDone} onBack={() => setAuthMode("welcome")} />;
-    if (authMode === "login") return <AuthLogin onDone={onAuthDone} onBack={() => setAuthMode("welcome")} />;
+    if (authMode === "register") return <AuthRegister emailEnabled={emailEnabled} onDone={onAuthDone} onBack={() => setAuthMode("welcome")} />;
+    if (authMode === "login") return <AuthLogin emailEnabled={emailEnabled} onDone={onAuthDone} onBack={() => setAuthMode("welcome")} onForgot={() => setAuthMode("recover")} />;
+    if (authMode === "recover") return <AuthRecover onDone={onAuthDone} onBack={() => setAuthMode("login")} />;
     return <AuthWelcome canCancel={adding && !!accounts.find((a) => a.account_id === activeId)}
       onRegister={() => setAuthMode("register")} onLogin={() => setAuthMode("login")} onCancel={cancelAdd} />;
   }
@@ -580,5 +789,6 @@ function MoyMoyRoot({ onClose }) {
 }
 
 Object.assign(window, {
-  MoyMoyRoot, AuthWelcome, AuthRegister, AuthLogin, AccountMenu, SettingsSheet, PinKeypad, PinDots,
+  MoyMoyRoot, AuthWelcome, AuthRegister, AuthLogin, AuthRecover, CodeEntry,
+  AccountMenu, SettingsSheet, PinKeypad, PinDots,
 });
