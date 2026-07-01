@@ -27,6 +27,7 @@ async function loadAccounts() {
       activeId: o.activeId || null,
     };
   } catch (e) {
+    console.error("MoyMoy: stored account list is corrupt JSON; resetting to empty", e);
     return { accounts: [], activeId: null };
   }
 }
@@ -229,6 +230,7 @@ function AuthRegister({ emailEnabled, onDone, onBack }) {
       if (r.ok && r.pending === "verify_email") { setPendingEmail(r.email || email.trim()); setStep("code"); setBusy(false); return; }
       backToForm(REG_ERR[r.error] || "登録に失敗しました");
     } catch (e) {
+      console.warn("MoyMoy: register failed (network/server/parse)", e);
       backToForm("通信に失敗しました");
     }
     setBusy(false);
@@ -338,6 +340,7 @@ function AuthLogin({ emailEnabled, onDone, onBack, onForgot }) {
       setErr(LOGIN_ERR[r.error] || "ログインに失敗しました");
       setPin("");
     } catch (e) {
+      console.warn("MoyMoy: login failed (network/server/parse)", e);
       setErr("通信に失敗しました");
       setPin("");
     }
@@ -570,7 +573,7 @@ function SettingsSheet({ open, account, onLogout, onClose }) {
         if (r.ok) { setLinks(r.linked_mc || []); setEmail(r.email || null); }
         else setFailed(true);
       })
-      .catch(() => { if (alive) setFailed(true); })
+      .catch((e) => { console.warn("MoyMoy: settings load (MoyMoy.me) failed", e); if (alive) setFailed(true); })
       .finally(() => { if (alive) setLoaded(true); });
     return () => { alive = false; };
   }, [open]);
@@ -657,6 +660,7 @@ function MoyMoyRoot({ onClose }) {
           verdict = me.ok ? "ok" : (me.error === "unauthorized" ? "expired" : "unknown");
         } catch (e) {
           // network / non-200 HTTP / JSON parse failure — can't verify (transient)
+          console.warn("MoyMoy: could not verify active session on boot (network/server/parse); treating as transient", e);
           verdict = "unknown";
         }
         if (!alive) return;
@@ -701,7 +705,10 @@ function MoyMoyRoot({ onClose }) {
     try {
       const me = await MoyMoy.me(acc.session);
       verdict = me.ok ? "ok" : (me.error === "unauthorized" ? "expired" : "unknown");
-    } catch (e) { verdict = "unknown"; }
+    } catch (e) {
+      console.warn("MoyMoy: could not verify target account on switch (network/server/parse); aborting switch", e);
+      verdict = "unknown";
+    }
     if (verdict === "ok") {
       MoyMoy.setSession(acc.session);
       setActiveId(id);
@@ -725,7 +732,13 @@ function MoyMoyRoot({ onClose }) {
     if (acc) {
       // Per-call token: revoke THIS account's session without clobbering the
       // active one (R05/R06).
-      try { await MoyMoy.logout(acc.session); } catch (e) { /* ignore */ }
+      try {
+        await MoyMoy.logout(acc.session);
+      } catch (e) {
+        // Best-effort server revocation: still remove the account locally, but
+        // surface the failure — a silently un-revoked session stays valid server-side.
+        console.warn("MoyMoy: server logout failed; removing account locally anyway", e);
+      }
     }
     const rest = accounts.filter((a) => a.account_id !== id);
     let nextActive = activeId;

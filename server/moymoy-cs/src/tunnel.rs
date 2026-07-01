@@ -27,9 +27,19 @@ use crate::env_or;
 /// `local_target` (our loopback TLS listener). Hub endpoints come from env with
 /// dev defaults that match a local `mochi-inworld` devstack.
 fn config(mnn_domain: &str, local_target: SocketAddr) -> CsTunnelConfig {
-    let hub_quic_addr = env_or("MOCHI_TUNNEL_HUB_QUIC", "127.0.0.1:7420")
-        .parse::<SocketAddr>()
-        .ok();
+    let hub_quic_addr = {
+        let raw = env_or("MOCHI_TUNNEL_HUB_QUIC", "127.0.0.1:7420");
+        match raw.parse::<SocketAddr>() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                // The default always parses; failure means an invalid env override.
+                // QUIC remains disabled (None) but surface the misconfiguration.
+                tracing::warn!(error = %e, value = %raw,
+                    "MOCHI_TUNNEL_HUB_QUIC is not a valid socket address; QUIC transport disabled");
+                None
+            }
+        }
+    };
     CsTunnelConfig {
         hub_ws_base: env_or("MOCHI_TUNNEL_HUB_WS", "ws://127.0.0.1:7411"),
         hub_quic_addr,

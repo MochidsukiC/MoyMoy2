@@ -118,8 +118,14 @@ impl ChargeCoordinator {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if let Some(prev) = db::idem_get(&tx, &ik, "charge")? {
-                let v: Value = serde_json::from_str(&prev).unwrap_or_else(|_| json!({}));
-                let op = v.get("op_id").and_then(Value::as_str).unwrap_or("").to_string();
+                let op = match serde_json::from_str::<Value>(&prev) {
+                    Ok(v) => v.get("op_id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    Err(e) => {
+                        tracing::error!(error = %e, idem_key = %ik,
+                            "begin_charge: corrupt idempotency record; treating as charge_failed (not fabricating success)");
+                        String::new()
+                    }
+                };
                 return Ok(BeginCharge::Existing(op));
             }
             // R007: a character belongs to exactly one account. Reject a charge
@@ -177,8 +183,14 @@ impl ChargeCoordinator {
                 self.set_state(&op_id, "sent").await;
                 "sent"
             }
-            // Not delivered now — leave 'pending'; reconciliation retries later.
-            SendOutcome::PlayerOffline | SendOutcome::BusDown | SendOutcome::Error(_) => "pending",
+            // Transport/SDK error: leave 'pending' for reconciliation, but surface it.
+            SendOutcome::Error(msg) => {
+                tracing::warn!(op_id = %op_id, error = %msg,
+                    "begin_charge: send_charge transport error; leaving 'pending' for reconcile");
+                "pending"
+            }
+            // Expected transient (player offline / bus reconnecting) — leave 'pending'; reconcile retries.
+            SendOutcome::PlayerOffline | SendOutcome::BusDown => "pending",
         };
         Ok(json!({ "ok": true, "op_id": op_id, "state": state }))
     }
@@ -249,15 +261,33 @@ impl ChargeCoordinator {
         .await
         {
             Ok(v) => v,
-            Err(_) => return,
+            Err(e) => {
+                tracing::error!(error = %e, "reconcile: spawn_blocking join failed (panic or shutdown); skipping this cycle");
+                return;
+            }
         };
 
         // Re-send routed by the character's mc_uuid; the credit on settle still
         // lands on the op's account_id (see settle_ack).
         for (op_id, idem_key, mc_uuid, amount) in ops {
-            if let Ok(uuid) = Uuid::parse_str(&mc_uuid) {
-                if let SendOutcome::Sent = bus.send_charge(&uuid, &op_id, &idem_key, amount).await {
-                    self.set_state(&op_id, "sent").await;
+            match Uuid::parse_str(&mc_uuid) {
+                Ok(uuid) => match bus.send_charge(&uuid, &op_id, &idem_key, amount).await {
+                    SendOutcome::Sent => self.set_state(&op_id, "sent").await,
+                    // Transport/SDK error: leave state unchanged (retried next cycle), but surface it.
+                    SendOutcome::Error(msg) => {
+                        tracing::warn!(op_id = %op_id, error = %msg,
+                            "reconcile: send_charge transport error; will retry next cycle");
+                    }
+                    // Expected transient — leave state unchanged; retried next cycle.
+                    SendOutcome::PlayerOffline | SendOutcome::BusDown => {}
+                },
+                Err(e) => {
+                    // A persisted mc_uuid that fails to parse can never succeed;
+                    // terminate it immediately (mirrors the primary charge path)
+                    // instead of silently reselecting it every reconcile cycle.
+                    tracing::error!(error = %e, op_id = %op_id, mc_uuid = %mc_uuid,
+                        "reconcile: op has unparseable mc_uuid; marking failed");
+                    self.set_state(&op_id, "failed").await;
                 }
             }
         }
@@ -268,16 +298,24 @@ impl ChargeCoordinator {
         let pool = self.pool.clone();
         let op_id = op_id.to_string();
         let state = state.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = pool.get() {
-                let _ = conn.execute(
+        let joined = tokio::task::spawn_blocking(move || match pool.get() {
+            Ok(conn) => {
+                if let Err(e) = conn.execute(
                     "UPDATE emerald_ops SET state = ?2, updated_unix_ms = ?3 \
                      WHERE op_id = ?1 AND state NOT IN ('settled','failed','stuck')",
                     params![op_id, state, now_ms()],
-                );
+                ) {
+                    tracing::warn!(error = %e, op_id = %op_id, state = %state, "set_state: update failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, op_id = %op_id, state = %state, "set_state: pool.get() failed");
             }
         })
         .await;
+        if let Err(e) = joined {
+            tracing::warn!(error = %e, "set_state: spawn_blocking join failed (panic or shutdown)");
+        }
     }
 }
 
@@ -287,10 +325,23 @@ impl ChargeCoordinator {
 pub fn settle_ack(conn: &mut Connection, ack: &Value) -> rusqlite::Result<()> {
     let op_id = ack.get("op_id").and_then(Value::as_str).unwrap_or("");
     if op_id.is_empty() {
+        tracing::warn!(ack = %ack, "settle: ack with missing/empty op_id (dropping)");
         return Ok(());
     }
     let status = ack.get("status").and_then(Value::as_str).unwrap_or("");
-    let settled = ack.get("settled").and_then(Value::as_i64).unwrap_or(0);
+    // `settled` arrives from an external mod over JSON. Integer emerald counts
+    // encoded as floats (e.g. 100.0 by Gson/Java defaults) make as_i64() return
+    // None, which would unwrap_or(0) and write off consumed emeralds (asset loss).
+    // Accept integers or fractionless floats; reject true non-integer floats.
+    let settled = ack
+        .get("settled")
+        .and_then(|v| {
+            v.as_i64().or_else(|| {
+                v.as_f64()
+                    .and_then(|f| if f.fract() == 0.0 { Some(f as i64) } else { None })
+            })
+        })
+        .unwrap_or(0);
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
@@ -314,6 +365,10 @@ pub fn settle_ack(conn: &mut Connection, ack: &Value) -> rusqlite::Result<()> {
             return Ok(());
         }
     };
+    // Terminal states are skipped for idempotency. NOTE (R008): `stuck` is
+    // deliberately NOT terminal here — a `stuck` op (a `sent` op whose ack was
+    // ambiguous) must remain settleable by a late ack, or its consumed emeralds
+    // would be written off. Do NOT add `stuck` to this set.
     if state == "settled" || state == "failed" {
         tx.commit()?; // terminal — idempotent no-op
         return Ok(());
@@ -324,6 +379,13 @@ pub fn settle_ack(conn: &mut Connection, ack: &Value) -> rusqlite::Result<()> {
         let credited = settled.clamp(0, requested);
         if credited > 0 {
             wallet::credit_charge(&tx, &account_id, credited, now, CHARGE_LABEL)?;
+        } else {
+            // ok/duplicate ack with zero credit = 'settled' field was missing, non-integer,
+            // or negative. Consumed emeralds go uncredited; surface for monitoring.
+            tracing::warn!(
+                op_id, status, requested, settled,
+                "charge ack ok but credited 0 (missing/invalid 'settled'); no emeralds credited"
+            );
         }
         tx.execute(
             "UPDATE emerald_ops SET state = 'settled', settled_amount = ?2, updated_unix_ms = ?3 WHERE op_id = ?1",

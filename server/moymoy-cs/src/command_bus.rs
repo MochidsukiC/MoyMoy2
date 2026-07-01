@@ -195,11 +195,11 @@ impl CommandBus {
                 return None;
             }
         };
-        if sdk
+        if let Err(e) = sdk
             .reliable_send(&dst, "moymoy", payload.to_string().as_bytes())
             .await
-            .is_err()
         {
+            tracing::warn!(error = %e, uuid = %uuid, "inventory.query reliable_send failed");
             self.pending_inv.lock().await.remove(&req_id);
             return None;
         }
@@ -305,7 +305,7 @@ async fn dispatch_inbound(
 
     if v.get("op_id").is_some() {
         let pool = pool.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let joined = tokio::task::spawn_blocking(move || {
             match pool.get() {
                 Ok(mut conn) => {
                     if let Err(e) = charge::settle_ack(&mut conn, &v) {
@@ -316,6 +316,9 @@ async fn dispatch_inbound(
             }
         })
         .await;
+        if let Err(e) = joined {
+            tracing::error!(error = %e, "command bus: settle spawn_blocking join failed (panic or shutdown); charge ack may be unprocessed");
+        }
         return;
     }
 

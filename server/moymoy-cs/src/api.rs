@@ -815,6 +815,9 @@ fn replay(stored: String) -> Value {
             }
             v
         }
-        Err(_) => json!({ "ok": true, "duplicate": true }),
+        Err(e) => {
+            tracing::error!(error = %e, "replay: corrupt idempotency record; returning internal_error instead of a fabricated success");
+            json!({ "ok": false, "error": "internal_error" })
+        }
     }
 }

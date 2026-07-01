@@ -171,6 +171,7 @@ function MoySend({ friends = [], onPick }) {
         setErr("@" + h + " が見つかりません");
       }
     } catch (e) {
+      console.warn("MoyMoy: handle lookup failed (network/server/parse)", e);
       setErr("検索に失敗しました");
     }
     setBusy(false);
@@ -489,9 +490,10 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   const [canCharge, setCanCharge] = msState(false);
   const [loaded, setLoaded] = msState(false);
   const mountedRef = msRef(true);
-  // A stable idem_key for the in-flight charge attempt: a retry after a poll
-  // timeout reuses it so the server replays the same op (no double consume).
-  const chargeIdemRef = msRef(null);
+  // A stable idem_key for the in-flight transaction (send/pay/charge). A retry
+  // after a network error or poll timeout reuses it so the server replays the
+  // same op instead of executing twice (no double send/pay/charge).
+  const idemRef = msRef(null);
 
   const [tab, setTab] = msState("home");
   const [flow, setFlow] = msState(null);       // {kind, target}  amount-entry
@@ -526,7 +528,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       } else if (h.error === "unauthorized") {
         onExpired();
       }
-    } catch (e) { /* keep last good state */ }
+    } catch (e) { console.warn("MoyMoy: home refresh failed — showing last known state", e); }
   }
 
   async function loadAll(isAlive = () => true) {
@@ -534,15 +536,15 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     try {
       const m = await MoyMoy.merchants();
       if (isAlive() && m.ok) setMerchants(m.merchants.map(enrichMerchant));
-    } catch (e) { /* ignore */ }
+    } catch (e) { console.warn("MoyMoy: merchants load failed", e); }
     try {
       const f = await MoyMoy.friends();
       if (isAlive() && f.ok) setFriends(f.friends.map(enrichFriend));
-    } catch (e) { /* ignore */ }
+    } catch (e) { console.warn("MoyMoy: friends load failed", e); }
     try {
       const i = await MoyMoy.inventory();
       if (isAlive() && i.ok) setInv({ emeralds: i.emeralds, blocks: i.blocks });
-    } catch (e) { /* ignore */ }
+    } catch (e) { console.warn("MoyMoy: inventory load failed", e); }
     if (isAlive()) setLoaded(true);
   }
 
@@ -557,19 +559,21 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   msEffect(() => {
     if (tab !== "history") return;
     let alive = true;
-    MoyMoy.history("all", 100).then(r => { if (alive && r.ok) setTxns(mapTxns(r.txns)); }).catch(() => {});
+    MoyMoy.history("all", 100).then(r => { if (alive && r.ok) setTxns(mapTxns(r.txns)); }).catch(e => console.warn("MoyMoy: history load failed", e));
     return () => { alive = false; };
   }, [tab]);
 
   async function pollOp(opId, tries = 25) {
+    let lastErr = null;
     for (let i = 0; i < tries; i++) {
       try {
         const r = await MoyMoy.op(opId);
         if (r.error === "unauthorized") return { unauthorized: true };
         if (r.ok && r.op && (r.op.state === "settled" || r.op.state === "failed" || r.op.state === "stuck")) return r.op;
-      } catch (e) { /* retry */ }
-      await new Promise(res => setTimeout(res, 600));
+      } catch (e) { lastErr = e; /* transient — keep polling */ }
+      if (i < tries - 1) await new Promise(res => setTimeout(res, 600));
     }
+    if (lastErr) console.warn("MoyMoy: pollOp gave up after " + tries + " attempts", lastErr);
     return null;
   }
 
@@ -580,15 +584,15 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     setErr(null);
     try {
       let res;
+      // Reuse one idem_key across retries of this attempt so a retry (after a
+      // network error or poll timeout) replays the same op, never executing twice.
+      if (!idemRef.current) idemRef.current = MoyMoy.newIdem();
       if (kind === "send") {
-        res = await MoyMoy.send(target.handle, amount);
+        res = await MoyMoy.send(target.handle, amount, idemRef.current);
       } else if (kind === "pay") {
-        res = await MoyMoy.pay(target.id, amount);
+        res = await MoyMoy.pay(target.id, amount, idemRef.current);
       } else {
-        // Reuse one idem_key across retries of this charge attempt so a retry
-        // after a poll timeout replays the same op (never consumes twice).
-        if (!chargeIdemRef.current) chargeIdemRef.current = MoyMoy.newIdem();
-        res = await MoyMoy.charge(amount, chargeIdemRef.current);
+        res = await MoyMoy.charge(amount, idemRef.current);
       }
 
       if (!res.ok) {
@@ -607,7 +611,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
           if (!mountedRef.current) return;
           const terminal = op && (op.state === "failed" || op.state === "stuck");
           // Terminal failure ⇒ this op is dead; let a retry start a fresh op.
-          if (terminal) chargeIdemRef.current = null;
+          if (terminal) idemRef.current = null;
           setErr(errLabel(terminal ? "charge_failed" : "charge_pending"));
           setBusy(false);
           await refresh(() => mountedRef.current);
@@ -621,16 +625,17 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       try {
         const i = await MoyMoy.inventory();
         if (mountedRef.current && i.ok) setInv({ emeralds: i.emeralds, blocks: i.blocks });
-      } catch (e) { /* ignore */ }
+      } catch (e) { console.warn("MoyMoy: inventory refresh after confirm failed", e); }
       if (!mountedRef.current) return;
 
-      chargeIdemRef.current = null; // settled — the next charge starts a fresh op
+      idemRef.current = null; // settled — the next transaction starts a fresh op
       setBusy(false);
       setConfirm(null);
       setFlow(null);
       setComplete({ kind, target: target ? target.name : null, amount: shownAmount });
       setTab("home");
     } catch (e) {
+      console.warn("MoyMoy: confirm (" + kind + ") failed", e);
       if (!mountedRef.current) return;
       setErr("通信に失敗しました");
       setBusy(false);
@@ -663,7 +668,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       {/* confirm sheet */}
       {confirm && (
         <MoyConfirmSheet {...confirm} balance={balance} busy={busy} error={err}
-          onCancel={() => { chargeIdemRef.current = null; setConfirm(null); setErr(null); }}
+          onCancel={() => { idemRef.current = null; setConfirm(null); setErr(null); }}
           onConfirm={doConfirm} />
       )}
 

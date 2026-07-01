@@ -63,14 +63,19 @@
         if (mochi.os.gameName) mcid = (await mochi.os.gameName()) || "";
       }
     } catch (e) {
-      /* not in-world */
+      // The guard ensures this fires only when OS API exists but threw in-world.
+      // In browser-dev (mochi absent) the try block is skipped entirely.
+      console.warn("MoyMoy.ident: OS identity API threw", e);
     }
     if (!mc_uuid && !mcid) {
       mc_uuid = qs.get("mc_uuid") || "";
       mcid = qs.get("mcid") || "";
     }
-    _identCache = { mc_uuid, mcid };
-    return _identCache;
+    const resolved = { mc_uuid, mcid };
+    // Cache only a resolved identity. If the OS API wasn't ready yet (both
+    // empty), don't poison the cache — let the next ident() call retry.
+    if (mc_uuid || mcid) _identCache = resolved;
+    return resolved;
   }
 
   // Device id (self-asserted metadata for the session row). Best-effort.
@@ -81,7 +86,7 @@
         return (st && st.phone_id) || null;
       }
     } catch (e) {
-      /* not in-world */
+      console.warn("MoyMoy.phoneId: phoneState API threw", e);
     }
     return null;
   }
@@ -96,12 +101,14 @@
         try {
           return await mochi.storage.get(k);
         } catch (e) {
+          console.error("MoyMoy.store.get (mochi.storage) failed", e);
           return null;
         }
       }
       try {
         return localStorage.getItem(k);
       } catch (e) {
+        console.error("MoyMoy.store.get (localStorage) failed", e);
         return null;
       }
     },
@@ -131,13 +138,14 @@
         try {
           return await mochi.storage.remove(k);
         } catch (e) {
+          console.error("MoyMoy.store.remove (mochi.storage) failed", e);
           return;
         }
       }
       try {
         localStorage.removeItem(k);
       } catch (e) {
-        /* ignore */
+        console.error("MoyMoy.store.remove (localStorage) failed", e);
       }
     },
   };
@@ -223,13 +231,16 @@
       return getJson("/wallet/inventory", { mc_uuid: i.mc_uuid, mcid: i.mcid });
     },
 
-    // Send to a MoyMoy handle (@id).
-    send: (toHandle, amount) =>
-      postJson("/wallet/send", { idem_key: newIdem(), to_handle: toHandle, amount }),
+    // Send to a MoyMoy handle (@id). Pass a stable `idemKey` so a retry of the
+    // SAME send (e.g. after a lost response) replays the same transfer instead of
+    // sending twice.
+    send: (toHandle, amount, idemKey) =>
+      postJson("/wallet/send", { idem_key: idemKey || newIdem(), to_handle: toHandle, amount }),
 
-    // Pay a merchant by id.
-    pay: (merchantId, amount) =>
-      postJson("/wallet/pay", { idem_key: newIdem(), merchant_id: merchantId, amount }),
+    // Pay a merchant by id. Pass a stable `idemKey` so a retry replays the same
+    // payment instead of paying twice.
+    pay: (merchantId, amount, idemKey) =>
+      postJson("/wallet/pay", { idem_key: idemKey || newIdem(), merchant_id: merchantId, amount }),
 
     // Charge from the current character's inventory emeralds (mod-backed).
     // Returns a pending op; poll op(). Pass a stable `idemKey` so a retry of the
