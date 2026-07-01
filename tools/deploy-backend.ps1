@@ -102,8 +102,9 @@ if ($EnableCharge) {
     [System.IO.File]::WriteAllText($tomlDest, $toml, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "charge enabled: cert -> $certDir ; MOCHI_MC_CERT_DIR=mc-cert set in app.toml." -ForegroundColor Green
     Write-Host "  Restart the backend to reconnect; can_charge should become true." -ForegroundColor DarkGray
-    Write-Host '  ALSO REQUIRED on the MC server: install the moymoy mod jar next to the mochi connector,' -ForegroundColor Yellow
-    Write-Host '  and add "moymoy" to mochi-server.toml [connector].hosted_app_ids, then restart the MC server.' -ForegroundColor Yellow
+    Write-Host '  ALSO REQUIRED on the MC server: load the moymoy mod jar (mod/build/libs/moymoy-*.jar)' -ForegroundColor Yellow
+    Write-Host '  next to the mochi connector mod, and set a non-empty mcserver_id in mochi-server.toml' -ForegroundColor Yellow
+    Write-Host '  (hosted_app_ids config is deprecated — the connector auto-advertises moymoy). Restart the MC server.' -ForegroundColor Yellow
 }
 
 Write-Host "Deployed to $dest" -ForegroundColor Green

@@ -16,7 +16,7 @@ MochiOS2.0 プラットフォーム向けの電子マネー / ウォレット / 
   - `mod/` — Forge 1.20.1 MC サーバーサイドmod → `moymoy.mc.mnn`。エメラルド消費/付与の真実。connector の `CommandDispatch.Handler` を `register("moymoy", …)`。**オプショナル**。
 - **エメラルドチャージ**: アプリ起点＋ゲーム内 両対応。双方向コマンドバス（backend が `cs_hosts:["moymoy"]` を claim、`reliable_send` 送信 / `run_inbound` 受信）。
 - **整合性**: 「消費の真実=mod / 残高の権威=backend」を `emerald_ops` 台帳 + 二層冪等キー(`idem_key`/`op_id`) + at-least-once 再送 + 冪等決済で eventually-consistent に。
-- **方針**: 旧 MoyMoy(`D:\IdeaProjects\MoyMoy`)はドメインの緩い参考のみ。MochiOS2.0 本体は原則無改変（app_backends 配置・`hosted_app_ids` 追加・証明書発行のみ）。
+- **方針**: 旧 MoyMoy(`D:\IdeaProjects\MoyMoy`)はドメインの緩い参考のみ。MochiOS2.0 本体は原則無改変（app_backends 配置・mod jar 配置・`mcserver_id` 設定・証明書発行のみ。`hosted_app_ids` は廃止）。
 
 ---
 
@@ -105,7 +105,7 @@ UIフロー:
 - [x] 再公開 **v0.2.1**（R007/R008・frontend修正・メール認証・レビュー反映を束ねた最終バンドル）を GitHub リリース＋HUB 再登録（sha256 `1b54d370`）
 - [x] メール送信を **MNN メール（`@*.mnn`）限定**に切替（`MnnMailSender`、外部SMTP廃止） `d6d8645`
 - [ ] 本番設定: `MOCHI_MAIL_SERVICE_BEARER`（＋任意 `MOYMOY_OTP_PEPPER`）を運用者が env で設定 — 未設定なら degrade
-- [x] **チャージ有効化の根治**: 「チャージは現在利用できません」= `can_charge=false` の原因は backend に MC クライアント証明書が無く command bus に繋がらないこと。`deploy-backend.ps1 -EnableCharge` で Hub の mc-pki CA から `--mcserver-id moymoy` の leaf を発行し `MOCHI_MC_CERT_DIR` を設定（検証: cert 付き起動で `can_charge=true`）。**チャージ成立にはもう一方の要件**: MC サーバに moymoy mod jar を導入＋`mochi-server.toml [connector].hosted_app_ids` に `"moymoy"` を追加。
+- [x] **チャージ有効化の根治**: 「チャージは現在利用できません」= `can_charge=false` の原因は backend に MC クライアント証明書が無く command bus に繋がらないこと。`deploy-backend.ps1 -EnableCharge` で Hub の mc-pki CA から `--mcserver-id moymoy` の leaf を発行し `MOCHI_MC_CERT_DIR` を設定（検証: cert 付き起動で `can_charge=true`、`run/app_backends/moymoy` に適用済）。**チャージ成立にはもう一方の要件**: MC サーバに moymoy mod jar（`mod/build/libs/moymoy-*.jar`）を mochi connector mod と一緒に読み込ませ、`mochi-server.toml` の `mcserver_id` を非空に設定（空だと connector 不起動）。※`hosted_app_ids` は**廃止**（connector が登録ハンドラを自動広告するため手動設定不要）。
 - [ ] backend 再配置（`deploy-backend.ps1 -EnableCharge` で moymoy-cs＋MC証明書を Hub workdir へ）
 - [ ] フル E2E（in-world で 0.2.2 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
 - [ ] 承認ゲート保留: `MOYMOY_OTP_PEPPER` の本番 fail-closed 化 / `AccountInfo` の email 型統合 / refresh 失敗の UI エラー状態化 / `run_inbound` 切断理由の可視化（mc-sdk 共有層）

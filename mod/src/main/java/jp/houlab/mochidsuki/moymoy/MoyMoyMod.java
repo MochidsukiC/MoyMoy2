@@ -26,8 +26,11 @@ import jp.houlab.mochidsuki.mochi.MochiMod;
  * {@code CMD_INBOUND}, and {@link MoyMoyExtension} consumes the inventory emeralds.
  *
  * <p>Depends on the MochiOS connector mod ({@code mochi}) for {@link MochiMod#DISPATCH}.
- * Add {@code "moymoy"} to {@code mochi-server.toml [connector].hosted_app_ids} so
- * the connector advertises the app to the Hub.
+ * The connector auto-advertises every handler registered on {@code DISPATCH} to
+ * the Hub ({@code hosted_app_ids} server config is deprecated — see
+ * MochiServerConfig), so hosting {@code moymoy} needs no per-app config: just load
+ * this jar next to the {@code mochi} connector mod and set a non-empty
+ * {@code mcserver_id} in {@code mochi-server.toml} (empty ⇒ connector won't start).
  *
  * <p>Also registers a read-only {@code /eme} command that shows the player's
  * chargeable inventory (no backend call — the app's charge tab performs the
@@ -57,9 +60,9 @@ public final class MoyMoyMod {
     @SubscribeEvent
     public void onServerStarting(ServerStartingEvent event) {
         MochiMod.DISPATCH.register(APP_ID, new MoyMoyExtension(event.getServer()));
-        LOGGER.info("MoyMoy: emerald-charge executor registered for app_id '{}'. "
-                + "Ensure mochi-server.toml [connector].hosted_app_ids contains \"{}\".",
-                APP_ID, APP_ID);
+        LOGGER.info("MoyMoy: emerald-charge executor registered for app_id '{}' "
+                + "(the connector auto-advertises it to the Hub; ensure mcserver_id is set).",
+                APP_ID);
     }
 
     @SubscribeEvent
