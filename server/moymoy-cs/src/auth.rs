@@ -65,15 +65,6 @@ pub enum RegisterOutcome {
     HandleTaken,
 }
 
-/// Outcome of `login`. `Invalid` is deliberately generic (no handle-vs-PIN
-/// distinction) to prevent account enumeration.
-#[derive(Debug)]
-pub enum LoginOutcome {
-    Ok(SessionMint),
-    Invalid,
-    Locked { retry_after_ms: i64 },
-}
-
 // ── credential helpers ───────────────────────────────────────────────────────
 
 /// Validate a handle (`[A-Za-z0-9_]`, 3–20 chars), returning the trimmed
@@ -89,13 +80,13 @@ pub fn valid_handle(s: &str) -> Option<String> {
 }
 
 /// A PIN is 4–6 ASCII digits.
-fn valid_pin(pin: &str) -> bool {
+pub fn valid_pin(pin: &str) -> bool {
     let len = pin.len();
     (4..=6).contains(&len) && pin.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Validate a display name (1–24 chars, no control chars), returning it trimmed.
-fn valid_display_name(s: &str) -> Option<String> {
+pub fn valid_display_name(s: &str) -> Option<String> {
     let t = s.trim();
     let len = t.chars().count();
     if (1..=24).contains(&len) && !t.chars().any(|c| c.is_control()) {
@@ -107,7 +98,7 @@ fn valid_display_name(s: &str) -> Option<String> {
 
 /// Argon2id PHC hash of a PIN (embeds a random salt). Returned as a `$argon2id$…`
 /// string suitable for storage in `accounts.pin_hash`.
-fn hash_pin(pin: &str) -> Result<String, ApiError> {
+pub fn hash_pin(pin: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(pin.as_bytes(), &salt)
@@ -181,7 +172,7 @@ pub fn lookup_handle(conn: &Connection, handle: &str) -> rusqlite::Result<Option
 
 /// Mint a session for `account_id`, persisting only the token hash. Returns the
 /// plaintext token (shown to the client once).
-fn create_session(conn: &Connection, account_id: &str, phone_id: Option<&str>) -> rusqlite::Result<String> {
+pub fn create_session(conn: &Connection, account_id: &str, phone_id: Option<&str>) -> rusqlite::Result<String> {
     let token = gen_token();
     let now = now_ms();
     conn.execute(
@@ -278,18 +269,7 @@ pub fn register(
 
     let pin_hash = hash_pin(pin)?;
     let account_id = Uuid::new_v4().to_string();
-    let now = now_ms();
-    let card = card_number_for(&account_id);
-    let holder = display.to_uppercase();
-    conn.execute(
-        "INSERT INTO accounts \
-           (account_id, balance, holder, card_number, is_merchant, \
-            handle, handle_lower, display_name, pin_hash, failed_pin_attempts, \
-            created_unix_ms, updated_unix_ms) \
-         VALUES (?1, 0, ?2, ?3, 0, ?4, ?5, ?6, ?7, 0, ?8, ?8)",
-        // card_expiry omitted — the schema DEFAULT '07/29' is the single source of truth.
-        params![account_id, holder, card, handle, handle_lower, display, pin_hash, now],
-    )?;
+    insert_account(conn, &account_id, &handle, &handle_lower, &display, &pin_hash, None)?;
     let token = create_session(conn, &account_id, phone_id)?;
     Ok(RegisterOutcome::Ok(SessionMint {
         token,
@@ -301,21 +281,109 @@ pub fn register(
     }))
 }
 
-/// Authenticate handle + PIN and mint a session. Enforces lockout and returns a
-/// generic `Invalid` for any failure mode (unknown handle, wrong PIN).
-pub fn login(
+/// Insert an account row (login account). `email` = `Some((email, email_lower))`
+/// marks it as email-verified; `None` = handle+PIN only (degrade / no email).
+/// `card_expiry` and card face are derived; the schema DEFAULT owns `card_expiry`.
+pub fn insert_account(
+    conn: &Connection,
+    account_id: &str,
+    handle: &str,
+    handle_lower: &str,
+    display: &str,
+    pin_hash: &str,
+    email: Option<(&str, &str)>,
+) -> Result<(), ApiError> {
+    let now = now_ms();
+    let card = card_number_for(account_id);
+    let holder = display.to_uppercase();
+    match email {
+        Some((em, eml)) => conn.execute(
+            "INSERT INTO accounts \
+               (account_id, balance, holder, card_number, is_merchant, handle, handle_lower, \
+                display_name, pin_hash, failed_pin_attempts, email, email_lower, \
+                email_verified_unix_ms, created_unix_ms, updated_unix_ms) \
+             VALUES (?1, 0, ?2, ?3, 0, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?10, ?10)",
+            params![account_id, holder, card, handle, handle_lower, display, pin_hash, em, eml, now],
+        )?,
+        None => conn.execute(
+            "INSERT INTO accounts \
+               (account_id, balance, holder, card_number, is_merchant, handle, handle_lower, \
+                display_name, pin_hash, failed_pin_attempts, created_unix_ms, updated_unix_ms) \
+             VALUES (?1, 0, ?2, ?3, 0, ?4, ?5, ?6, ?7, 0, ?8, ?8)",
+            params![account_id, holder, card, handle, handle_lower, display, pin_hash, now],
+        )?,
+    };
+    Ok(())
+}
+
+/// Is `handle_lower` already registered?
+pub fn handle_taken(conn: &Connection, handle_lower: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM accounts WHERE handle_lower = ?1", [handle_lower], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Is `email_lower` already registered (1 email ↔ 1 account)?
+pub fn email_taken(conn: &Connection, email_lower: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM accounts WHERE email_lower = ?1", [email_lower], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Rich account info for the email flows (2FA / recovery) and `/auth/me`.
+#[derive(Debug, Clone)]
+pub struct AccountInfo {
+    pub account_id: String,
+    pub handle: String,
+    pub display_name: String,
+    pub email: Option<String>,
+    pub email_lower: Option<String>,
+    pub email_verified: bool,
+}
+
+/// Outcome of `verify_credentials`.
+pub enum CredsOutcome {
+    Ok(AccountInfo),
+    Invalid,
+    Locked { retry_after_ms: i64 },
+}
+
+fn info_from_row(
+    account_id: String,
+    handle: Option<String>,
+    display_name: Option<String>,
+    email: Option<String>,
+    email_lower: Option<String>,
+    email_verified_ms: Option<i64>,
+) -> AccountInfo {
+    AccountInfo {
+        account_id,
+        handle: handle.unwrap_or_default(),
+        display_name: display_name.unwrap_or_default(),
+        email,
+        email_lower,
+        email_verified: email_verified_ms.is_some(),
+    }
+}
+
+/// Verify handle + PIN WITHOUT minting a session (the caller decides whether a
+/// second factor is required). Enforces lockout; clears the failure counter on
+/// success. Generic `Invalid` for unknown handle or wrong PIN (no enumeration).
+pub fn verify_credentials(
     conn: &Connection,
     handle_input: &str,
     pin: &str,
-    phone_id: Option<&str>,
-) -> Result<LoginOutcome, ApiError> {
+) -> Result<CredsOutcome, ApiError> {
     let hl = handle_input.trim().to_lowercase();
     if hl.is_empty() {
-        return Ok(LoginOutcome::Invalid);
+        return Ok(CredsOutcome::Invalid);
     }
     let row = conn
         .query_row(
-            "SELECT account_id, handle, display_name, pin_hash, failed_pin_attempts, locked_until_unix_ms \
+            "SELECT account_id, handle, display_name, pin_hash, failed_pin_attempts, \
+                    locked_until_unix_ms, email, email_lower, email_verified_unix_ms \
              FROM accounts WHERE handle_lower = ?1",
             [&hl],
             |r| {
@@ -326,58 +394,138 @@ pub fn login(
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
                 ))
             },
         )
         .optional()?;
-    let (account_id, handle, display_name, pin_hash, attempts, locked_until) = match row {
-        Some(x) => x,
-        None => return Ok(LoginOutcome::Invalid),
-    };
+    let (account_id, handle, display_name, pin_hash, attempts, locked_until, email, email_lower, ev) =
+        match row {
+            Some(x) => x,
+            None => return Ok(CredsOutcome::Invalid),
+        };
 
     let now = now_ms();
     if let Some(until) = locked_until {
         if until > now {
-            return Ok(LoginOutcome::Locked {
-                retry_after_ms: until - now,
-            });
+            return Ok(CredsOutcome::Locked { retry_after_ms: until - now });
         }
     }
-
     let ok = pin_hash.as_deref().map(|h| verify_pin(pin, h)).unwrap_or(false);
     if !ok {
-        let new_attempts = attempts + 1;
-        let new_lock = if new_attempts >= MAX_FAILED_ATTEMPTS {
-            Some(now + LOCKOUT_MS)
-        } else {
-            None
-        };
+        let na = attempts + 1;
+        let lock = if na >= MAX_FAILED_ATTEMPTS { Some(now + LOCKOUT_MS) } else { None };
         conn.execute(
             "UPDATE accounts SET failed_pin_attempts = ?2, locked_until_unix_ms = ?3, updated_unix_ms = ?4 \
              WHERE account_id = ?1",
-            params![account_id, new_attempts, new_lock, now],
+            params![account_id, na, lock, now],
         )?;
-        if new_lock.is_some() {
-            return Ok(LoginOutcome::Locked {
-                retry_after_ms: LOCKOUT_MS,
-            });
+        if lock.is_some() {
+            return Ok(CredsOutcome::Locked { retry_after_ms: LOCKOUT_MS });
         }
-        return Ok(LoginOutcome::Invalid);
+        return Ok(CredsOutcome::Invalid);
     }
-
-    // Success: clear the failure counter and mint a session.
     conn.execute(
         "UPDATE accounts SET failed_pin_attempts = 0, locked_until_unix_ms = NULL, updated_unix_ms = ?2 \
          WHERE account_id = ?1",
         params![account_id, now],
     )?;
+    Ok(CredsOutcome::Ok(info_from_row(
+        account_id, handle, display_name, email, email_lower, ev,
+    )))
+}
+
+/// Full account info by id (email flows + `/auth/me`).
+pub fn account_full(conn: &Connection, account_id: &str) -> rusqlite::Result<Option<AccountInfo>> {
+    conn.query_row(
+        "SELECT account_id, handle, display_name, email, email_lower, email_verified_unix_ms \
+         FROM accounts WHERE account_id = ?1",
+        [account_id],
+        |r| {
+            Ok(info_from_row(
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+            ))
+        },
+    )
+    .optional()
+}
+
+/// Full account info by handle (recovery / 2FA lookups).
+pub fn account_full_by_handle(conn: &Connection, handle: &str) -> rusqlite::Result<Option<AccountInfo>> {
+    let hl = handle.trim().to_lowercase();
+    if hl.is_empty() {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT account_id, handle, display_name, email, email_lower, email_verified_unix_ms \
+         FROM accounts WHERE handle_lower = ?1 AND pin_hash IS NOT NULL",
+        [&hl],
+        |r| {
+            Ok(info_from_row(
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+            ))
+        },
+    )
+    .optional()
+}
+
+/// Set a new PIN (recovery) and clear any lockout. Returns `false` if the PIN is
+/// malformed.
+pub fn set_pin(conn: &Connection, account_id: &str, new_pin: &str) -> Result<bool, ApiError> {
+    if !valid_pin(new_pin) {
+        return Ok(false);
+    }
+    let hash = hash_pin(new_pin)?;
+    conn.execute(
+        "UPDATE accounts SET pin_hash = ?2, failed_pin_attempts = 0, locked_until_unix_ms = NULL, \
+                updated_unix_ms = ?3 WHERE account_id = ?1",
+        params![account_id, hash, now_ms()],
+    )?;
+    Ok(true)
+}
+
+/// Outcome of creating the real account from a verified signup.
+pub enum VerifiedSignup {
+    Ok(SessionMint),
+    HandleTaken,
+    EmailTaken,
+}
+
+/// Create the real account from a verified signup (handle/pin_hash already
+/// validated + hashed) with a verified email, and mint its first session.
+/// Re-checks uniqueness (a handle/email could be claimed between OTP and verify).
+pub fn register_verified(
+    conn: &Connection,
+    pending: &crate::otp::PendingSignup,
+    email: &str,
+    email_lower: &str,
+    phone_id: Option<&str>,
+) -> Result<VerifiedSignup, ApiError> {
+    if handle_taken(conn, &pending.handle_lower)? {
+        return Ok(VerifiedSignup::HandleTaken);
+    }
+    if email_taken(conn, email_lower)? {
+        return Ok(VerifiedSignup::EmailTaken);
+    }
+    let account_id = Uuid::new_v4().to_string();
+    insert_account(
+        conn,
+        &account_id,
+        &pending.handle,
+        &pending.handle_lower,
+        &pending.display_name,
+        &pending.pin_hash,
+        Some((email, email_lower)),
+    )?;
     let token = create_session(conn, &account_id, phone_id)?;
-    Ok(LoginOutcome::Ok(SessionMint {
+    Ok(VerifiedSignup::Ok(SessionMint {
         token,
         account: AccountView {
             account_id,
-            handle: handle.unwrap_or_default(),
-            display_name: display_name.unwrap_or_default(),
+            handle: pending.handle.clone(),
+            display_name: pending.display_name.clone(),
         },
     }))
 }

@@ -64,3 +64,8 @@ mochi-hub-cs-sdk = { path = "../../../MochiOS2.0/hub/cs-sdk" }
 # (degrades to wallet-only when no cert is configured).
 mochi-hub-mc-sdk = { path = "../../../MochiOS2.0/hub/mc-sdk" }
 mochi-hub-mc-pki = { path = "../../../MochiOS2.0/hub/mc-pki" }
+
+# Outbound email (OTP delivery) for account email verification / 2FA / PIN
+# recovery. Real SMTP via lettre; ALL connection params come from MOCHI_SMTP_*
+# env (nothing hardcoded). Absent env ⇒ email features degrade off.
+mochi-hub-mailer = { path = "../../../MochiOS2.0/hub/mailer" }

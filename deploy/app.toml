@@ -34,3 +34,18 @@ MOCHI_IPVM_ROUTER_URL = "http://127.0.0.1:7400"
 # MOCHI_MC_CERT_DIR  = "<cert dir>"
 MOCHI_MC_HUB_QUIC  = "127.0.0.1:7421"
 MOCHI_IPVM_GATEWAY = "127.0.0.1:7411"
+
+# Email verification / login 2FA / PIN recovery (OPTIONAL). When these SMTP
+# params are set, account creation requires an emailed code and recovery is
+# available; when unset, the wallet degrades to handle+PIN only. The password is
+# a SECRET — set it from your secret store, never in a committed file. The From
+# domain must be an SMTP-authorised sending domain (SPF/DKIM). Provider examples:
+# Resend / Brevo / SES. Gmail: an app password + smtp.gmail.com:587 (starttls).
+# MOCHI_SMTP_HOST     = "smtp.example.com"
+# MOCHI_SMTP_PORT     = "587"
+# MOCHI_SMTP_USERNAME = "<smtp user>"
+# MOCHI_SMTP_PASSWORD = "<secret>"
+# MOCHI_SMTP_FROM     = "MoyMoy <no-reply@yourdomain>"
+# MOCHI_SMTP_TLS      = "starttls"   # starttls (587) | implicit (465) | none (dev)
+# Local testing WITHOUT SMTP: MOYMOY_DEV_OTP_LOG=1 logs the code instead of
+# emailing it (dev only — never in a real deploy).

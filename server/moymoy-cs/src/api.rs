@@ -38,11 +38,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::auth::{self, AuthedAccount, LoginOutcome, RegisterOutcome};
+use crate::auth::{self, AuthedAccount, CredsOutcome, RegisterOutcome, VerifiedSignup};
 use crate::charge::ChargeCoordinator;
 use crate::db::{self, Pool};
 use crate::error::ApiError;
 use crate::identity;
+use crate::otp::{self, CreateOtp, Mailer, PendingSignup, VerifyOtp};
 use crate::wallet::{self, TxResult};
 
 /// Shared handler state (cheap to clone — the pool and coordinator are `Arc`-ish).
@@ -50,11 +51,15 @@ use crate::wallet::{self, TxResult};
 pub struct AppState {
     pub pool: Pool,
     pub charge: Arc<ChargeCoordinator>,
+    pub mailer: Mailer,
 }
 
 impl AppState {
     fn can_charge(&self) -> bool {
         self.charge.can_charge()
+    }
+    fn email_enabled(&self) -> bool {
+        self.mailer.enabled()
     }
 }
 
@@ -71,9 +76,14 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/wallet/status", get(status))
-        // Auth (independent MoyMoy accounts).
+        // Auth (independent MoyMoy accounts + email verification / 2FA / recovery).
+        .route("/auth/config", get(auth_config))
         .route("/auth/register", post(register))
+        .route("/auth/register/verify", post(register_verify))
         .route("/auth/login", post(login))
+        .route("/auth/login/verify", post(login_verify))
+        .route("/auth/recover/start", post(recover_start))
+        .route("/auth/recover/verify", post(recover_verify))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/lookup", get(lookup))
@@ -102,34 +112,141 @@ async fn status(State(st): State<AppState>) -> impl IntoResponse {
 
 // ── auth ─────────────────────────────────────────────────────────────────────
 
+/// Whether email-backed features (verify / 2FA / recovery) are active. The app
+/// shows the email UI only when this is true.
+async fn auth_config(State(st): State<AppState>) -> impl IntoResponse {
+    Json(json!({ "ok": true, "email_enabled": st.email_enabled() }))
+}
+
 #[derive(Deserialize)]
 struct RegisterReq {
     handle: String,
     display_name: String,
     pin: String,
+    email: Option<String>,
     phone_id: Option<String>,
 }
 
+enum SignupStart {
+    Issued(String),
+    TooSoon(i64),
+    HandleTaken,
+    EmailTaken,
+}
+
+/// Start a signup. With email enabled: validate, email a code, return
+/// `pending:"verify_email"` (the account is created on verify). With email
+/// disabled (no SMTP): degrade to immediate handle+PIN creation.
 async fn register(
     State(st): State<AppState>,
     Json(req): Json<RegisterReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let value = blocking(st.pool, move |conn| {
-        // IMMEDIATE so the handle-uniqueness check + insert are one atomic unit.
+    if !st.email_enabled() {
+        let value = blocking(st.pool, move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let outcome = auth::register(&tx, &req.handle, &req.display_name, &req.pin, req.phone_id.as_deref())?;
+            let v = match outcome {
+                RegisterOutcome::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
+                RegisterOutcome::BadHandle => json!({ "ok": false, "error": "bad_handle" }),
+                RegisterOutcome::BadPin => json!({ "ok": false, "error": "bad_pin" }),
+                RegisterOutcome::BadDisplayName => json!({ "ok": false, "error": "bad_display_name" }),
+                RegisterOutcome::HandleTaken => json!({ "ok": false, "error": "handle_taken" }),
+            };
+            tx.commit()?;
+            Ok::<Value, ApiError>(v)
+        })
+        .await?;
+        return Ok(Json(value));
+    }
+
+    // Email path: validate everything up front, then issue + email an OTP.
+    let handle = match auth::valid_handle(&req.handle) {
+        Some(h) => h,
+        None => return Ok(Json(json!({ "ok": false, "error": "bad_handle" }))),
+    };
+    let display = match auth::valid_display_name(&req.display_name) {
+        Some(d) => d,
+        None => return Ok(Json(json!({ "ok": false, "error": "bad_display_name" }))),
+    };
+    if !auth::valid_pin(&req.pin) {
+        return Ok(Json(json!({ "ok": false, "error": "bad_pin" })));
+    }
+    let email = match req.email.as_deref().and_then(otp::valid_email) {
+        Some(e) => e,
+        None => return Ok(Json(json!({ "ok": false, "error": "bad_email" }))),
+    };
+    let email_lower = email.to_lowercase();
+    let handle_lower = handle.to_lowercase();
+    let pin_hash = auth::hash_pin(&req.pin)?;
+    let pending = PendingSignup {
+        handle: handle.clone(),
+        handle_lower,
+        display_name: display,
+        pin_hash,
+    };
+    let payload = serde_json::to_string(&pending).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let el = email_lower.clone();
+    let hl = pending.handle_lower.clone();
+    let start = blocking(st.pool.clone(), move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let outcome = auth::register(
-            &tx,
-            &req.handle,
-            &req.display_name,
-            &req.pin,
-            req.phone_id.as_deref(),
-        )?;
-        let v = match outcome {
-            RegisterOutcome::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
-            RegisterOutcome::BadHandle => json!({ "ok": false, "error": "bad_handle" }),
-            RegisterOutcome::BadPin => json!({ "ok": false, "error": "bad_pin" }),
-            RegisterOutcome::BadDisplayName => json!({ "ok": false, "error": "bad_display_name" }),
-            RegisterOutcome::HandleTaken => json!({ "ok": false, "error": "handle_taken" }),
+        let out = if auth::handle_taken(&tx, &hl)? {
+            SignupStart::HandleTaken
+        } else if auth::email_taken(&tx, &el)? {
+            SignupStart::EmailTaken
+        } else {
+            match otp::create(&tx, otp::PURPOSE_SIGNUP, &el, None, Some(&payload))? {
+                CreateOtp::Issued(code) => SignupStart::Issued(code),
+                CreateOtp::TooSoon { retry_after_ms } => SignupStart::TooSoon(retry_after_ms),
+            }
+        };
+        tx.commit()?;
+        Ok::<SignupStart, ApiError>(out)
+    })
+    .await?;
+
+    match start {
+        SignupStart::HandleTaken => Ok(Json(json!({ "ok": false, "error": "handle_taken" }))),
+        SignupStart::EmailTaken => Ok(Json(json!({ "ok": false, "error": "email_taken" }))),
+        SignupStart::TooSoon(ms) => Ok(Json(json!({ "ok": false, "error": "too_soon", "retry_after_ms": ms }))),
+        SignupStart::Issued(code) => {
+            st.mailer.send(&email, &code, otp::PURPOSE_SIGNUP).await?;
+            Ok(Json(json!({ "ok": true, "pending": "verify_email", "email": email })))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RegisterVerifyReq {
+    email: String,
+    code: String,
+    phone_id: Option<String>,
+}
+
+/// Finish a signup: verify the emailed code, then create the account + session.
+async fn register_verify(
+    State(st): State<AppState>,
+    Json(req): Json<RegisterVerifyReq>,
+) -> Result<Json<Value>, ApiError> {
+    let email = match otp::valid_email(&req.email) {
+        Some(e) => e,
+        None => return Ok(Json(json!({ "ok": false, "error": "bad_email" }))),
+    };
+    let email_lower = email.to_lowercase();
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = match otp::verify(&tx, otp::PURPOSE_SIGNUP, &email_lower, &req.code)? {
+            VerifyOtp::Ok { payload, .. } => {
+                match payload.as_deref().and_then(|p| serde_json::from_str::<PendingSignup>(p).ok()) {
+                    Some(pending) => match auth::register_verified(&tx, &pending, &email, &email_lower, req.phone_id.as_deref())? {
+                        VerifiedSignup::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
+                        VerifiedSignup::HandleTaken => json!({ "ok": false, "error": "handle_taken" }),
+                        VerifiedSignup::EmailTaken => json!({ "ok": false, "error": "email_taken" }),
+                    },
+                    None => json!({ "ok": false, "error": "invalid_code" }),
+                }
+            }
+            VerifyOtp::Invalid => json!({ "ok": false, "error": "invalid_code" }),
         };
         tx.commit()?;
         Ok::<Value, ApiError>(v)
@@ -145,26 +262,172 @@ struct LoginReq {
     phone_id: Option<String>,
 }
 
+enum LoginStart {
+    Terminal(Value),
+    TwoFactor { email: String, code: Option<String> },
+}
+
+/// Login step 1: verify handle + PIN. If the account has a verified email and
+/// email is enabled, email a 2FA code and return `pending:"2fa"`; otherwise mint
+/// the session directly.
 async fn login(
     State(st): State<AppState>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let value = blocking(st.pool, move |conn| {
-        // IMMEDIATE so the attempt-counter update / session mint commit atomically.
+    let email_enabled = st.email_enabled();
+    let start = blocking(st.pool.clone(), move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let outcome = auth::login(&tx, &req.handle, &req.pin, req.phone_id.as_deref())?;
-        let v = match outcome {
-            LoginOutcome::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
-            LoginOutcome::Invalid => json!({ "ok": false, "error": "invalid_credentials" }),
-            LoginOutcome::Locked { retry_after_ms } => {
-                json!({ "ok": false, "error": "locked", "retry_after_ms": retry_after_ms })
+        let out = match auth::verify_credentials(&tx, &req.handle, &req.pin)? {
+            CredsOutcome::Invalid => LoginStart::Terminal(json!({ "ok": false, "error": "invalid_credentials" })),
+            CredsOutcome::Locked { retry_after_ms } => {
+                LoginStart::Terminal(json!({ "ok": false, "error": "locked", "retry_after_ms": retry_after_ms }))
+            }
+            CredsOutcome::Ok(info) => {
+                if email_enabled && info.email_verified && info.email_lower.is_some() {
+                    let el = info.email_lower.clone().unwrap_or_default();
+                    let em = info.email.clone().unwrap_or_default();
+                    match otp::create(&tx, otp::PURPOSE_LOGIN2FA, &el, Some(&info.account_id), None)? {
+                        CreateOtp::Issued(code) => LoginStart::TwoFactor { email: em, code: Some(code) },
+                        CreateOtp::TooSoon { .. } => LoginStart::TwoFactor { email: em, code: None },
+                    }
+                } else {
+                    let token = auth::create_session(&tx, &info.account_id, req.phone_id.as_deref())?;
+                    LoginStart::Terminal(json!({ "ok": true, "session": token,
+                        "account": { "account_id": info.account_id, "handle": info.handle, "display_name": info.display_name } }))
+                }
             }
         };
+        tx.commit()?;
+        Ok::<LoginStart, ApiError>(out)
+    })
+    .await?;
+
+    match start {
+        LoginStart::Terminal(v) => Ok(Json(v)),
+        LoginStart::TwoFactor { email, code } => {
+            if let Some(c) = code {
+                st.mailer.send(&email, &c, otp::PURPOSE_LOGIN2FA).await?;
+            }
+            Ok(Json(json!({ "ok": true, "pending": "2fa", "email": email })))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LoginVerifyReq {
+    handle: String,
+    code: String,
+    phone_id: Option<String>,
+}
+
+/// Login step 2: verify the emailed 2FA code and mint the session.
+async fn login_verify(
+    State(st): State<AppState>,
+    Json(req): Json<LoginVerifyReq>,
+) -> Result<Json<Value>, ApiError> {
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = finish_otp_session(&tx, otp::PURPOSE_LOGIN2FA, &req.handle, &req.code, None, req.phone_id.as_deref())?;
         tx.commit()?;
         Ok::<Value, ApiError>(v)
     })
     .await?;
     Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct RecoverStartReq {
+    handle: String,
+}
+
+/// Recovery step 1: if the account has a verified email, email a code. Always
+/// returns `ok` (never reveals whether the handle exists).
+async fn recover_start(
+    State(st): State<AppState>,
+    Json(req): Json<RecoverStartReq>,
+) -> Result<Json<Value>, ApiError> {
+    if !st.email_enabled() {
+        return Ok(Json(json!({ "ok": false, "error": "recovery_unavailable" })));
+    }
+    let created = blocking(st.pool.clone(), move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let out = match auth::account_full_by_handle(&tx, &req.handle)? {
+            Some(info) if info.email_verified && info.email_lower.is_some() => {
+                let el = info.email_lower.clone().unwrap_or_default();
+                match otp::create(&tx, otp::PURPOSE_RECOVERY, &el, Some(&info.account_id), None)? {
+                    CreateOtp::Issued(code) => Some((info.email.clone().unwrap_or_default(), Some(code))),
+                    CreateOtp::TooSoon { .. } => Some((info.email.clone().unwrap_or_default(), None)),
+                }
+            }
+            _ => None,
+        };
+        tx.commit()?;
+        Ok::<Option<(String, Option<String>)>, ApiError>(out)
+    })
+    .await?;
+    if let Some((email, Some(code))) = &created {
+        st.mailer.send(email, code, otp::PURPOSE_RECOVERY).await?;
+    }
+    Ok(Json(json!({ "ok": true, "sent": true })))
+}
+
+#[derive(Deserialize)]
+struct RecoverVerifyReq {
+    handle: String,
+    code: String,
+    new_pin: String,
+    phone_id: Option<String>,
+}
+
+/// Recovery step 2: verify the emailed code, set a new PIN, and mint a session.
+async fn recover_verify(
+    State(st): State<AppState>,
+    Json(req): Json<RecoverVerifyReq>,
+) -> Result<Json<Value>, ApiError> {
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = finish_otp_session(&tx, otp::PURPOSE_RECOVERY, &req.handle, &req.code, Some(req.new_pin.as_str()), req.phone_id.as_deref())?;
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+/// Shared tail for login-2FA and recovery: resolve the account by handle, verify
+/// the OTP for `purpose`, optionally set a new PIN, and mint a session.
+fn finish_otp_session(
+    tx: &rusqlite::Transaction<'_>,
+    purpose: &str,
+    handle: &str,
+    code: &str,
+    new_pin: Option<&str>,
+    phone_id: Option<&str>,
+) -> Result<Value, ApiError> {
+    let info = match auth::account_full_by_handle(tx, handle)? {
+        Some(i) => i,
+        None => return Ok(json!({ "ok": false, "error": "invalid_code" })),
+    };
+    let el = match info.email_lower.clone() {
+        Some(e) => e,
+        None => return Ok(json!({ "ok": false, "error": "invalid_code" })),
+    };
+    match otp::verify(tx, purpose, &el, code)? {
+        VerifyOtp::Ok { account_id, .. } => {
+            if account_id.as_deref() != Some(info.account_id.as_str()) {
+                return Ok(json!({ "ok": false, "error": "invalid_code" }));
+            }
+            if let Some(pin) = new_pin {
+                if !auth::set_pin(tx, &info.account_id, pin)? {
+                    return Ok(json!({ "ok": false, "error": "bad_pin" }));
+                }
+            }
+            let token = auth::create_session(tx, &info.account_id, phone_id)?;
+            Ok(json!({ "ok": true, "session": token,
+                "account": { "account_id": info.account_id, "handle": info.handle, "display_name": info.display_name } }))
+        }
+        VerifyOtp::Invalid => Ok(json!({ "ok": false, "error": "invalid_code" })),
+    }
 }
 
 async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
@@ -186,14 +449,20 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<V
 
 async fn me(State(st): State<AppState>, acct: AuthedAccount) -> Result<Json<Value>, ApiError> {
     let id = acct.account_id;
-    let (view, links) = blocking(st.pool, move |conn| {
-        let view = auth::account_view(conn, &id)?
+    let (info, links) = blocking(st.pool, move |conn| {
+        let info = auth::account_full(conn, &id)?
             .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
         let links = identity::linked_mc(conn, &id)?;
-        Ok::<_, ApiError>((view, links))
+        Ok::<_, ApiError>((info, links))
     })
     .await?;
-    Ok(Json(json!({ "ok": true, "account": view, "linked_mc": links })))
+    Ok(Json(json!({
+        "ok": true,
+        "account": { "account_id": info.account_id, "handle": info.handle, "display_name": info.display_name },
+        "email": info.email,
+        "email_verified": info.email_verified,
+        "linked_mc": links,
+    })))
 }
 
 #[derive(Deserialize)]

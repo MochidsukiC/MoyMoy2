@@ -17,6 +17,7 @@ mod command_bus;
 mod db;
 mod error;
 mod identity;
+mod otp;
 mod tls;
 mod tunnel;
 mod wallet;
@@ -72,9 +73,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Email OTP (verify / 2FA / recovery). Enabled only when MOCHI_SMTP_* is
+    // configured; otherwise the wallet degrades to handle+PIN.
+    let mailer = otp::Mailer::from_env();
+
     let state = AppState {
         pool: pool.clone(),
         charge,
+        mailer,
     };
 
     // --- bind loopback listener ---
