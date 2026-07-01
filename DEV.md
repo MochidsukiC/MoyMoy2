@@ -40,14 +40,16 @@ UIフロー:
 - **資格情報**: `handle`（一意・小文字正規化・`[A-Za-z0-9_]` 3〜20）＋ `PIN`（4〜6桁数字, **Argon2id** ハッシュ保存）。handle は送金宛先（`@handle`）に兼用。
 - **セッション**: register/login で 256bit ランダムトークンを発行し、HTTP ヘッダ `X-MoyMoy-Session` で送る。DB には **SHA-256 ハッシュ**で保存（期限 30日・logout で失効）。**backend が全ウォレットリクエストの本人を検証**（旧 mc_uuid 自己申告を解消）。
 - **マルチアカウント**: 1端末に複数口座をリンク。クライアント保持リスト（`mochi.storage` / dev は localStorage）が正本で、ヘッダのアバターから切替・追加・ログアウト。サーバは `moymoy_sessions.phone_id` をメタデータ記録のみ。
-- **MCキャラ連携**: チャージ時に現在の `gameUuid`（os.gameUuid）を `account_mc_links` へ自動リンク（1口座に複数キャラ可）。MC UUID は「チャージ用の連携リソース」。
+- **MCキャラ連携**: チャージ時に現在の `gameUuid`（os.gameUuid）を `account_mc_links` へ自動リンク（1口座に複数キャラ可）。MC UUID は「チャージ用の連携リソース」。1キャラ=1口座（`account_mc_links.mc_uuid` UNIQUE、別口座からのチャージ/在庫照会は `character_claimed` で拒否）。
+- **メール検証 / 2FA / リカバリ（v4）**: SMTP 設定時（`MOCHI_SMTP_*`）は**開設にメール＋OTP必須**（1メール1口座、`email_lower` UNIQUE）、ログインは PIN＋メール2FA、PIN 忘れはメール OTP で再設定。SMTP 未設定なら**従来の handle+PIN へ自動 degrade**（メール要素は無効）。OTP は 6桁・SHA-256 保存・10分・5回上限・単回・再送クールダウン（`moymoy_otps`）。送信は `mochi-hub-mailer` の `SmtpMailSender`（設定は全て env・ハードコード無し）。dev 検証は `MOYMOY_DEV_OTP_LOG=1`（コードをログ出力、送信しない）。
 
 ### バックエンド HTTP API
 全レスポンス `{ok:bool, ...}`。ウォレット系は `X-MoyMoy-Session` でセッション認証（無効は 401）。
-- `GET /healthz` / `GET /wallet/status` → `{ok, app:"moymoy", can_charge}`（公開）
-- `POST /auth/register {handle, display_name, pin, phone_id?}` → `{ok, session, account}`（ロックアウト/列挙防止）
-- `POST /auth/login {handle, pin, phone_id?}` → `{ok, session, account}` ／ `POST /auth/logout`（session）
-- `GET /auth/me` → `{ok, account, linked_mc:[{mc_uuid,mcid}]}` ／ `GET /auth/lookup?handle=` → 送金宛先解決
+- `GET /healthz` / `GET /wallet/status` → `{ok, app:"moymoy", can_charge}`（公開）／ `GET /auth/config` → `{ok, email_enabled}`
+- `POST /auth/register {handle, display_name, pin, email?, phone_id?}` → メール有効時 `{ok, pending:"verify_email", email}`／無効時 `{ok, session, account}` ／ `POST /auth/register/verify {email, code}` → `{ok, session, account}`
+- `POST /auth/login {handle, pin, phone_id?}` → 2FA 時 `{ok, pending:"2fa", email}`／それ以外 `{ok, session, account}` ／ `POST /auth/login/verify {handle, code}` → `{ok, session, account}`
+- `POST /auth/recover/start {handle}` → 常に `{ok}`（列挙防止） ／ `POST /auth/recover/verify {handle, code, new_pin}` → `{ok, session, account}`
+- `POST /auth/logout`（session） ／ `GET /auth/me` → `{ok, account, email, email_verified, linked_mc:[{mc_uuid,mcid}]}` ／ `GET /auth/lookup?handle=` → 送金宛先解決
 - `GET /wallet/home` → `{ok, balance, profile:{holder,number,expiry}, txns:[...recent], can_charge}`
 - `GET /wallet/history?limit=&filter=all|pay|send|charge` ／ `GET /wallet/friends`（最近の相手・handle 付）／ `GET /wallet/merchants`
 - `GET /wallet/inventory?mc_uuid=&mcid=` → `{ok, emeralds, blocks, chargeable}`（**MC mod 依存**）
@@ -58,7 +60,7 @@ UIフロー:
 - `POST /wallet/_dev/credit {handle, amount}` → dev 専用クレジット（`MOYMOY_DEV_CREDIT=1` ゲート）
 
 ### SQLite スキーマ
-`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires) / `account_mc_links`(account_id, mc_uuid, mcid) / `transactions`(kind, label, counterparty, amount符号付, balance_after, ts) / `merchants`(merchant_id, account_id, …) / `idempotency` / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, …)。v1→v2 マイグレーションは `db/schema_v2.sql`（旧 mc_uuid キーのウォレット行はリセット）。詳細は `server/moymoy-cs/src/db/`。
+`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until, **email, email_lower(UNIQUE), email_verified**) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires) / `account_mc_links`(account_id, mc_uuid(UNIQUE), mcid) / `moymoy_otps`(otp_id, purpose=signup|login2fa|recovery, email_lower, account_id, code_hash, payload_json, attempts, expires) / `transactions` / `merchants` / `idempotency`(PK=idem_key,scope) / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, state=pending|sent|settled|failed|stuck, …)。マイグレーションは user_version ステッパ（v1 baseline `schema.sql` → v2 独立アカウント → v3 1キャラ1口座 → v4 メール/OTP、各 `db/schema_vN.sql`）。詳細は `server/moymoy-cs/src/db/`。
 
 ### コマンドバス verb（backend→mod / mod→backend ack）
 - `emerald.charge {op_id, idem_key, target_uuid, amount}` → mod 消費(インベントリのエメラルド+ブロック) → ack `{op_id, status, settled:consumed}`
@@ -95,8 +97,11 @@ UIフロー:
 - [x] 段階4: 配置・公開ツール（tools/, deploy/, icon.png）
 - [x] **再設計**: 独立アカウント(handle+PIN)+セッション検証 — backend（`6b85dc5`、HTTPスモーク緑）
 - [x] **再設計**: マルチアカウント(1端末=複数口座)+1口座=複数MCキャラ — frontend（`9cc6c18`、Babel透過）
-- [x] CodeX 再レビュー指摘の反映（backend `382acc2` / frontend `ffb40c8`）
-- [x] 再公開: バンドル v0.2.0 を GitHub リリース化＋registry再登録（`tools/register-hub.ps1`、:7409 へ 0.2.0 配置）
-- [ ] backend 再配置（`tools/deploy-backend.ps1`）— レビュー反映後の moymoy-cs を Hub workdir へ
-- [ ] フル E2E（in-world で 0.2.0 再インストール → 口座開設→切替→送金→チャージ自動リンク の実機検証）
-- [ ] 承認ゲート課題の設計対応（R007 / R008 / R05・R06 / R13・charge再試行）— §問題参照
+- [x] CodeX 再レビュー反映（v2: backend `382acc2` / frontend `ffb40c8`）
+- [x] 承認ゲート課題の実装（R007 1キャラ1口座 / R008 dead-letter `1b95b62`、R05/R06/R13/charge再試行 `21d98cc`）
+- [x] 再公開: バンドル v0.2.0 を GitHub リリース化＋registry再登録
+- [x] **メール認証**: 検証/2FA/PINリカバリ/1メール1口座＋SMTP無しdegrade — backend `01a4b0f`(schema v4, スモーク緑) / frontend `cf702d6`(Babel透過)
+- [ ] CodeX 再レビュー反映（R007/R008・frontend-followups、メール認証）— reviewer 実行中
+- [ ] SMTP 本番設定（`MOCHI_SMTP_*` を運用者が env で設定。gmail/Resend/Brevo/SES 等）
+- [ ] 再公開 v0.2.1（R007/R008・frontend修正・メール認証を反映した最終バンドル）＋ backend 再配置（`deploy-backend.ps1`）
+- [ ] フル E2E（in-world で 0.2.1 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
