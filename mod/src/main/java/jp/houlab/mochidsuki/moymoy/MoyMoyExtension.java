@@ -170,10 +170,16 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
         JsonObject o = new JsonObject();
         o.addProperty("req_id", reqId);
         if (inv == null) {
+            // No live player on THIS server for that UUID — the app's gameUuid does
+            // not match a logged-in player (offline, or an online/offline-mode UUID
+            // mismatch). Logged so a "0 emeralds" report is diagnosable.
+            LOGGER.info("moymoy: inventory.query {} — no online player for that UUID "
+                    + "(offline or UUID mismatch); replying online=false", uuid);
             o.addProperty("online", false);
             o.addProperty("emeralds", 0);
             o.addProperty("blocks", 0);
         } else {
+            LOGGER.info("moymoy: inventory.query {} — {} emeralds + {} blocks", uuid, inv[0], inv[1]);
             o.addProperty("online", true);
             o.addProperty("emeralds", inv[0]);
             o.addProperty("blocks", inv[1]);

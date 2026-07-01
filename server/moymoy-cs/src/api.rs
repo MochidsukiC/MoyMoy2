@@ -641,6 +641,21 @@ async fn inventory(
         })));
     }
     let inv = st.charge.query_inventory(&mc_uuid).await?;
+    // Surface the real outcome instead of a misleading 0 (CLAUDE.md: no symptom
+    // hiding). `reachable=false` ⇒ the mod never answered; `online=false` ⇒ the
+    // character (this gameUuid) isn't a live player on the server it routed to.
+    if !inv.reachable {
+        return Ok(Json(json!({
+            "ok": false, "error": "character_unreachable", "can_charge": true,
+            "emeralds": 0, "blocks": 0, "chargeable": 0,
+        })));
+    }
+    if !inv.online {
+        return Ok(Json(json!({
+            "ok": false, "error": "character_offline", "can_charge": true,
+            "emeralds": 0, "blocks": 0, "chargeable": 0,
+        })));
+    }
     Ok(Json(json!({
         "ok": true, "can_charge": true,
         "emeralds": inv.emeralds, "blocks": inv.blocks, "chargeable": inv.chargeable,

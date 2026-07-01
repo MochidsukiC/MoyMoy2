@@ -175,9 +175,17 @@ impl CommandBus {
         }
     }
 
-    /// Round-trip the player's chargeable inventory (emeralds, blocks) via the
-    /// mod. `None` on timeout / offline / bus-down.
-    pub async fn query_inventory(&self, uuid: &Uuid) -> Option<(i64, i64)> {
+    /// Round-trip the player's chargeable inventory via the mod.
+    ///
+    /// Returns `Some((online, emeralds, blocks))` when the mod answered — `online`
+    /// distinguishes "player is on the live server" (real counts) from "the mod
+    /// replied but the UUID isn't a player on this server" (`online=false`, so the
+    /// counts are 0 because the character wasn't found, NOT because they own none).
+    /// `None` means no round-trip completed at all (bus down, send failed, or no
+    /// reply within the timeout — offline / the server doesn't host moymoy / the
+    /// MC-side connector isn't set up). Callers MUST surface these three states
+    /// distinctly rather than collapsing them into "0 emeralds".
+    pub async fn query_inventory(&self, uuid: &Uuid) -> Option<(bool, i64, i64)> {
         let req_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.pending_inv.lock().await.insert(req_id.clone(), tx);
@@ -192,6 +200,7 @@ impl CommandBus {
             Some(s) => s,
             None => {
                 self.pending_inv.lock().await.remove(&req_id);
+                tracing::warn!(uuid = %uuid, "inventory.query: bus down (reconnecting)");
                 return None;
             }
         };
@@ -199,18 +208,23 @@ impl CommandBus {
             .reliable_send(&dst, "moymoy", payload.to_string().as_bytes())
             .await
         {
-            tracing::warn!(error = %e, uuid = %uuid, "inventory.query reliable_send failed");
+            tracing::warn!(error = %e, uuid = %uuid, "inventory.query reliable_send failed (player offline / no moymoy host?)");
             self.pending_inv.lock().await.remove(&req_id);
             return None;
         }
         match tokio::time::timeout(Duration::from_secs(3), rx).await {
             Ok(Ok(v)) => {
-                let e = v.get("emeralds").and_then(Value::as_i64)?;
-                let b = v.get("blocks").and_then(Value::as_i64)?;
-                Some((e, b))
+                // The mod always sends `online`; absence ⇒ assume found (lenient).
+                let online = v.get("online").and_then(Value::as_bool).unwrap_or(true);
+                let e = v.get("emeralds").and_then(Value::as_i64).unwrap_or(0);
+                let b = v.get("blocks").and_then(Value::as_i64).unwrap_or(0);
+                tracing::info!(uuid = %uuid, online, emeralds = e, blocks = b, "inventory.query reply");
+                Some((online, e, b))
             }
             _ => {
                 self.pending_inv.lock().await.remove(&req_id);
+                tracing::warn!(uuid = %uuid,
+                    "inventory.query: no reply within 3s — character offline, the server doesn't host moymoy, or the MC connector/sidecar isn't running");
                 None
             }
         }

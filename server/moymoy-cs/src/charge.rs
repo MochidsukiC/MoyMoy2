@@ -38,8 +38,16 @@ enum BeginCharge {
 }
 
 /// Player inventory snapshot for the charge screen (9 eme = 1 block).
+///
+/// `reachable`/`online` keep the three real outcomes distinct instead of
+/// collapsing them to "0 emeralds": `reachable=false` ⇒ the mod never answered
+/// (offline / server doesn't host moymoy / MC connector down); `online=false` ⇒
+/// the mod answered but the UUID isn't a live player there (a UUID mismatch shows
+/// up here, NOT as a genuine zero balance).
 #[derive(Debug)]
 pub struct Inventory {
+    pub reachable: bool,
+    pub online: bool,
     pub emeralds: i64,
     pub blocks: i64,
     pub chargeable: i64,
@@ -73,13 +81,18 @@ impl ChargeCoordinator {
         let uuid = Uuid::parse_str(mc_uuid)
             .map_err(|_| ApiError::bad_request("mc_uuid is not a UUID"))?;
         match bus.query_inventory(&uuid).await {
-            Some((emeralds, blocks)) => Ok(Inventory {
+            Some((online, emeralds, blocks)) => Ok(Inventory {
+                reachable: true,
+                online,
                 emeralds,
                 blocks,
                 chargeable: emeralds + blocks * 9,
             }),
-            // Player offline / mod didn't answer — report empty (frontend shows 0).
+            // No round-trip: keep it distinct from a real zero so the UI can say
+            // WHY (character offline / not in-game / MC-side not set up).
             None => Ok(Inventory {
+                reachable: false,
+                online: false,
                 emeralds: 0,
                 blocks: 0,
                 chargeable: 0,

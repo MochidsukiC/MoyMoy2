@@ -295,7 +295,7 @@ function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
 }
 
 /* ─── チャージ画面 (インベントリの手持ちエメラルドのみ) ──────────── */
-function MoyCharge({ balance, inv, canCharge, onConfirm }) {
+function MoyCharge({ balance, inv, canCharge, invStatus, onConfirm }) {
   const available = inv.emeralds + inv.blocks * 9; // 9エメ = 1ブロック
   const [amt, setAmt] = msState(0);
   const press = (k) => {
@@ -318,6 +318,24 @@ function MoyCharge({ balance, inv, canCharge, onConfirm }) {
         <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", marginTop: 8, lineHeight: 1.7 }}>
           エメラルドのチャージには Minecraft サーバーへの接続が必要です。<br />
           サーバーに参加してから、もう一度お試しください。
+        </div>
+      </div>
+    );
+  }
+
+  // The backend distinguishes "couldn't reach the character" from a genuine 0, so
+  // don't show a misleading empty inventory — say why and let the user retry.
+  if (invStatus === "character_unreachable" || invStatus === "character_offline") {
+    return (
+      <div style={{ padding: "40px 24px 120px", textAlign: "center" }}>
+        <EmeGem size={56} style={{ margin: "0 auto 16px", opacity: 0.5 }} />
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 15, fontWeight: 700, color: "var(--ink)" }}>
+          手持ちのエメラルドを取得できません
+        </div>
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", marginTop: 8, lineHeight: 1.7 }}>
+          {invStatus === "character_offline"
+            ? <>このキャラクターがゲームにログインしていません。<br />Minecraft サーバーに参加してから、もう一度お試しください。</>
+            : <>Minecraft のキャラクターに接続できませんでした。<br />ゲームにログインしているか、サーバー側の連携（mod）設定をご確認ください。</>}
         </div>
       </div>
     );
@@ -471,6 +489,8 @@ const ERR_LABEL = {
   mc_unavailable: "Minecraft サーバーに接続されていません",
   no_character: "Minecraft キャラクターが見つかりません",
   character_claimed: "このキャラクターは別のアカウントに連携されています",
+  character_offline: "キャラクターがゲームにログインしていません",
+  character_unreachable: "キャラクターに接続できません（ゲーム／サーバー連携をご確認ください）",
   charge_pending: "チャージは保留中です（反映までお待ちください）",
   charge_failed: "チャージに失敗しました。もう一度お試しください",
   unauthorized: "セッションが切れました。ログインし直してください",
@@ -487,6 +507,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   const [merchants, setMerchants] = msState([]);
   const [friends, setFriends] = msState([]);
   const [inv, setInv] = msState({ emeralds: 0, blocks: 0 });
+  const [invStatus, setInvStatus] = msState(null); // null = ok; else the inventory error code
   const [canCharge, setCanCharge] = msState(false);
   const [loaded, setLoaded] = msState(false);
   const mountedRef = msRef(true);
@@ -543,8 +564,11 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     } catch (e) { console.warn("MoyMoy: friends load failed", e); }
     try {
       const i = await MoyMoy.inventory();
-      if (isAlive() && i.ok) setInv({ emeralds: i.emeralds, blocks: i.blocks });
-    } catch (e) { console.warn("MoyMoy: inventory load failed", e); }
+      if (isAlive()) {
+        if (i.ok) { setInv({ emeralds: i.emeralds, blocks: i.blocks }); setInvStatus(null); }
+        else { setInv({ emeralds: 0, blocks: 0 }); setInvStatus(i.error || "inventory_error"); }
+      }
+    } catch (e) { console.warn("MoyMoy: inventory load failed", e); if (isAlive()) setInvStatus("inventory_error"); }
     if (isAlive()) setLoaded(true);
   }
 
@@ -624,7 +648,10 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       if (!mountedRef.current) return;
       try {
         const i = await MoyMoy.inventory();
-        if (mountedRef.current && i.ok) setInv({ emeralds: i.emeralds, blocks: i.blocks });
+        if (mountedRef.current) {
+          if (i.ok) { setInv({ emeralds: i.emeralds, blocks: i.blocks }); setInvStatus(null); }
+          else { setInv({ emeralds: 0, blocks: 0 }); setInvStatus(i.error || "inventory_error"); }
+        }
       } catch (e) { console.warn("MoyMoy: inventory refresh after confirm failed", e); }
       if (!mountedRef.current) return;
 
@@ -651,7 +678,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
         {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={setTab} />}
         {tab === "pay" && <MoyPay merchants={merchants} onPick={t => setFlow({ kind: "pay", target: t })} />}
         {tab === "send" && <MoySend friends={friends} onPick={t => setFlow({ kind: "send", target: t })} />}
-        {tab === "charge" && <MoyCharge balance={balance} inv={inv} canCharge={canCharge}
+        {tab === "charge" && <MoyCharge balance={balance} inv={inv} canCharge={canCharge} invStatus={invStatus}
           onConfirm={(amount) => { setErr(null); setConfirm({ kind: "charge", target: null, amount }); }} />}
         {tab === "history" && <MoyHistory txns={txns} />}
       </div>
