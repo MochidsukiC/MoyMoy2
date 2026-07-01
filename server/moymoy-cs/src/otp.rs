@@ -1,14 +1,16 @@
 //! Email one-time-passcodes: signup verification, login 2FA, and PIN recovery.
 //!
-//! Codes are 6 digits, delivered over SMTP via `mochi-hub-mailer` (all
-//! connection params from `MOCHI_SMTP_*` env — nothing hardcoded). We persist
-//! only the SHA-256 hash of a code (never the code), with a 10-minute expiry, a
-//! 5-attempt limit, single-use semantics, and a per-target resend cooldown.
+//! Codes are 6 digits, delivered to **MNN mail addresses** (`local@disc.mnn`)
+//! via `mochi-hub-mailer`'s `MnnMailSender` — the code is POSTed to the IPvM
+//! gateway's `/mail/otp-deliver` and lands in the recipient's in-world mail app.
+//! No external SMTP is involved. We persist only the SHA-256(+pepper) hash of a
+//! code (never the code), with a 10-minute expiry, a 5-attempt limit, single-use
+//! semantics, and a per-target resend cooldown.
 //!
-//! Email features are active only when SMTP is configured; otherwise the wallet
-//! degrades to handle+PIN and this module's rows stay unused. A dev-only
-//! `MOYMOY_DEV_OTP_LOG=1` mode lets the flow be exercised locally without SMTP
-//! (codes go to the log — never in a real deploy).
+//! Email features are active only when the MNN mail bearer is configured
+//! (`MOCHI_MAIL_SERVICE_BEARER`); otherwise the wallet degrades to handle+PIN.
+//! A dev-only `MOYMOY_DEV_OTP_LOG=1` mode lets the flow be exercised locally
+//! without the mail service (codes go to the log — never in a real deploy).
 
 use std::sync::{Arc, OnceLock};
 
@@ -19,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use mochi_hub_mailer::{MailSender, SmtpMailSender};
+use mochi_hub_mailer::{MailSender, MnnMailSender};
 
 use crate::db::now_ms;
 use crate::error::ApiError;
@@ -42,30 +44,31 @@ pub struct PendingSignup {
     pub pin_hash: String,
 }
 
-/// Outbound email + the email-features gate. Holds the real SMTP sender when
-/// `MOCHI_SMTP_*` is configured; `dev_log` exercises the OTP flow locally
-/// without SMTP by logging codes (dev only).
+/// Outbound OTP delivery (MNN mail) + the email-features gate. Holds the MNN
+/// mail sender when `MOCHI_MAIL_SERVICE_BEARER` is configured; `dev_log`
+/// exercises the OTP flow locally without the mail service by logging codes.
 #[derive(Clone)]
 pub struct Mailer {
-    sender: Option<Arc<SmtpMailSender>>,
+    sender: Option<Arc<MnnMailSender>>,
     dev_log: bool,
 }
 
 impl Mailer {
-    /// Build from the environment: real SMTP if `MOCHI_SMTP_*` parses, else a
-    /// dev-log fallback when `MOYMOY_DEV_OTP_LOG=1`, else disabled (degrade).
+    /// Build from the environment: the MNN mail sender if
+    /// `MOCHI_MAIL_SERVICE_BEARER` is set, else a dev-log fallback when
+    /// `MOYMOY_DEV_OTP_LOG=1`, else disabled (degrade to handle+PIN).
     pub fn from_env() -> Self {
         let dev_log = crate::env_flag("MOYMOY_DEV_OTP_LOG", false);
-        match SmtpMailSender::from_env() {
+        match MnnMailSender::from_env() {
             Ok(s) => {
-                tracing::info!("email OTP enabled (SMTP configured)");
+                tracing::info!("email OTP enabled (MNN mail)");
                 Mailer { sender: Some(Arc::new(s)), dev_log }
             }
             Err(e) => {
                 if dev_log {
-                    tracing::warn!(reason = %e, "SMTP not configured — DEV OTP LOG mode (codes logged, not emailed)");
+                    tracing::warn!(reason = %e, "MNN mail not configured — DEV OTP LOG mode (codes logged, not delivered)");
                 } else {
-                    tracing::info!(reason = %e, "email OTP disabled (no SMTP) — wallet runs handle+PIN only");
+                    tracing::info!(reason = %e, "email OTP disabled (no MNN mail bearer) — wallet runs handle+PIN only");
                 }
                 Mailer { sender: None, dev_log }
             }
@@ -93,24 +96,23 @@ impl Mailer {
     }
 }
 
-/// Minimal email sanity (one `@`, non-empty local, a dotted domain, no
-/// whitespace). Returns the trimmed address.
+/// Validate an **MNN mail address** `local@<discriminator>.mnn` (single-label
+/// discriminator — the form `MnnMailSender` can route). Non-`.mnn` addresses are
+/// rejected: MoyMoy delivers over the MNN overlay, not external SMTP. Returns
+/// the trimmed address.
 pub fn valid_email(s: &str) -> Option<String> {
     let t = s.trim();
     if t.is_empty() || t.len() > 254 || t.chars().any(char::is_whitespace) {
         return None;
     }
-    let parts: Vec<&str> = t.split('@').collect();
-    if parts.len() != 2 {
+    let (local, domain) = t.split_once('@')?;
+    if local.is_empty() || local.contains('@') || domain.contains('@') {
         return None;
     }
-    let (local, domain) = (parts[0], parts[1]);
-    if local.is_empty()
-        || domain.len() < 3
-        || !domain.contains('.')
-        || domain.starts_with('.')
-        || domain.ends_with('.')
-    {
+    // `<disc>.mnn` with a single-label discriminator (no dots), matching
+    // MnnMailSender::mail_server_host.
+    let disc = domain.strip_suffix(".mnn")?;
+    if disc.is_empty() || disc.contains('.') {
         return None;
     }
     Some(t.to_string())

@@ -43,7 +43,7 @@ const REG_ERR = {
   bad_handle: "ID は半角英数字と _ の3〜20文字です",
   bad_pin: "PIN は4〜6桁の数字です",
   bad_display_name: "名前を入力してください",
-  bad_email: "メールアドレスの形式が正しくありません",
+  bad_email: "MNN メールアドレス（@*.mnn）を入力してください",
   email_taken: "このメールアドレスはすでに使われています",
   too_soon: "コードを送信済みです。少し待ってから再送してください",
   invalid_code: "確認コードが正しくありません",
@@ -55,10 +55,11 @@ const LOGIN_ERR = {
   recovery_unavailable: "この環境では PIN の再設定は利用できません",
 };
 
-/// Loose email check for the input field (the server validates authoritatively).
+/// MNN mail address check for the input field: local@<disc>.mnn with a
+/// single-label discriminator (the server validates authoritatively).
 function emailLooksOk(s) {
   const t = (s || "").trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
+  return /^[^\s@]+@[^\s@.]+\.mnn$/.test(t);
 }
 
 /* ─── small UI atoms ─────────────────────────────────────────────────── */
@@ -321,9 +322,9 @@ function AuthRegister({ emailEnabled, onDone, onBack }) {
         </div>
         {emailEnabled && (
           <div>
-            <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>メールアドレス（本人確認・PIN再設定）</div>
-            <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" type="email" maxLength={254} style={fieldStyle} />
-            <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", marginTop: 6 }}>確認コードを送信します。1メール＝1口座。</div>
+            <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>MNN メールアドレス（本人確認・PIN再設定）</div>
+            <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@usermail.mnn" type="text" maxLength={254} style={fieldStyle} />
+            <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", marginTop: 6 }}>確認コードを電話のメールアプリに送信します。1アドレス＝1口座。</div>
           </div>
         )}
         {err && <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)" }}>{err}</div>}
