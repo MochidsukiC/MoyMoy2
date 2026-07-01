@@ -105,6 +105,7 @@ UIフロー:
 - [x] 再公開 **v0.2.1**（R007/R008・frontend修正・メール認証・レビュー反映を束ねた最終バンドル）を GitHub リリース＋HUB 再登録（sha256 `1b54d370`）
 - [x] メール送信を **MNN メール（`@*.mnn`）限定**に切替（`MnnMailSender`、外部SMTP廃止） `d6d8645`
 - [ ] 本番設定: `MOCHI_MAIL_SERVICE_BEARER`（＋任意 `MOYMOY_OTP_PEPPER`）を運用者が env で設定 — 未設定なら degrade
-- [ ] backend 再配置（`deploy-backend.ps1` で v0.2.1 の moymoy-cs を Hub workdir へ）
-- [ ] フル E2E（in-world で 0.2.1 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
+- [x] **チャージ有効化の根治**: 「チャージは現在利用できません」= `can_charge=false` の原因は backend に MC クライアント証明書が無く command bus に繋がらないこと。`deploy-backend.ps1 -EnableCharge` で Hub の mc-pki CA から `--mcserver-id moymoy` の leaf を発行し `MOCHI_MC_CERT_DIR` を設定（検証: cert 付き起動で `can_charge=true`）。**チャージ成立にはもう一方の要件**: MC サーバに moymoy mod jar を導入＋`mochi-server.toml [connector].hosted_app_ids` に `"moymoy"` を追加。
+- [ ] backend 再配置（`deploy-backend.ps1 -EnableCharge` で moymoy-cs＋MC証明書を Hub workdir へ）
+- [ ] フル E2E（in-world で 0.2.2 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
 - [ ] 承認ゲート保留: `MOYMOY_OTP_PEPPER` の本番 fail-closed 化 / `AccountInfo` の email 型統合 / refresh 失敗の UI エラー状態化 / `run_inbound` 切断理由の可視化（mc-sdk 共有層）
