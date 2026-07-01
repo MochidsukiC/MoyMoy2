@@ -1,6 +1,6 @@
 {
   "id": "com.mochi.moymoy",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "schema_version": 1,
   "name": { "default": "MoyMoy", "ja": "モイモイ" },
   "description": {
@@ -11,14 +11,14 @@
   "license": "Proprietary",
   "categories": ["finance", "utilities"],
   "bundle": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.2.1/com.mochi.moymoy-0.2.1.tar",
-    "sha256": "1b54d370c85e4761850ba9d7ddfc60782d135f3da8c4d9b4065be56845b93c24",
-    "size": 136192,
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.2.2/com.mochi.moymoy-0.2.2.tar",
+    "sha256": "f4f3aa39da17da3be467f01d839806574dbe7c08353421263116342a1155552e",
+    "size": 136704,
     "format": "tar"
   },
   "runtime": { "kind": "js", "foreground": { "entry": "index.html" } },
   "icon": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.2.1/com.mochi.moymoy-0.2.1.png",
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.2.2/com.mochi.moymoy-0.2.2.png",
     "sha256": "cfd2d10d05f14df3ef79adbbc68c3447670b150634746d7076ea5090f409e988",
     "size_px": 512,
     "format": "png"

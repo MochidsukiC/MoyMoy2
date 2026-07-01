@@ -41,7 +41,7 @@ UIフロー:
 - **セッション**: register/login で 256bit ランダムトークンを発行し、HTTP ヘッダ `X-MoyMoy-Session` で送る。DB には **SHA-256 ハッシュ**で保存（期限 30日・logout で失効）。**backend が全ウォレットリクエストの本人を検証**（旧 mc_uuid 自己申告を解消）。
 - **マルチアカウント**: 1端末に複数口座をリンク。クライアント保持リスト（`mochi.storage` / dev は localStorage）が正本で、ヘッダのアバターから切替・追加・ログアウト。サーバは `moymoy_sessions.phone_id` をメタデータ記録のみ。
 - **MCキャラ連携**: チャージ時に現在の `gameUuid`（os.gameUuid）を `account_mc_links` へ自動リンク（1口座に複数キャラ可）。MC UUID は「チャージ用の連携リソース」。1キャラ=1口座（`account_mc_links.mc_uuid` UNIQUE、別口座からのチャージ/在庫照会は `character_claimed` で拒否）。
-- **メール検証 / 2FA / リカバリ（v4）**: SMTP 設定時（`MOCHI_SMTP_*`）は**開設にメール＋OTP必須**（1メール1口座、`email_lower` UNIQUE）、ログインは PIN＋メール2FA、PIN 忘れはメール OTP で再設定。SMTP 未設定なら**従来の handle+PIN へ自動 degrade**（メール要素は無効）。OTP は 6桁・SHA-256 保存・10分・5回上限・単回・再送クールダウン（`moymoy_otps`）。送信は `mochi-hub-mailer` の `SmtpMailSender`（設定は全て env・ハードコード無し）。dev 検証は `MOYMOY_DEV_OTP_LOG=1`（コードをログ出力、送信しない）。
+- **メール検証 / 2FA / リカバリ（v4）**: **MNN メール（`@*.mnn`）限定**。`MOCHI_MAIL_SERVICE_BEARER` 設定時は**開設にメール＋OTP必須**（1メール1口座、`email_lower` UNIQUE）、ログインは PIN＋メール2FA、PIN 忘れはメール OTP で再設定。未設定なら**従来の handle+PIN へ自動 degrade**。OTP は 6桁・SHA-256(+`MOYMOY_OTP_PEPPER`)保存・10分・5回上限・単回・再送クールダウン（`moymoy_otps`）。送信は `mochi-hub-mailer` の `MnnMailSender`（IPvM ゲートウェイ `/mail/otp-deliver` 経由で相手の in-world メールアプリへ配送。外部SMTPは使わない）。`valid_email` は `local@<単一ラベル>.mnn` のみ受理。dev 検証は `MOYMOY_DEV_OTP_LOG=1`（コードをログ出力）。
 
 ### バックエンド HTTP API
 全レスポンス `{ok:bool, ...}`。ウォレット系は `X-MoyMoy-Session` でセッション認証（無効は 401）。
@@ -103,7 +103,8 @@ UIフロー:
 - [x] **メール認証**: 検証/2FA/PINリカバリ/1メール1口座＋SMTP無しdegrade — backend `01a4b0f`(schema v4, スモーク緑) / frontend `cf702d6`(Babel透過)
 - [x] CodeX 再レビュー反映（R007/R008・frontend-followups `cc15389` ＋ メール認証 `9b910e5`）— 資産損失floatバグ・dead-letter・OTPロールバック・pepper 等
 - [x] 再公開 **v0.2.1**（R007/R008・frontend修正・メール認証・レビュー反映を束ねた最終バンドル）を GitHub リリース＋HUB 再登録（sha256 `1b54d370`）
-- [ ] SMTP 本番設定（`MOCHI_SMTP_*` ＋任意 `MOYMOY_OTP_PEPPER` を運用者が env で設定。gmail/Resend/Brevo/SES 等）— 未設定なら degrade
+- [x] メール送信を **MNN メール（`@*.mnn`）限定**に切替（`MnnMailSender`、外部SMTP廃止） `d6d8645`
+- [ ] 本番設定: `MOCHI_MAIL_SERVICE_BEARER`（＋任意 `MOYMOY_OTP_PEPPER`）を運用者が env で設定 — 未設定なら degrade
 - [ ] backend 再配置（`deploy-backend.ps1` で v0.2.1 の moymoy-cs を Hub workdir へ）
 - [ ] フル E2E（in-world で 0.2.1 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
 - [ ] 承認ゲート保留: `MOYMOY_OTP_PEPPER` の本番 fail-closed 化 / `AccountInfo` の email 型統合 / refresh 失敗の UI エラー状態化 / `run_inbound` 切断理由の可視化（mc-sdk 共有層）
