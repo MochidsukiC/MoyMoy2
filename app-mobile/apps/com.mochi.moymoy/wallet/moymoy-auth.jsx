@@ -249,10 +249,31 @@ function AuthRegister({ emailEnabled, onDone, onBack }) {
     setBusy(false);
   }
 
+  // Dedicated resend handler for the code screen: stays on the code screen and
+  // shows inline errors (too_soon etc.) rather than bouncing back to the form.
+  async function resend() {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await MoyMoy.register({
+        handle: handle.trim(),
+        display_name: name.trim(),
+        pin,
+        email: emailEnabled ? email.trim() : undefined,
+      });
+      if (r.ok && r.session) { onDone(r.account, r.session); return; }
+      if (r.ok && r.pending === "verify_email") { setPendingEmail(r.email || email.trim()); }
+      else setErr(REG_ERR[r.error] || "再送に失敗しました");
+    } catch (e) {
+      setErr("通信に失敗しました");
+    }
+    setBusy(false);
+  }
+
   if (step === "code") {
     return (
       <CodeEntry title="メール確認" sub={"@" + handle.trim()} email={pendingEmail} cta="口座を開設"
-        onSubmit={verifyCode} onResend={submit} busy={busy} err={err} onBack={() => backToForm("")} />
+        onSubmit={verifyCode} onResend={resend} busy={busy} err={err} onBack={() => backToForm("")} />
     );
   }
 
@@ -641,7 +662,7 @@ function MoyMoyRoot({ onClose }) {
     let alive = true;
     MoyMoy.config()
       .then((r) => { if (alive && r && r.ok) setEmailEnabled(!!r.email_enabled); })
-      .catch(() => {});
+      .catch((e) => { console.warn("MoyMoy: /auth/config failed; email UI hidden until reload", e); });
     return () => { alive = false; };
   }, []);
 

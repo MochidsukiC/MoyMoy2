@@ -10,7 +10,7 @@
 //! `MOYMOY_DEV_OTP_LOG=1` mode lets the flow be exercised locally without SMTP
 //! (codes go to the log — never in a real deploy).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use base64::Engine as _;
@@ -116,6 +116,17 @@ pub fn valid_email(s: &str) -> Option<String> {
     Some(t.to_string())
 }
 
+/// Server-side pepper mixed into OTP hashes so a leaked `moymoy_otps` table
+/// cannot be brute-forced offline (code space is only 10^6).
+/// Set `MOYMOY_OTP_PEPPER` in production; absent → empty (backward-compatible,
+/// but provides no offline-attack resistance — see ops runbook).
+fn otp_pepper() -> &'static [u8] {
+    static PEPPER: OnceLock<Vec<u8>> = OnceLock::new();
+    PEPPER
+        .get_or_init(|| std::env::var("MOYMOY_OTP_PEPPER").unwrap_or_default().into_bytes())
+        .as_slice()
+}
+
 fn gen_code() -> String {
     let mut b = [0u8; 4];
     OsRng.fill_bytes(&mut b);
@@ -124,8 +135,10 @@ fn gen_code() -> String {
 }
 
 fn code_hash(code: &str) -> String {
-    let digest = Sha256::digest(code.as_bytes());
-    base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
+    let mut h = Sha256::new();
+    h.update(otp_pepper());
+    h.update(code.as_bytes());
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(h.finalize())
 }
 
 /// Result of requesting a code.
@@ -167,6 +180,12 @@ pub fn create(
         "DELETE FROM moymoy_otps WHERE purpose = ?1 AND email_lower = ?2",
         params![purpose, email_lower],
     )?;
+    // Opportunistic GC: sweep globally expired OTPs piggybacked on issuance so
+    // abandoned signup/login/recovery codes don't accumulate indefinitely.
+    conn.execute(
+        "DELETE FROM moymoy_otps WHERE expires_unix_ms < ?1",
+        params![now],
+    )?;
     let code = gen_code();
     conn.execute(
         "INSERT INTO moymoy_otps \
@@ -184,6 +203,17 @@ pub fn create(
         ],
     )?;
     Ok(CreateOtp::Issued(code))
+}
+
+/// Delete the OTP for `(purpose, email_lower)`. Used to roll back a code that
+/// was issued but could not be delivered (e.g. SMTP failure) so the resend
+/// cooldown doesn't strand the user behind a code they never received.
+pub fn revoke(conn: &Connection, purpose: &str, email_lower: &str) -> Result<(), ApiError> {
+    conn.execute(
+        "DELETE FROM moymoy_otps WHERE purpose = ?1 AND email_lower = ?2",
+        params![purpose, email_lower],
+    )?;
+    Ok(())
 }
 
 /// Result of verifying a code.

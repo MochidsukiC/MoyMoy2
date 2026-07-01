@@ -210,7 +210,16 @@ async fn register(
         SignupStart::EmailTaken => Ok(Json(json!({ "ok": false, "error": "email_taken" }))),
         SignupStart::TooSoon(ms) => Ok(Json(json!({ "ok": false, "error": "too_soon", "retry_after_ms": ms }))),
         SignupStart::Issued(code) => {
-            st.mailer.send(&email, &code, otp::PURPOSE_SIGNUP).await?;
+            if let Err(e) = st.mailer.send(&email, &code, otp::PURPOSE_SIGNUP).await {
+                // Roll back the OTP so the resend cooldown doesn't strand the user.
+                let el = email_lower.clone();
+                if let Err(re) = blocking(st.pool.clone(), move |conn| {
+                    otp::revoke(conn, otp::PURPOSE_SIGNUP, &el)
+                }).await {
+                    tracing::warn!(error = %re, "failed to roll back undelivered signup OTP");
+                }
+                return Err(e);
+            }
             Ok(Json(json!({ "ok": true, "pending": "verify_email", "email": email })))
         }
     }
@@ -237,13 +246,16 @@ async fn register_verify(
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let v = match otp::verify(&tx, otp::PURPOSE_SIGNUP, &email_lower, &req.code)? {
             VerifyOtp::Ok { payload, .. } => {
-                match payload.as_deref().and_then(|p| serde_json::from_str::<PendingSignup>(p).ok()) {
-                    Some(pending) => match auth::register_verified(&tx, &pending, &email, &email_lower, req.phone_id.as_deref())? {
-                        VerifiedSignup::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
-                        VerifiedSignup::HandleTaken => json!({ "ok": false, "error": "handle_taken" }),
-                        VerifiedSignup::EmailTaken => json!({ "ok": false, "error": "email_taken" }),
-                    },
-                    None => json!({ "ok": false, "error": "invalid_code" }),
+                // A corrupt/missing payload is a server fault, not a wrong code.
+                // Returning 500 here rolls back the transaction so the OTP is not
+                // consumed, allowing the user to retry with a fresh resend.
+                let raw = payload.ok_or_else(|| ApiError::internal("signup OTP missing payload"))?;
+                let pending: PendingSignup = serde_json::from_str(&raw)
+                    .map_err(|e| ApiError::internal(format!("corrupt signup payload: {e}")))?;
+                match auth::register_verified(&tx, &pending, &email, &email_lower, req.phone_id.as_deref())? {
+                    VerifiedSignup::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
+                    VerifiedSignup::HandleTaken => json!({ "ok": false, "error": "handle_taken" }),
+                    VerifiedSignup::EmailTaken => json!({ "ok": false, "error": "email_taken" }),
                 }
             }
             VerifyOtp::Invalid => json!({ "ok": false, "error": "invalid_code" }),
@@ -264,7 +276,9 @@ struct LoginReq {
 
 enum LoginStart {
     Terminal(Value),
-    TwoFactor { email: String, code: Option<String> },
+    /// `email_lower` mirrors the key passed to `otp::create` so the revoke on
+    /// SMTP failure uses the identical key (symmetry with register and recover).
+    TwoFactor { email: String, email_lower: String, code: Option<String> },
 }
 
 /// Login step 1: verify handle + PIN. If the account has a verified email and
@@ -287,8 +301,8 @@ async fn login(
                     let el = info.email_lower.clone().unwrap_or_default();
                     let em = info.email.clone().unwrap_or_default();
                     match otp::create(&tx, otp::PURPOSE_LOGIN2FA, &el, Some(&info.account_id), None)? {
-                        CreateOtp::Issued(code) => LoginStart::TwoFactor { email: em, code: Some(code) },
-                        CreateOtp::TooSoon { .. } => LoginStart::TwoFactor { email: em, code: None },
+                        CreateOtp::Issued(code) => LoginStart::TwoFactor { email: em, email_lower: el, code: Some(code) },
+                        CreateOtp::TooSoon { .. } => LoginStart::TwoFactor { email: em, email_lower: el, code: None },
                     }
                 } else {
                     let token = auth::create_session(&tx, &info.account_id, req.phone_id.as_deref())?;
@@ -304,9 +318,19 @@ async fn login(
 
     match start {
         LoginStart::Terminal(v) => Ok(Json(v)),
-        LoginStart::TwoFactor { email, code } => {
+        LoginStart::TwoFactor { email, email_lower, code } => {
             if let Some(c) = code {
-                st.mailer.send(&email, &c, otp::PURPOSE_LOGIN2FA).await?;
+                if let Err(e) = st.mailer.send(&email, &c, otp::PURPOSE_LOGIN2FA).await {
+                    // Use the same email_lower key that otp::create used, not a
+                    // re-derivation via to_lowercase(), to guarantee the revoke
+                    // targets the right row even on data-inconsistency edge cases.
+                    if let Err(re) = blocking(st.pool.clone(), move |conn| {
+                        otp::revoke(conn, otp::PURPOSE_LOGIN2FA, &email_lower)
+                    }).await {
+                        tracing::warn!(error = %re, "failed to roll back undelivered 2FA OTP");
+                    }
+                    return Err(e);
+                }
             }
             Ok(Json(json!({ "ok": true, "pending": "2fa", "email": email })))
         }
@@ -355,18 +379,35 @@ async fn recover_start(
             Some(info) if info.email_verified && info.email_lower.is_some() => {
                 let el = info.email_lower.clone().unwrap_or_default();
                 match otp::create(&tx, otp::PURPOSE_RECOVERY, &el, Some(&info.account_id), None)? {
-                    CreateOtp::Issued(code) => Some((info.email.clone().unwrap_or_default(), Some(code))),
-                    CreateOtp::TooSoon { .. } => Some((info.email.clone().unwrap_or_default(), None)),
+                    // Carry `el` (the key used for OTP creation) alongside the
+                    // display email so the revoke below uses the identical key.
+                    CreateOtp::Issued(code) => Some((info.email.clone().unwrap_or_default(), el, Some(code))),
+                    CreateOtp::TooSoon { .. } => Some((info.email.clone().unwrap_or_default(), el, None)),
                 }
             }
             _ => None,
         };
         tx.commit()?;
-        Ok::<Option<(String, Option<String>)>, ApiError>(out)
+        Ok::<Option<(String, String, Option<String>)>, ApiError>(out)
     })
     .await?;
-    if let Some((email, Some(code))) = &created {
-        st.mailer.send(email, code, otp::PURPOSE_RECOVERY).await?;
+    if let Some((email, email_lower, Some(code))) = &created {
+        if let Err(e) = st.mailer.send(email, code, otp::PURPOSE_RECOVERY).await {
+            // Existence secrecy: recover_start must return an identical response
+            // whether or not the handle maps to a verified account (unlike
+            // register/login, which may surface 5xx). Propagating the SMTP error
+            // would 5xx *only* for real verified accounts, creating an account-
+            // enumeration oracle. Log it, roll back the undelivered code (so the
+            // resend cooldown doesn't strand a real user), then fall through to
+            // the uniform ok response.
+            tracing::warn!(error = %e, "recovery OTP email send failed (suppressed for existence secrecy)");
+            let el = email_lower.clone();
+            if let Err(re) = blocking(st.pool.clone(), move |conn| {
+                otp::revoke(conn, otp::PURPOSE_RECOVERY, &el)
+            }).await {
+                tracing::warn!(error = %re, "failed to roll back undelivered recovery OTP");
+            }
+        }
     }
     Ok(Json(json!({ "ok": true, "sent": true })))
 }
@@ -412,14 +453,27 @@ fn finish_otp_session(
         Some(e) => e,
         None => return Ok(json!({ "ok": false, "error": "invalid_code" })),
     };
+    // Validate the new PIN *before* consuming the OTP. auth::set_pin() only
+    // rejects on an invalid PIN format, so a bad PIN must not burn the code and
+    // strand the user behind the resend cooldown.
+    if let Some(pin) = new_pin {
+        if !auth::valid_pin(pin) {
+            return Ok(json!({ "ok": false, "error": "bad_pin" }));
+        }
+    }
     match otp::verify(tx, purpose, &el, code)? {
         VerifyOtp::Ok { account_id, .. } => {
             if account_id.as_deref() != Some(info.account_id.as_str()) {
                 return Ok(json!({ "ok": false, "error": "invalid_code" }));
             }
             if let Some(pin) = new_pin {
+                // valid_pin was already checked before the OTP was consumed, so a
+                // false here means set_pin rejected for some *other* reason — a
+                // server-side inconsistency, not a user input error. Surface it as
+                // an internal error so the tx rolls back (OTP not burned) and the
+                // user can retry, mirroring register_verify's server-fault path.
                 if !auth::set_pin(tx, &info.account_id, pin)? {
-                    return Ok(json!({ "ok": false, "error": "bad_pin" }));
+                    return Err(ApiError::internal("set_pin rejected an already-validated PIN"));
                 }
             }
             let token = auth::create_session(tx, &info.account_id, phone_id)?;
