@@ -46,8 +46,16 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
 
     private static final Logger LOGGER = LogUtils.getLogger();
 
-    /** The backend app_id (cert SAN) allowed to issue commands. */
+    /** The backend identity (cert SAN, stamped by the Hub as `src`) allowed to
+     *  issue commands — the wallet backend's command-bus cert `mcserver_id`. */
     private static final String ALLOWED_SRC = "moymoy";
+
+    /** cs-host the reply is addressed to. The backend claims `charge.moymoy` on
+     *  its command-bus connection (a SIBLING of its wallet's `wallet.moymoy`), so
+     *  we reply to this sub-host — NOT the received `src` (which is the cert id
+     *  `moymoy`, whose `moymoy.cs.mnn` the backend does not claim). The sidecar
+     *  routes `reply.reply("charge.moymoy", …)` as `charge.moymoy.cs.mnn`. */
+    private static final String REPLY_HOST = "charge.moymoy";
 
     /** Bounds a single charge against a hostile/buggy backend. */
     private static final int MAX_AMOUNT = 1_000_000_000;
@@ -79,7 +87,7 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
                 default -> {
                     String opId = optString(cmd, "op_id");
                     if (!opId.isEmpty()) {
-                        ackCharge(reply, src, opId, "unknown_verb", 0);
+                        ackCharge(reply, opId, "unknown_verb", 0);
                     } else {
                         LOGGER.warn("moymoy: unknown verb '{}' from src '{}'", verb, src);
                     }
@@ -90,7 +98,7 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
             try {
                 String opId = optString(cmd, "op_id");
                 if (!opId.isEmpty()) {
-                    ackCharge(reply, src, opId, "internal_error", 0);
+                    ackCharge(reply, opId, "internal_error", 0);
                 }
             } catch (Throwable ackFailure) {
                 LOGGER.error("moymoy: failed to ack internal_error", ackFailure);
@@ -108,13 +116,13 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
         }
         if (!ALLOWED_SRC.equals(src)) {
             LOGGER.warn("moymoy: rejected charge from unauthorized src '{}' (op {})", src, opId);
-            ackCharge(reply, src, opId, "unauthorized", 0);
+            ackCharge(reply, opId, "unauthorized", 0);
             return;
         }
         UUID uuid = parseUuid(optString(cmd, "target_uuid"));
         int amount = optInt(cmd, "amount");
         if (uuid == null || amount <= 0 || amount > MAX_AMOUNT) {
-            ackCharge(reply, src, opId, "bad_request", 0);
+            ackCharge(reply, opId, "bad_request", 0);
             return;
         }
 
@@ -122,7 +130,7 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
         EmeraldOpStore store = EmeraldOpStore.get(server);
         Integer prior = store.recorded(opId);
         if (prior != null) {
-            ackCharge(reply, src, opId, "duplicate", prior);
+            ackCharge(reply, opId, "duplicate", prior);
             return;
         }
 
@@ -137,18 +145,18 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
         }).join();
 
         if (consumed == null) {
-            ackCharge(reply, src, opId, "player_offline", 0);
+            ackCharge(reply, opId, "player_offline", 0);
             return;
         }
         if (consumed <= 0) {
             // No emeralds to consume — retryable (the player may acquire some).
-            ackCharge(reply, src, opId, "insufficient_emeralds", 0);
+            ackCharge(reply, opId, "insufficient_emeralds", 0);
             return;
         }
 
         store.record(opId, consumed); // claim only after a real consume
         LOGGER.info("moymoy: charged op {} → {} consumed {} エメ", opId, uuid, consumed);
-        ackCharge(reply, src, opId, "ok", consumed);
+        ackCharge(reply, opId, "ok", consumed);
     }
 
     // ── inventory.query ──────────────────────────────────────────────────────
@@ -184,18 +192,19 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
             o.addProperty("emeralds", inv[0]);
             o.addProperty("blocks", inv[1]);
         }
-        reply.reply(ALLOWED_SRC, o.toString().getBytes(StandardCharsets.UTF_8));
+        reply.reply(REPLY_HOST, o.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    private static void ackCharge(CommandDispatch.Replier reply, String dst, String opId,
+    private static void ackCharge(CommandDispatch.Replier reply, String opId,
                                   String status, int settled) {
         JsonObject o = new JsonObject();
         o.addProperty("op_id", opId);
         o.addProperty("status", status);
         o.addProperty("settled", settled);
-        reply.reply(dst, o.toString().getBytes(StandardCharsets.UTF_8));
+        // Reply to the backend's charge sub-host (see REPLY_HOST), not the src.
+        reply.reply(REPLY_HOST, o.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     private static UUID parseUuid(String s) {

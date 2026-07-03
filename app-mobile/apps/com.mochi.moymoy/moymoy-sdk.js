@@ -2,8 +2,10 @@
 /* =====================================================================
    MoyMoy — client SDK (piggle-sdk.js pattern)
 
-   Talks to the MoyMoy wallet backend at `moymoy.cs.mnn` over the MNN overlay.
-   The backend is the single source of truth for balances and identity.
+   Talks to the MoyMoy wallet backend at `wallet.moymoy.cs.mnn` over the MNN
+   overlay. The backend is the single source of truth for balances and identity.
+   (The wallet ingress is `wallet.moymoy`; the emerald-charge reply channel is the
+   sibling `charge.moymoy` — see command_bus.rs — so one backend claims both.)
 
    Identity (v2): a MoyMoy account (handle + PIN). The backend verifies every
    wallet request from the session token we send in the `X-MoyMoy-Session`
@@ -11,7 +13,7 @@
    ONLY for charge/inventory — the character whose emeralds to consume.
 
    Endpoint resolution:
-     - in-world (mochi-internal:// origin): https://moymoy.cs.mnn
+     - in-world (mochi-internal:// origin): https://wallet.moymoy.cs.mnn
      - browser-dev: ?moymoy_http=<base> or window.__MOYMOY_ENDPOINT__
        (default http://127.0.0.1:7433, the cs.mnn dev listen addr).
 
@@ -29,7 +31,7 @@
     if (window.__MOYMOY_ENDPOINT__) return trim(window.__MOYMOY_ENDPOINT__);
     const o = qs.get("moymoy_http");
     if (o) return trim(o);
-    if (inWorld) return "https://moymoy.cs.mnn";
+    if (inWorld) return "https://wallet.moymoy.cs.mnn";
     return "http://127.0.0.1:7433"; // cs.mnn dev listen
   }
 

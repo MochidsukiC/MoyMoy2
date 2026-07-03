@@ -8,11 +8,15 @@
 //! Single `McSdk` connection, two directions (DEV.md §7.3):
 //!   - OUTBOUND `reliable_send("moymoy.<UUID>.minecraft.auto.mnn", "moymoy", …)` —
 //!     ask the mod to consume emeralds / report inventory, auto-routed to the
-//!     player's live server.
-//!   - INBOUND `run_inbound` — because we connect with `cs_hosts = ["moymoy"]`,
-//!     the mod's reply (`reply.reply("moymoy", …)`, which the mc-connector sidecar
-//!     routes as `moymoy.cs.mnn`) lands here. A charge ack (`op_id`) settles the
-//!     `emerald_ops` ledger; an inventory reply (`req_id`) wakes a pending query.
+//!     player's live server. The Hub stamps `src` from THIS connection's cert
+//!     (mcserver_id "moymoy"), which the mod checks against its ALLOWED_SRC.
+//!   - INBOUND `run_inbound` — we connect with `cs_hosts = ["charge.moymoy"]`,
+//!     so the mod's reply (the mod addresses it to "charge.moymoy", which the
+//!     mc-connector sidecar routes as `charge.moymoy.cs.mnn`) lands here. That
+//!     sub-host is a SIBLING of the wallet's `wallet.moymoy.cs.mnn`, so the two
+//!     connections of this one backend never collide on the same cs claim. A
+//!     charge ack (`op_id`) settles the `emerald_ops` ledger; an inventory reply
+//!     (`req_id`) wakes a pending query.
 //!
 //! A supervisor task owns connect → run_inbound → reconnect, publishing the live
 //! `McSdk` into a slot that `send_*` reads (None while reconnecting, so a send
@@ -69,9 +73,13 @@ impl ConnMaterials {
             // node_id keys the reverse tunnel; routing to us is by the cs claim,
             // so a fresh id per connect is fine (matches the grant-sender pattern).
             node_id: Uuid::new_v4(),
-            // Claim cs host "moymoy" so the mod's reply (routed as moymoy.cs.mnn)
-            // is delivered to THIS connection's run_inbound.
-            cs_hosts: vec!["moymoy".to_string()],
+            // Claim cs host "charge.moymoy" (a SIBLING of the wallet's
+            // "wallet.moymoy") so the mod's reply — which the mod addresses to
+            // "charge.moymoy", routed by the sidecar as charge.moymoy.cs.mnn —
+            // lands on THIS connection's run_inbound. Using a distinct sub-host
+            // (not the bare "moymoy") avoids the unified cs_dispatch rejecting
+            // this claim as a duplicate of the wallet tunnel's claim.
+            cs_hosts: vec!["charge.moymoy".to_string()],
         }
     }
 }

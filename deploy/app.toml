@@ -8,7 +8,10 @@
 # launcher injects only MOCHI_APP_LISTEN and runs NO tunnel itself (DEV.md §5.4.3).
 
 enabled = true
-domain  = "moymoy.cs.mnn"
+# Wallet ingress. Split from the emerald-charge reply channel onto sibling
+# cs-hosts under `moymoy` (wallet=wallet.moymoy, charge reply=charge.moymoy) so
+# one backend claims both without the unified cs_dispatch rejecting the second.
+domain  = "wallet.moymoy.cs.mnn"
 # `exec` omitted on purpose: the launcher auto-detects the single runnable file in
 # this dir (moymoy-cs / moymoy-cs.exe), which is portable across Windows/Unix
 # without hardcoding the `.exe` suffix. Add `exec = ["./moymoy-cs"]` to override.
@@ -18,7 +21,7 @@ tunnel  = "self"
 [env]
 # Wallet store (relative to app_backends/moymoy/).
 MOYMOY_DB_PATH = "moymoy.db"
-# Serve TLS for path-C (https://moymoy.cs.mnn through the gateway CONNECT tunnel).
+# Serve TLS for path-C (https://wallet.moymoy.cs.mnn via the gateway CONNECT tunnel).
 MOYMOY_CS_TLS  = "1"
 
 # Embedded cs tunnel → Hub endpoints. These match a local `mochi-inworld` devstack;

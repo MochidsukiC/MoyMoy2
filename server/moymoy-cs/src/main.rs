@@ -41,7 +41,11 @@ async fn main() -> anyhow::Result<()> {
     // The launcher injects MOCHI_APP_LISTEN=127.0.0.1:<port>; fall back to a dev
     // default for a standalone smoke (tools/run-cs.ps1).
     let listen = env_or("MOCHI_APP_LISTEN", &env_or("MOYMOY_CS_LISTEN", "127.0.0.1:7433"));
-    let mnn = env_or("MOYMOY_CS_MNN", "moymoy.cs.mnn");
+    // Wallet ingress. The wallet and the emerald-charge reply are split onto
+    // sibling cs-hosts under `moymoy` so ONE backend can claim BOTH without the
+    // unified cs_dispatch rejecting the second: wallet = `wallet.moymoy.cs.mnn`
+    // (this tunnel), charge reply = `charge.moymoy.cs.mnn` (the command bus).
+    let mnn = env_or("MOYMOY_CS_MNN", "wallet.moymoy.cs.mnn");
     let db_path = env_or("MOYMOY_DB_PATH", "moymoy.db");
     let tls_on = env_flag("MOYMOY_CS_TLS", true);
     let tunnel_on = env_flag("MOYMOY_CS_TUNNEL", true);
