@@ -21,8 +21,13 @@
   MC server + "moymoy" in mochi-server.toml [connector].hosted_app_ids.
 
 .PARAMETER McCaDir
-  The Hub's mc-pki CA directory (the leaf must chain to the CA the Hub trusts).
-  Default: <MochiRepo>\.devstack\mc-pki\ca (the mochi-inworld devstack layout).
+  The Hub's MC command-bus CA directory (the leaf MUST chain to the CA the Hub
+  serves :7421 with, else the backend's mTLS handshake fails with BadSignature).
+  Default: <HubWorkdir>\state\mc-pki — the rebuilt Hub's canonical CA (mc_bus.rs
+  falls back to <state_dir>/mc-pki when MOCHI_HUB_MC_PKI_DIR is unset). Override
+  only if the Hub's MOCHI_HUB_MC_PKI_DIR points elsewhere. NOTE: this CA also
+  issues the MC connectors' leaves — it is the whole command bus's trust root,
+  not MC-connector-only (see docs/charge-mtls-keys.md).
 
 .EXAMPLE
   powershell -File tools/deploy-backend.ps1 -HubWorkdir D:\IdeaProjects\MochiOS2.0\.devstack\hub -EnableCharge
@@ -39,7 +44,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $root 'server\moymoy-cs\Cargo.toml'
-if (-not $McCaDir) { $McCaDir = Join-Path $MochiRepo '.devstack\mc-pki\ca' }
+if (-not $McCaDir) { $McCaDir = Join-Path $HubWorkdir 'state\mc-pki' }
 
 if (-not $NoBuild) {
     Write-Host "cargo build --release ..." -ForegroundColor Cyan
@@ -71,7 +76,7 @@ if (Test-Path $tomlDest) {
 if ($EnableCharge) {
     Write-Host "enabling emerald charge (minting MC client cert) ..." -ForegroundColor Cyan
     if (-not (Test-Path $McCaDir)) {
-        throw "mc-pki CA dir not found: $McCaDir. Run the mochi-inworld devstack first (creates .devstack\mc-pki\ca), or pass -McCaDir <the Hub's CA dir>."
+        throw "MC command-bus CA dir not found: $McCaDir. Start the Hub once (it creates <state_dir>/mc-pki), or pass -McCaDir <the Hub's actual MOCHI_HUB_MC_PKI_DIR>."
     }
     $mcCa = Join-Path $MochiRepo 'target\debug\mochi-mc-ca.exe'
     if (-not (Test-Path $mcCa)) {
