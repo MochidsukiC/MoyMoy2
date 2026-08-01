@@ -737,6 +737,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-rustls"
+version = "0.27.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
+dependencies = [
+ "http",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+ "webpki-roots",
+]
+
+[[package]]
 name = "hyper-util"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1049,13 +1065,60 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "mochi-config",
+ "mochi-hub-enroll-client",
+ "mochi-hub-ipvm-tunnel",
  "mochi-hub-tunnel-client",
+ "mochi-profile",
+ "mochi-proto-exsoft-connector",
  "reqwest",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "mochi-hub-enroll-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "rand 0.8.6",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "mochi-hub-exsoft-pki"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mochi-proto-exsoft-connector",
+ "pem",
+ "rcgen",
+ "rustls",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "mochi-hub-exsoft-sdk"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "mochi-hub-ipvm-tunnel",
+ "mochi-proto-exsoft-connector",
+ "quinn",
+ "rustls",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1084,35 +1147,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mochi-hub-mc-pki"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "mochi-proto-mc-connector",
- "pem",
- "rcgen",
- "rustls",
- "thiserror 2.0.18",
- "time",
-]
-
-[[package]]
-name = "mochi-hub-mc-sdk"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "mochi-hub-ipvm-tunnel",
- "mochi-proto-mc-connector",
- "quinn",
- "rustls",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "mochi-hub-tunnel-client"
 version = "0.1.0"
 dependencies = [
@@ -1122,15 +1156,25 @@ dependencies = [
  "mochi-hub-ipvm-tunnel",
  "mochi-proto-ipvm",
  "mochi-proto-mnn-link",
+ "pem",
  "quinn",
  "reqwest",
  "rustls",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "mochi-profile"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rand 0.8.6",
 ]
 
 [[package]]
@@ -1143,23 +1187,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "mochi-proto-ipvm"
-version = "0.1.0"
-dependencies = [
- "mochi-proto-common",
- "serde",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "mochi-proto-mc-connector"
+name = "mochi-proto-exsoft-connector"
 version = "0.1.0"
 dependencies = [
  "mochi-proto-common",
  "mochi-proto-ipvm",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "mochi-proto-ipvm"
+version = "0.1.0"
+dependencies = [
+ "mochi-proto-common",
+ "serde",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -1206,9 +1250,9 @@ dependencies = [
  "hyper-util",
  "md5",
  "mochi-hub-cs-sdk",
+ "mochi-hub-exsoft-pki",
+ "mochi-hub-exsoft-sdk",
  "mochi-hub-mailer",
- "mochi-hub-mc-pki",
- "mochi-hub-mc-sdk",
  "r2d2",
  "r2d2_sqlite",
  "rand 0.8.6",
@@ -1700,16 +1744,21 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "js-sys",
  "log",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tower-service",
@@ -1717,6 +1766,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2593,6 +2643,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

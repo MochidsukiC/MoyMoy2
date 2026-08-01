@@ -7,8 +7,11 @@
 //! code (never the code), with a 10-minute expiry, a 5-attempt limit, single-use
 //! semantics, and a per-target resend cooldown.
 //!
-//! Email features are active only when the MNN mail bearer is configured
-//! (`MOCHI_MAIL_SERVICE_BEARER`); otherwise the wallet degrades to handle+PIN.
+//! Email features are active only when this process has its own per-process
+//! identity token (`MOCHI_SVC_IDENTITY_TOKEN`, injected by the hub launcher);
+//! otherwise the wallet degrades to handle+PIN. The shared
+//! `MOCHI_MAIL_SERVICE_BEARER` it used to present was retired in DEV.md §7.3.9
+//! Stage 6-iv-c2 — mail now accepts nothing but a caller's own identity token.
 //! A dev-only `MOYMOY_DEV_OTP_LOG=1` mode lets the flow be exercised locally
 //! without the mail service (codes go to the log — never in a real deploy).
 
@@ -45,7 +48,7 @@ pub struct PendingSignup {
 }
 
 /// Outbound OTP delivery (MNN mail) + the email-features gate. Holds the MNN
-/// mail sender when `MOCHI_MAIL_SERVICE_BEARER` is configured; `dev_log`
+/// mail sender when this process has an identity token to present; `dev_log`
 /// exercises the OTP flow locally without the mail service by logging codes.
 #[derive(Clone)]
 pub struct Mailer {
@@ -54,21 +57,28 @@ pub struct Mailer {
 }
 
 impl Mailer {
-    /// Build from the environment: the MNN mail sender if
-    /// `MOCHI_MAIL_SERVICE_BEARER` is set, else a dev-log fallback when
-    /// `MOYMOY_DEV_OTP_LOG=1`, else disabled (degrade to handle+PIN).
+    /// Build from the environment: the MNN mail sender if this process has its
+    /// own identity token (`MOCHI_SVC_IDENTITY_TOKEN`), else a dev-log fallback
+    /// when `MOYMOY_DEV_OTP_LOG=1`, else disabled (degrade to handle+PIN).
+    ///
+    /// An empty token fail-closes the MNN leg rather than building a sender that
+    /// authenticates with nothing — the same posture `RouterMailSender::-
+    /// from_env_with_bearer` takes upstream.
     pub fn from_env() -> Self {
         let dev_log = crate::env_flag("MOYMOY_DEV_OTP_LOG", false);
-        match MnnMailSender::from_env() {
-            Ok(s) => {
-                tracing::info!("email OTP enabled (MNN mail)");
-                Mailer { sender: Some(Arc::new(s)), dev_log }
+        match std::env::var("MOCHI_SVC_IDENTITY_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(token) => {
+                tracing::info!("email OTP enabled (MNN mail, per-process identity)");
+                Mailer { sender: Some(Arc::new(MnnMailSender::with_bearer(token))), dev_log }
             }
-            Err(e) => {
+            None => {
                 if dev_log {
-                    tracing::warn!(reason = %e, "MNN mail not configured — DEV OTP LOG mode (codes logged, not delivered)");
+                    tracing::warn!("MOCHI_SVC_IDENTITY_TOKEN unset — DEV OTP LOG mode (codes logged, not delivered)");
                 } else {
-                    tracing::info!(reason = %e, "email OTP disabled (no MNN mail bearer) — wallet runs handle+PIN only");
+                    tracing::info!("email OTP disabled (no per-process identity token) — wallet runs handle+PIN only");
                 }
                 Mailer { sender: None, dev_log }
             }

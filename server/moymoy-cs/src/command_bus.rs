@@ -1,4 +1,4 @@
-//! MochiOS command-bus client (mc-sdk) — bidirectional link to the in-world mod.
+//! MochiOS command-bus client (exsoft-sdk) — bidirectional link to the in-world mod.
 //!
 //! This is the OPTIONAL emerald-charge path. The wallet (balance/send/pay/history)
 //! works entirely without it; when no MC cert is configured the backend runs
@@ -9,10 +9,10 @@
 //!   - OUTBOUND `reliable_send("moymoy.<UUID>.minecraft.auto.mnn", "moymoy", …)` —
 //!     ask the mod to consume emeralds / report inventory, auto-routed to the
 //!     player's live server. The Hub stamps `src` from THIS connection's cert
-//!     (mcserver_id "moymoy"), which the mod checks against its ALLOWED_SRC.
+//!     (exsoft_id "moymoy"), which the mod checks against its ALLOWED_SRC.
 //!   - INBOUND `run_inbound` — we connect with `cs_hosts = ["charge.moymoy"]`,
 //!     so the mod's reply (the mod addresses it to "charge.moymoy", which the
-//!     mc-connector sidecar routes as `charge.moymoy.cs.mnn`) lands here. That
+//!     ExSoft connector sidecar routes as `charge.moymoy.cs.mnn`) lands here. That
 //!     sub-host is a SIBLING of the wallet's `wallet.moymoy.cs.mnn`, so the two
 //!     connections of this one backend never collide on the same cs claim. A
 //!     charge ack (`op_id`) settles the `emerald_ops` ledger; an inventory reply
@@ -28,8 +28,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mochi_hub_mc_pki::load_client_identity;
-use mochi_hub_mc_sdk::{McSdk, McSdkConfig, SdkError};
+use mochi_hub_exsoft_pki::load_client_identity;
+use mochi_hub_exsoft_sdk::{McSdk, McSdkConfig, SdkError};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
 use serde_json::Value;
@@ -52,7 +52,7 @@ pub enum SendOutcome {
 }
 
 /// Connection materials kept so the supervisor can rebuild the config and
-/// reconnect after an idle drop (mc-sdk types are not `Clone`, so we hold the
+/// reconnect after an idle drop (exsoft-sdk types are not `Clone`, so we hold the
 /// raw cert material and re-derive `McSdkConfig` each connect).
 struct ConnMaterials {
     hub_addr: SocketAddr,
@@ -93,19 +93,19 @@ pub struct CommandBus {
 }
 
 impl CommandBus {
-    /// Connect to the Hub command bus when `MOCHI_MC_CERT_DIR` is configured and
-    /// holds the PEMs. Returns `Ok(None)` (degraded wallet-only) when unset or
+    /// Connect to the Hub command bus when `MOCHI_EXSOFT_CERT_DIR` is configured
+    /// and holds the PEMs. Returns `Ok(None)` (degraded wallet-only) when unset or
     /// missing — never fails the boot for a missing optional integration.
     pub async fn connect(pool: Pool) -> anyhow::Result<Option<CommandBus>> {
-        let cert_dir = match std::env::var("MOCHI_MC_CERT_DIR")
+        let cert_dir = match std::env::var("MOCHI_EXSOFT_CERT_DIR")
             .ok()
             .filter(|s| !s.is_empty())
         {
             Some(d) => PathBuf::from(d),
             None => {
                 tracing::warn!(
-                    "MOCHI_MC_CERT_DIR unset — running WALLET-ONLY (emerald charge disabled). \
-                     Mint a cert: mochi-mc-ca issue --mcserver-id moymoy --out <dir>"
+                    "MOCHI_EXSOFT_CERT_DIR unset — running WALLET-ONLY (emerald charge disabled). \
+                     Mint a cert: mochi-exsoft-ca issue --exsoft-id moymoy --out <dir>"
                 );
                 return Ok(None);
             }
@@ -120,12 +120,12 @@ impl CommandBus {
         }
 
         let (chain, key, ca_roots) = load_client_identity(&chain_p, &key_p, &ca_p)?;
-        let hub_addr: SocketAddr = std::env::var("MOCHI_MC_HUB_QUIC")
+        let hub_addr: SocketAddr = std::env::var("MOCHI_EXSOFT_HUB_QUIC")
             .unwrap_or_else(|_| "127.0.0.1:7421".to_string())
             .parse()
-            .map_err(|e| anyhow::anyhow!("MOCHI_MC_HUB_QUIC parse: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("MOCHI_EXSOFT_HUB_QUIC parse: {e}"))?;
         let server_name =
-            std::env::var("MOCHI_MC_SERVER_NAME").unwrap_or_else(|_| "localhost".to_string());
+            std::env::var("MOCHI_EXSOFT_SERVER_NAME").unwrap_or_else(|_| "localhost".to_string());
 
         let materials = Arc::new(ConnMaterials {
             hub_addr,

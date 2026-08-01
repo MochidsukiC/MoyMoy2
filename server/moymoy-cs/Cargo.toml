@@ -2,7 +2,7 @@
 name = "moymoy-cs"
 version = "0.1.0"
 edition = "2021"
-description = "MoyMoy cs.mnn wallet backend — serves the wallet (balance/send/request/history) over the MNN overlay (moymoy.cs.mnn) with an EMBEDDED cs tunnel (mochi-hub-cs-sdk), persists to SQLite, and drives emerald deposit/withdraw against the in-world mod over the MochiOS command bus (mc-sdk, bidirectional)."
+description = "MoyMoy cs.mnn wallet backend — serves the wallet (balance/send/request/history) over the MNN overlay (moymoy.cs.mnn) with an EMBEDDED cs tunnel (mochi-hub-cs-sdk), persists to SQLite, and drives emerald deposit/withdraw against the in-world mod over the MochiOS command bus (exsoft-sdk, bidirectional)."
 
 # Standalone workspace so this crate resolves independently while path-depending
 # into the co-located MochiOS2.0 checkout for the embedded cs tunnel + command-bus
@@ -62,10 +62,11 @@ mochi-hub-cs-sdk = { path = "../../../MochiOS2.0/hub/cs-sdk" }
 # emerald.deposit/withdraw (auto-routed to the player's live server) and receive
 # the mod's settlement acks (cs_hosts claim + run_inbound). Optional at runtime
 # (degrades to wallet-only when no cert is configured).
-mochi-hub-mc-sdk = { path = "../../../MochiOS2.0/hub/mc-sdk" }
-mochi-hub-mc-pki = { path = "../../../MochiOS2.0/hub/mc-pki" }
+mochi-hub-exsoft-sdk = { path = "../../../MochiOS2.0/hub/exsoft-sdk" }
+mochi-hub-exsoft-pki = { path = "../../../MochiOS2.0/hub/exsoft-pki" }
 
 # Outbound email (OTP delivery) for account email verification / 2FA / PIN
-# recovery. Real SMTP via lettre; ALL connection params come from MOCHI_SMTP_*
-# env (nothing hardcoded). Absent env ⇒ email features degrade off.
+# recovery. Delivery is over the MNN overlay (`MnnMailSender`, `*.mnn`
+# recipients), authenticated with this process's own identity token. Absent
+# identity ⇒ email features degrade off.
 mochi-hub-mailer = { path = "../../../MochiOS2.0/hub/mailer" }

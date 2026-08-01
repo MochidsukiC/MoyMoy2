@@ -77,8 +77,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Email OTP (verify / 2FA / recovery). Enabled only when MOCHI_SMTP_* is
-    // configured; otherwise the wallet degrades to handle+PIN.
+    // Email OTP (verify / 2FA / recovery) over MNN mail. Enabled only when this
+    // process has its own identity token; otherwise the wallet degrades to
+    // handle+PIN.
     let mailer = otp::Mailer::from_env();
 
     let state = AppState {
@@ -99,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
     // --- embedded cs tunnel (tunnel = "self") ---
     // Held for the process lifetime; dropping the sender winds the tunnel down.
     let _tunnel = if tunnel_on {
-        Some(tunnel::spawn(&mnn, local))
+        Some(tunnel::spawn(&mnn, local)?)
     } else {
         tracing::info!("MOYMOY_CS_TUNNEL=0 — embedded tunnel disabled (loopback-only smoke)");
         None

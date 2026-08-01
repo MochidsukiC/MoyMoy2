@@ -2,9 +2,10 @@
 --
 -- Adds an optional VERIFIED email to an account plus a one-time-passcode (OTP)
 -- table backing three flows: signup verification, login second factor, and PIN
--- recovery. Email features are active only when SMTP is configured
--- (MOCHI_SMTP_*); otherwise the wallet degrades to handle+PIN and these
--- columns/rows simply stay unused.
+-- recovery. Email features are active only when this process has its own
+-- identity token to authenticate MNN mail delivery with
+-- (MOCHI_SVC_IDENTITY_TOKEN); otherwise the wallet degrades to handle+PIN and
+-- these columns/rows simply stay unused.
 
 ALTER TABLE accounts ADD COLUMN email                  TEXT;    -- verified address (NULL = none)
 ALTER TABLE accounts ADD COLUMN email_lower            TEXT;    -- case-insensitive uniqueness / lookup
