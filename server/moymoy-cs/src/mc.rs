@@ -84,7 +84,7 @@ pub struct McLink {
 
 impl McLink {
     /// Wrap the HTTP half of the backend's cs tunnel
-    /// (`CsCommandSender::http_sender()`). The handle is published with the live
+    /// (the `CsHttpSender` published with the live tunnel). The handle is published with the live
     /// tunnel as soon as it connects, so it can be built before the tunnel is up.
     pub fn new(sender: CsHttpSender) -> Self {
         McLink { sender }

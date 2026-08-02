@@ -35,7 +35,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use mochi_hub_cs_sdk::{run_cs_tunnel_with_sender, CsCommandSender, CsTunnelConfig};
+use mochi_hub_cs_sdk::{run_cs_tunnel_with_sender, CsHttpSender, CsTunnelConfig};
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -138,7 +138,7 @@ fn quic_trust_anchor_pem() -> anyhow::Result<Option<String>> {
 pub fn spawn(
     mnn_domain: &str,
     local_target: SocketAddr,
-    sender: CsCommandSender,
+    sender: CsHttpSender,
 ) -> anyhow::Result<watch::Sender<()>> {
     let bearer = std::env::var("MOCHI_SVC_IDENTITY_TOKEN")
         .ok()

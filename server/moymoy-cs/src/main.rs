@@ -26,7 +26,7 @@ mod wallet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mochi_hub_cs_sdk::CsCommandSender;
+use mochi_hub_cs_sdk::CsHttpSender;
 
 use api::AppState;
 use charge::ChargeCoordinator;
@@ -66,10 +66,10 @@ async fn main() -> anyhow::Result<()> {
     // The outbound half, held before the tunnel is spawned: it is published with
     // the live connection on connect (and cleared on drop), so the charge path can
     // hold it from the start and simply report "not connected" until then.
-    let tunnel_sender = CsCommandSender::default();
+    let tunnel_sender = CsHttpSender::default();
     let charge = Arc::new(ChargeCoordinator::new(
         pool.clone(),
-        McLink::new(tunnel_sender.http_sender()),
+        McLink::new(tunnel_sender.clone()),
     ));
 
     // Reconciliation: re-send non-terminal emerald ops so a dropped request/ack

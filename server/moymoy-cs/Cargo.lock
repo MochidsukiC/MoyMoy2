@@ -961,10 +961,8 @@ dependencies = [
  "hyper-util",
  "mochi-config",
  "mochi-hub-enroll-client",
- "mochi-hub-ipvm-tunnel",
  "mochi-hub-tunnel-client",
  "mochi-profile",
- "mochi-proto-exsoft-connector",
  "reqwest",
  "serde_json",
  "thiserror 2.0.18",
@@ -1048,18 +1046,6 @@ name = "mochi-proto-common"
 version = "0.1.0"
 dependencies = [
  "serde",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
-name = "mochi-proto-exsoft-connector"
-version = "0.1.0"
-dependencies = [
- "mochi-proto-common",
- "mochi-proto-ipvm",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
  "uuid",
 ]
