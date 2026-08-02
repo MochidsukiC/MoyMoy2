@@ -23,7 +23,7 @@
     "size_px": 512,
     "format": "png"
   },
-  "allowed_origins": ["https://wallet.moymoy.cs.mnn"],
+  "allowed_origins": ["https://moymoy.cs.mnn"],
   "allowed_services": [],
   "requires": {
     "permissions": [],

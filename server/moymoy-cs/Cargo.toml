@@ -2,11 +2,11 @@
 name = "moymoy-cs"
 version = "0.1.0"
 edition = "2021"
-description = "MoyMoy cs.mnn wallet backend — serves the wallet (balance/send/request/history) over the MNN overlay (moymoy.cs.mnn) with an EMBEDDED cs tunnel (mochi-hub-cs-sdk), persists to SQLite, and drives emerald deposit/withdraw against the in-world mod over the MochiOS command bus (exsoft-sdk, bidirectional)."
+description = "MoyMoy cs.mnn wallet backend — serves the wallet (balance/send/request/history) over the MNN overlay (moymoy.cs.mnn) with an EMBEDDED cs tunnel (mochi-hub-cs-sdk), persists to SQLite, and drives emerald charging against the in-world mod as HTTP in MNN over that same tunnel."
 
 # Standalone workspace so this crate resolves independently while path-depending
-# into the co-located MochiOS2.0 checkout for the embedded cs tunnel + command-bus
-# SDKs. (Mirrors PiggleShop2/server/piggleshop-cs.)
+# into the co-located MochiOS2.0 checkout for the embedded cs tunnel SDK.
+# (Mirrors PiggleShop2/server/piggleshop-cs.)
 [workspace]
 
 [[bin]]
@@ -20,7 +20,6 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 tower = { version = "0.5", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,16 +53,12 @@ hyper = { version = "1", default-features = false, features = ["server", "http1"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 
 # Embedded cs tunnel (the "tunnel-embedded SDK"): claim moymoy.cs.mnn in-process,
-# no sidecar (DEV.md §5.4.3 / app.toml tunnel="self"). Path-dep into the
-# co-located MochiOS2.0 checkout.
+# no sidecar (DEV.md §5.4.3 / app.toml tunnel="self"). It also carries the
+# outbound emerald-charge requests to the in-world mod as HTTP in MNN
+# (MochiOS DEV.md §7.3.10), so this is the ONLY MochiOS transport dependency —
+# the exsoft command-bus SDK and its mTLS PKI are no longer used at all.
+# Path-dep into the co-located MochiOS2.0 checkout.
 mochi-hub-cs-sdk = { path = "../../../MochiOS2.0/hub/cs-sdk" }
-
-# Command bus: bidirectional with the in-world mod over mTLS QUIC :7421 — send
-# emerald.deposit/withdraw (auto-routed to the player's live server) and receive
-# the mod's settlement acks (cs_hosts claim + run_inbound). Optional at runtime
-# (degrades to wallet-only when no cert is configured).
-mochi-hub-exsoft-sdk = { path = "../../../MochiOS2.0/hub/exsoft-sdk" }
-mochi-hub-exsoft-pki = { path = "../../../MochiOS2.0/hub/exsoft-pki" }
 
 # Outbound email (OTP delivery) for account email verification / 2FA / PIN
 # recovery. Delivery is over the MNN overlay (`MnnMailSender`, `*.mnn`

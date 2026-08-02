@@ -11,6 +11,12 @@
 //! reverse-tunnel handshake (no `PUT /nodes`). The Hub gateway then routes
 //! `moymoy.cs.mnn` HTTPS through this tunnel to our loopback TLS listener.
 //!
+//! ONE connection, both directions (MochiOS DEV.md §7.3.10): inbound wallet HTTP
+//! arrives on it, and the outbound emerald-charge requests to the in-world mod
+//! leave over it (`crate::mc`). Nothing else is claimed — the sibling
+//! `charge.moymoy` sub-host the old command-bus connection needed is gone, so
+//! `moymoy` is this backend's single cs host again.
+//!
 //! When `tunnel = "self"` the launcher injects NO `MOCHI_TUNNEL_*`; we source the
 //! Hub endpoints from env (dev defaults below) and the loopback target from the
 //! address we actually bound (`MOCHI_APP_LISTEN`).
@@ -19,8 +25,8 @@
 //!
 //! The handshake bearer is THIS process's own per-process identity token
 //! (`MOCHI_SVC_IDENTITY_TOKEN`, minted and injected by the hub launcher), so the
-//! Hub attributes the `wallet.moymoy` claim to `ServiceProcess("app.moymoy")` —
-//! the principal the launcher registered this backend's cs-host under. The legacy
+//! Hub attributes the `moymoy` claim to `ServiceProcess("app.moymoy")` — the
+//! principal the launcher registered this backend's cs-host under. The legacy
 //! shared `MOCHI_TUNNEL_BEARER` is gone: since Stage 6-iv-c2 the Hub derives no
 //! principal from it at all, so presenting it can only ever be rejected (that is
 //! the `tunnel WS handshake failed` loop this replaced). No token ⇒ no tunnel,
@@ -29,7 +35,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use mochi_hub_cs_sdk::{run_cs_tunnel, CsTunnelConfig};
+use mochi_hub_cs_sdk::{run_cs_tunnel_with_sender, CsCommandSender, CsTunnelConfig};
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -118,16 +124,22 @@ fn quic_trust_anchor_pem() -> anyhow::Result<Option<String>> {
     }
 }
 
-/// Spawn the embedded cs tunnel on the current Tokio runtime. Returns the
+/// Spawn the embedded cs tunnel on the current Tokio runtime. `sender` is
+/// published with the live connection as it connects, so the caller's outbound
+/// half (`crate::mc`) can be built and held before this is called. Returns the
 /// shutdown [`watch::Sender`]; hold it for the process lifetime (dropping it
 /// signals the tunnel to wind down). The tunnel reconnects on its own until then.
 ///
 /// Errors when this process has no identity token to authenticate the claim with
 /// (`MOCHI_SVC_IDENTITY_TOKEN` unset ⇒ it was not started by the hub launcher).
-/// `wallet.moymoy.cs.mnn` is our ONLY ingress, so a tunnel that can never be
-/// accepted is a dead backend — fail loudly at boot instead of looping on a
-/// handshake the Hub is guaranteed to reject.
-pub fn spawn(mnn_domain: &str, local_target: SocketAddr) -> anyhow::Result<watch::Sender<()>> {
+/// `moymoy.cs.mnn` is our ONLY ingress, so a tunnel that can never be accepted is
+/// a dead backend — fail loudly at boot instead of looping on a handshake the Hub
+/// is guaranteed to reject.
+pub fn spawn(
+    mnn_domain: &str,
+    local_target: SocketAddr,
+    sender: CsCommandSender,
+) -> anyhow::Result<watch::Sender<()>> {
     let bearer = std::env::var("MOCHI_SVC_IDENTITY_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())
@@ -144,8 +156,9 @@ pub fn spawn(mnn_domain: &str, local_target: SocketAddr) -> anyhow::Result<watch
     let domain = mnn_domain.to_string();
     tokio::spawn(async move {
         tracing::info!(%domain, %local_target, "embedded cs tunnel starting (tunnel-embedded SDK)");
-        if let Err(e) = run_cs_tunnel(cfg, rx).await {
-            tracing::error!(error = %e, %domain, "embedded cs tunnel exited with error");
+        if let Err(e) = run_cs_tunnel_with_sender(cfg, rx, sender).await {
+            tracing::error!(error = %e, %domain,
+                "embedded cs tunnel exited with error — the wallet is UNREACHABLE and charges cannot be delivered");
         }
     });
     Ok(tx)

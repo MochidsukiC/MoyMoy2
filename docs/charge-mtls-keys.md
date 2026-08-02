@@ -1,5 +1,18 @@
 # MC コマンドバス mTLS 鍵リファレンス（エメラルドチャージ）
 
+> **この文書は廃止済み（historical）。以下の手順に従ってはならない。**
+>
+> エメラルドチャージはコマンドバス（QUIC :7421, mTLS）を使わなくなり、バックエンド
+> 自身の cs トンネル上の **HTTP in MNN**（`http://moymoy.<UUID>.minecraft.auto.mnn/`）
+> になった（MochiOS DEV.md §7.3.10）。**バックエンド leaf（`--exsoft-id moymoy` /
+> 旧 `--mcserver-id moymoy`）はもう発行も配置も不要**で、`MOCHI_EXSOFT_CERT_DIR` /
+> `MOCHI_EXSOFT_HUB_QUIC` はコードから読まれない。`can_charge` は証明書の有無ではなく
+> cs トンネルの生死を報告する。配置手順は `deploy/README.md` を参照。
+>
+> 以下は移行前の記録として残す。MC コネクタ側の leaf（サイドカーが読むもの）は
+> MochiOS 側の enrollment に置き換わっているので、そちらも MochiOS の
+> `docs/developers/exsoft-connector.md` を一次ソースとすること。
+
 MoyMoy のエメラルドチャージは Hub の MC コマンドバス（QUIC :7421, mTLS）経由で
 動く。鯖缶（サーバ運用者）が実際に発行・配置しなければならない鍵と、その出所を
 一覧化する。

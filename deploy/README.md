@@ -19,7 +19,7 @@ tools\deploy-backend.ps1 -HubWorkdir <Hubの作業ディレクトリ>
 #   （チャージも使うなら MOCHI_MC_CERT_DIR も。下記 3 参照）
 # enabled = true なので launcher が起動。Hub TUI で状態確認。
 ```
-内蔵トンネル（`tunnel = "self"`）で `moymoy.cs.mnn` を自己 claim。MC証明書未設定なら `can_charge=false` のウォレットのみで動作。
+内蔵トンネル（`tunnel = "self"`）で `moymoy.cs.mnn` を自己 claim。エメラルドチャージも**同じトンネル上の HTTP in MNN**なので追加の資格情報は無い（`can_charge` はトンネルの生死をそのまま報告する）。
 
 ## 2. モバイルアプリ
 ```
@@ -35,19 +35,17 @@ tools\publish-moymoy.ps1 -Token $tok
 ```
 in-world の App Store（com.mochi.appstore）から「MoyMoy」をインストール → ホームに表示 → 起動。
 
-## 3. MCサーバーサイドmod（moymoy.mc.mnn、オプショナル）
+## 3. MCサーバーサイドmod（オプショナル、チャージに必要）
 ```
 # MochiOS2.0 の forge を先にビルド（compileOnly 参照先）
 # mod をビルド
 cd mod ; .\gradlew build       # → build/libs/moymoy-0.1.0.jar
 
-# jar を mochi connector mod と一緒に MCサーバの mods/ へ
-# mochi-server.toml [connector].hosted_app_ids に "moymoy" を追加
-
-# バックエンド用 MC クライアント証明書を発行し app.toml の MOCHI_MC_CERT_DIR に設定
-#   （mochi-mc-ca の場所は MochiOS2.0/hub/mc-pki/src/bin/mochi-mc-ca.rs）
-cargo run -p mochi-hub-mc-pki --bin mochi-mc-ca -- issue --mcserver-id moymoy --out <cert_dir>
+# jar を mochi connector mod と一緒に MCサーバの mods/ へ置いて再起動。
+# コネクタが登録済み app_id を自動的に <appId>.<コネクタID>.mnn へ露出するので、
+# バックエンド側の設定・証明書発行は不要。
 ```
+バックエンドは `http://moymoy.<プレイヤーUUID>.minecraft.auto.mnn/` へ HTTP を投げ、Hub が在席ディレクトリでプレイヤーの居るサーバへ配送する。mod の応答はその **HTTP レスポンス**として返る。
 
 ## ローカル開発（Hub/MC 不要、ブラウザ検証）
 ```
@@ -64,5 +62,5 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:7433/wallet/_dev/credit `
 
 ## E2E 検証
 - **A. ウォレット単体（MC不要）**: 口座開設(handle+PIN)→ `/wallet/status` `can_charge:false`。dev-credit(handle) で残高投入 → ホーム反映。`@相手` へ送金（相手に receive）・加盟店支払い・履歴。同一 idem_key で二重送金されない。**1端末に2口座を開設→切替で残高が独立**。リロードで保存セッション自動ログイン。PIN 連続失敗でロックアウト。backend 再起動で SQLite から復元。
-- **B. チャージ（mod + 証明書あり）**: `/wallet/status` → `can_charge:true`。プレイヤー在線中にアプリの「チャージ」→ 在世エメラルド消費 → 残高加算。`/eme` でローカルの換金可能量表示。
-- **C. 整合・冪等**: ack 一時喪失 → `emerald_ops` が sent 滞留 → reconcile 再送 → mod が duplicate 再ack（再消費なし）→ settled。MCサーバ再起動を跨いで二重消費なし（EmeraldOpStore）。
+- **B. チャージ（mod あり）**: `/wallet/status` → `can_charge:true`（＝トンネルが生きている）。プレイヤー在線中にアプリの「チャージ」→ 在世エメラルド消費 → 残高加算。ack は charge リクエストの HTTP レスポンスとして同期的に返るので、通常はこの 1 往復で `settled` まで進む。`/eme` でローカルの換金可能量表示。
+- **C. 整合・冪等**: 往復が途中で切れる（タイムアウト等）→ `emerald_ops` が sent 滞留 → reconcile が同じ `op_id` で再送 → mod が duplicate 再ack（再消費なし）→ settled。MCサーバ再起動を跨いで二重消費なし（EmeraldOpStore）。

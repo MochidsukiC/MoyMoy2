@@ -8,10 +8,11 @@
 # launcher injects only MOCHI_APP_LISTEN and runs NO tunnel itself (DEV.md §5.4.3).
 
 enabled = true
-# Wallet ingress. Split from the emerald-charge reply channel onto sibling
-# cs-hosts under `moymoy` (wallet=wallet.moymoy, charge reply=charge.moymoy) so
-# one backend claims both without the unified cs_dispatch rejecting the second.
-domain  = "wallet.moymoy.cs.mnn"
+# The backend's single ingress. Emerald charging is HTTP in MNN over this same
+# tunnel, so there is no second connection and no second claim — the sibling
+# sub-host split (wallet.moymoy / charge.moymoy) the old command bus needed is
+# gone with it.
+domain  = "moymoy.cs.mnn"
 # `exec` omitted on purpose: the launcher auto-detects the single runnable file in
 # this dir (moymoy-cs / moymoy-cs.exe), which is portable across Windows/Unix
 # without hardcoding the `.exe` suffix. Add `exec = ["./moymoy-cs"]` to override.
@@ -21,7 +22,7 @@ tunnel  = "self"
 [env]
 # Wallet store (relative to app_backends/moymoy/).
 MOYMOY_DB_PATH = "moymoy.db"
-# Serve TLS for path-C (https://wallet.moymoy.cs.mnn via the gateway CONNECT tunnel).
+# Serve TLS for path-C (https://moymoy.cs.mnn via the gateway CONNECT tunnel).
 MOYMOY_CS_TLS  = "1"
 
 # Embedded cs tunnel → Hub endpoints. These match a local `mochi-inworld` devstack;
@@ -32,11 +33,11 @@ MOCHI_TUNNEL_HUB_QUIC = "127.0.0.1:7420"
 MOCHI_IPVM_ROUTER_URL = "http://127.0.0.1:7400"
 # MOCHI_TUNNEL_BEARER = "<secret>"
 
-# Emerald charge (OPTIONAL — omit for a wallet-only deploy). Point at the mc
-# client cert minted by:  mochi-mc-ca issue --mcserver-id moymoy --out <dir>
-# MOCHI_MC_CERT_DIR  = "<cert dir>"
-MOCHI_MC_HUB_QUIC  = "127.0.0.1:7421"
-MOCHI_IPVM_GATEWAY = "127.0.0.1:7411"
+# Emerald charge needs NO configuration of its own: it rides the cs tunnel above
+# as HTTP in MNN, so there is no command-bus endpoint and no mTLS client
+# certificate to mint. `can_charge` simply follows that tunnel's liveness. What
+# it still needs is on the Minecraft side: the moymoy mod jar next to the mochi
+# connector mod, and a connector configured on that server.
 
 # Email verification / login 2FA / PIN recovery (OPTIONAL). MoyMoy delivers OTP
 # codes over the MNN overlay to *.mnn mailboxes (the in-world mail app) — NO

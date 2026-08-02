@@ -7,16 +7,17 @@
 //!     for balances and works WITHOUT the Minecraft mod.
 //!   - Be reachable as `moymoy.cs.mnn` via an EMBEDDED cs tunnel
 //!     (`mochi-hub-cs-sdk`, app.toml `tunnel = "self"`) — no sidecar process.
-//!   - (Optional) drive emerald deposit against the in-world mod over the command
-//!     bus; degrades to wallet-only when no MC cert is configured.
+//!   - Drive emerald charging against the in-world mod as HTTP in MNN over that
+//!     SAME tunnel (`crate::mc`); it degrades to wallet-only whenever the tunnel
+//!     is down, which is the only "unavailable" state left.
 
 mod api;
 mod auth;
 mod charge;
-mod command_bus;
 mod db;
 mod error;
 mod identity;
+mod mc;
 mod otp;
 mod tls;
 mod tunnel;
@@ -25,9 +26,11 @@ mod wallet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use mochi_hub_cs_sdk::CsCommandSender;
+
 use api::AppState;
 use charge::ChargeCoordinator;
-use command_bus::CommandBus;
+use mc::McLink;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,11 +44,11 @@ async fn main() -> anyhow::Result<()> {
     // The launcher injects MOCHI_APP_LISTEN=127.0.0.1:<port>; fall back to a dev
     // default for a standalone smoke (tools/run-cs.ps1).
     let listen = env_or("MOCHI_APP_LISTEN", &env_or("MOYMOY_CS_LISTEN", "127.0.0.1:7433"));
-    // Wallet ingress. The wallet and the emerald-charge reply are split onto
-    // sibling cs-hosts under `moymoy` so ONE backend can claim BOTH without the
-    // unified cs_dispatch rejecting the second: wallet = `wallet.moymoy.cs.mnn`
-    // (this tunnel), charge reply = `charge.moymoy.cs.mnn` (the command bus).
-    let mnn = env_or("MOYMOY_CS_MNN", "wallet.moymoy.cs.mnn");
+    // Our single ingress. The wallet and emerald charging share ONE cs claim now
+    // that the charge path is HTTP over this same tunnel — the sibling-sub-host
+    // split (`wallet.moymoy` / `charge.moymoy`) existed only to give the old
+    // command-bus connection a claim of its own, and is gone with it.
+    let mnn = env_or("MOYMOY_CS_MNN", "moymoy.cs.mnn");
     let db_path = env_or("MOYMOY_DB_PATH", "moymoy.db");
     let tls_on = env_flag("MOYMOY_CS_TLS", true);
     let tunnel_on = env_flag("MOYMOY_CS_TUNNEL", true);
@@ -59,15 +62,21 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(db = %db_path, "sqlite ready");
 
-    // --- optional command bus (emerald charge) ---
-    let bus = CommandBus::connect(pool.clone()).await?;
-    let can_charge = bus.is_some();
-    let charge = Arc::new(ChargeCoordinator::new(pool.clone(), bus));
+    // --- emerald charge over the cs tunnel ---
+    // The outbound half, held before the tunnel is spawned: it is published with
+    // the live connection on connect (and cleared on drop), so the charge path can
+    // hold it from the start and simply report "not connected" until then.
+    let tunnel_sender = CsCommandSender::default();
+    let charge = Arc::new(ChargeCoordinator::new(
+        pool.clone(),
+        McLink::new(tunnel_sender.http_sender()),
+    ));
 
-    // Reconciliation: re-send non-terminal emerald ops so a dropped command/ack
-    // eventually settles (at-least-once + op-idempotent mod). Once at startup,
-    // then on a timer. Only meaningful when the command bus is connected.
-    if can_charge {
+    // Reconciliation: re-send non-terminal emerald ops so a dropped request/ack
+    // eventually settles (at-least-once + op-idempotent mod), and age out ops too
+    // old to keep retrying. Once at startup, then on a timer — unconditionally,
+    // since the tunnel may connect (or drop) at any point in this process's life.
+    {
         let charge_rec = charge.clone();
         tokio::spawn(async move {
             loop {
@@ -95,13 +104,15 @@ async fn main() -> anyhow::Result<()> {
     let local: SocketAddr = listener
         .local_addr()
         .map_err(|e| anyhow::anyhow!("local_addr: {e}"))?;
-    tracing::info!(%local, %mnn, tls = tls_on, can_charge, "moymoy.cs.mnn wallet backend online");
+    tracing::info!(%local, %mnn, tls = tls_on, "moymoy.cs.mnn wallet backend online");
 
     // --- embedded cs tunnel (tunnel = "self") ---
     // Held for the process lifetime; dropping the sender winds the tunnel down.
     let _tunnel = if tunnel_on {
-        Some(tunnel::spawn(&mnn, local)?)
+        Some(tunnel::spawn(&mnn, local, tunnel_sender)?)
     } else {
+        // No tunnel ⇒ no ingress and no charge path: `can_charge` reports false
+        // for as long as it is down, which is exactly what this smoke wants.
         tracing::info!("MOYMOY_CS_TUNNEL=0 — embedded tunnel disabled (loopback-only smoke)");
         None
     };

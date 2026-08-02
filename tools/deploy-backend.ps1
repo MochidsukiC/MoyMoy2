@@ -9,42 +9,29 @@
   the Hub TUI (or app.toml already sets enabled = true). Existing moymoy.db is
   preserved (never overwritten).
 
+  Emerald charge needs NO deploy step here any more. It used to require an mTLS
+  client certificate for the Hub's command bus (:7421), which this script minted
+  under -EnableCharge; charging is now ordinary HTTP in MNN over the backend's
+  own cs tunnel, so there is no second credential to issue. `can_charge` follows
+  that tunnel's liveness. What charge still needs is on the Minecraft side: the
+  moymoy mod jar loaded next to the mochi connector mod, on a server whose
+  connector is configured.
+
 .PARAMETER HubWorkdir
   The Hub's working directory (the parent of app_backends/). Required.
 
-.PARAMETER EnableCharge
-  Also enable emerald charging: mint the backend's MC client cert (via the Hub's
-  mc-pki CA) into app_backends/moymoy/mc-cert and set MOCHI_MC_CERT_DIR in the
-  staged app.toml, so the backend connects to the command bus (can_charge=true).
-  Without this the wallet deploys charge-DISABLED (MOCHI_MC_CERT_DIR unset →
-  "チャージは現在利用できません"). NOTE: charge also needs the moymoy mod on the
-  MC server + "moymoy" in mochi-server.toml [connector].hosted_app_ids.
-
-.PARAMETER McCaDir
-  The Hub's MC command-bus CA directory (the leaf MUST chain to the CA the Hub
-  serves :7421 with, else the backend's mTLS handshake fails with BadSignature).
-  Default: <HubWorkdir>\state\mc-pki — the rebuilt Hub's canonical CA (mc_bus.rs
-  falls back to <state_dir>/mc-pki when MOCHI_HUB_MC_PKI_DIR is unset). Override
-  only if the Hub's MOCHI_HUB_MC_PKI_DIR points elsewhere. NOTE: this CA also
-  issues the MC connectors' leaves — it is the whole command bus's trust root,
-  not MC-connector-only (see docs/charge-mtls-keys.md).
-
 .EXAMPLE
-  powershell -File tools/deploy-backend.ps1 -HubWorkdir D:\IdeaProjects\MochiOS2.0\.devstack\hub -EnableCharge
+  powershell -File tools/deploy-backend.ps1 -HubWorkdir D:\IdeaProjects\MochiOS2.0\.devstack\hub
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)] [string] $HubWorkdir,
-    [switch] $NoBuild,
-    [switch] $EnableCharge,
-    [string] $MochiRepo = 'D:\IdeaProjects\MochiOS2.0',
-    [string] $McCaDir
+    [switch] $NoBuild
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $manifest = Join-Path $root 'server\moymoy-cs\Cargo.toml'
-if (-not $McCaDir) { $McCaDir = Join-Path $HubWorkdir 'state\mc-pki' }
 
 if (-not $NoBuild) {
     Write-Host "cargo build --release ..." -ForegroundColor Cyan
@@ -64,58 +51,14 @@ Copy-Item $bin (Join-Path $dest 'moymoy-cs.exe') -Force
 $tomlDest = Join-Path $dest 'app.toml'
 if (Test-Path $tomlDest) {
     Write-Host "app.toml exists — left as-is (edit it for secrets/overrides)." -ForegroundColor Yellow
+    Write-Host "  NOTE: domain must be 'moymoy.cs.mnn'. An app.toml staged before the" -ForegroundColor Yellow
+    Write-Host "  command-bus removal still says 'wallet.moymoy.cs.mnn' and will claim" -ForegroundColor Yellow
+    Write-Host "  a host the app no longer talks to — update it by hand." -ForegroundColor Yellow
 } else {
     Copy-Item (Join-Path $root 'deploy\app.toml') $tomlDest
-    Write-Host "app.toml staged from deploy/app.toml — set MOCHI_TUNNEL_BEARER (+ MOCHI_MC_CERT_DIR for charge)." -ForegroundColor Yellow
-}
-
-# --- Emerald charge: mint the MC client cert + wire MOCHI_MC_CERT_DIR. --------
-# Root cause of "チャージは現在利用できません": with no cert the backend never
-# connects to the command bus, so can_charge=false. Minting the leaf here (signed
-# by the Hub's CA) and setting MOCHI_MC_CERT_DIR flips it on.
-if ($EnableCharge) {
-    Write-Host "enabling emerald charge (minting MC client cert) ..." -ForegroundColor Cyan
-    if (-not (Test-Path $McCaDir)) {
-        throw "MC command-bus CA dir not found: $McCaDir. Start the Hub once (it creates <state_dir>/mc-pki), or pass -McCaDir <the Hub's actual MOCHI_HUB_MC_PKI_DIR>."
-    }
-    $mcCa = Join-Path $MochiRepo 'target\debug\mochi-mc-ca.exe'
-    if (-not (Test-Path $mcCa)) {
-        Write-Host "building mochi-mc-ca ..." -ForegroundColor DarkGray
-        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        & cargo build -p mochi-hub-mc-pki --bin mochi-mc-ca --manifest-path (Join-Path $MochiRepo 'Cargo.toml')
-        $code = $LASTEXITCODE; $ErrorActionPreference = $prev
-        if ($code -ne 0 -or -not (Test-Path $mcCa)) { throw "mochi-mc-ca build failed (exit $code)" }
-    }
-    $certDir = Join-Path $dest 'mc-cert'
-    # Client leaf bound to app_id 'moymoy' (the mod's ALLOWED_SRC), signed by the
-    # Hub's CA (--flat, matching the devstack). Yields chain.pem/leaf.key.pem/ca.cert.pem.
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    & $mcCa issue --dir $McCaDir --mcserver-id moymoy --out $certDir --flat | Out-Null
-    $code = $LASTEXITCODE; $ErrorActionPreference = $prev
-    if ($code -ne 0) { throw "mochi-mc-ca issue failed (exit $code)" }
-    foreach ($f in 'chain.pem', 'leaf.key.pem', 'ca.cert.pem') {
-        if (-not (Test-Path (Join-Path $certDir $f))) { throw "cert missing after issue: $f" }
-    }
-    # Set MOCHI_MC_CERT_DIR in the staged app.toml (relative to the backend's
-    # workdir = app_backends/moymoy). Uncomment the template line, else append.
-    # Read as UTF-8 explicitly — PS 5.1 Get-Content defaults to ANSI, which would
-    # round-trip non-ASCII comments (§ → —) into mojibake on the WriteAllText below.
-    $toml = Get-Content $tomlDest -Raw -Encoding UTF8
-    if ($toml -match '(?m)^\s*#\s*MOCHI_MC_CERT_DIR\s*=') {
-        $toml = $toml -replace '(?m)^\s*#\s*MOCHI_MC_CERT_DIR\s*=.*$', 'MOCHI_MC_CERT_DIR  = "mc-cert"'
-    } elseif ($toml -notmatch '(?m)^\s*MOCHI_MC_CERT_DIR\s*=') {
-        $toml = $toml.TrimEnd() + "`r`nMOCHI_MC_CERT_DIR  = `"mc-cert`"`r`n"
-    }
-    [System.IO.File]::WriteAllText($tomlDest, $toml, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "charge enabled: cert -> $certDir ; MOCHI_MC_CERT_DIR=mc-cert set in app.toml." -ForegroundColor Green
-    Write-Host "  Restart the backend to reconnect; can_charge should become true." -ForegroundColor DarkGray
-    Write-Host '  ALSO REQUIRED on the MC server: load the moymoy mod jar (mod/build/libs/moymoy-*.jar)' -ForegroundColor Yellow
-    Write-Host '  next to the mochi connector mod, and set a non-empty mcserver_id in mochi-server.toml' -ForegroundColor Yellow
-    Write-Host '  (hosted_app_ids config is deprecated — the connector auto-advertises moymoy). Restart the MC server.' -ForegroundColor Yellow
+    Write-Host "app.toml staged from deploy/app.toml (domain = moymoy.cs.mnn)." -ForegroundColor Yellow
 }
 
 Write-Host "Deployed to $dest" -ForegroundColor Green
-Write-Host "Note: exec in app.toml is ['./moymoy-cs'] — on Windows the launcher resolves moymoy-cs.exe." -ForegroundColor DarkGray
-if (-not $EnableCharge) {
-    Write-Host "Charge is DISABLED (no MC cert). Re-run with -EnableCharge to mint the cert + enable it." -ForegroundColor DarkGray
-}
+Write-Host "Note: exec is auto-detected from this dir — on Windows the launcher resolves moymoy-cs.exe." -ForegroundColor DarkGray
+Write-Host "Emerald charge is on whenever the cs tunnel is up; load the moymoy mod jar on the MC server to use it." -ForegroundColor DarkGray
