@@ -753,7 +753,9 @@ async fn attest_challenge(
     let Some(purpose) = AttestPurpose::parse(&req.purpose) else {
         return Ok(Json(json!({ "ok": false, "error": "bad_purpose" })));
     };
-    let (challenge, expires_unix_ms) = st.challenges.issue(&acct.account_id, purpose, now_ms());
+    let (challenge, expires_unix_ms) =
+        st.challenges
+            .issue(&acct.account_id, purpose.as_str(), now_ms());
     Ok(Json(json!({
         "ok": true,
         "challenge": challenge,
@@ -777,40 +779,41 @@ async fn attest_session(
     acct: AuthedAccount,
     Json(req): Json<AttestSessionReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let claims = match st
+    // A confirmation binds to a constant hash: it has no request content of its
+    // own, and the replay protection is the challenge, which is inside the signed
+    // claims and spent exactly once below. The domain still separates it from the
+    // charge hash space, so a charge assertion cannot be presented here.
+    let facts = match st
         .attest
-        .verify(&req.assertion, attest::now_unix_secs())
+        .verify(
+            &req.assertion,
+            &attest::session_request_hash(),
+            attest::now_unix_secs(),
+        )
         .await
     {
-        Ok(c) => c,
+        Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "attest/session: assertion refused");
             return Ok(Json(json!({ "ok": false, "error": e.code() })));
         }
     };
-    // The session assertion binds to its own challenge (there is no other request
-    // content to bind to), in a hash space disjoint from the charge one.
-    if let Err(code) =
-        attest::check_claims(&claims, &attest::session_request_hash(&claims.challenge))
-    {
-        return Ok(Json(json!({ "ok": false, "error": code })));
-    }
     if !st.challenges.consume(
-        &claims.challenge,
+        facts.challenge(),
         &acct.account_id,
-        AttestPurpose::Session,
+        AttestPurpose::Session.as_str(),
         now_ms(),
     ) {
         return Ok(Json(json!({ "ok": false, "error": "attest_challenge" })));
     }
-    let Some(mc_uuid) = identity::normalize_uuid(&claims.subject) else {
-        tracing::error!(subject = %claims.subject,
+    let Some(mc_uuid) = identity::normalize_uuid(facts.subject()) else {
+        tracing::error!(subject = %facts.subject(),
             "attest/session: signed subject is not a UUID — refusing rather than routing to it");
         return Ok(Json(json!({ "ok": false, "error": "attest_invalid" })));
     };
     st.char_sessions
-        .put(&acct.account_id, &mc_uuid, &claims.attester_id, now_ms());
-    log_accepted_assertion("attest/session", &acct.account_id, &claims);
+        .put(&acct.account_id, &mc_uuid, facts.attester_id(), now_ms());
+    log_accepted_assertion("attest/session", &acct.account_id, &facts);
     Ok(Json(json!({
         "ok": true,
         "mc_uuid": mc_uuid,
@@ -825,14 +828,14 @@ async fn attest_session(
 /// backend — it is deliberately NOT what `account` says, and no code path reads
 /// it for a decision. `iat`/`exp` make a clock skew against the Hub (which would
 /// otherwise present as every assertion being `attest_invalid`) visible here.
-fn log_accepted_assertion(path: &str, account_id: &str, claims: &attest::AttestClaims) {
+fn log_accepted_assertion(path: &str, account_id: &str, facts: &attest::AttestedFacts) {
     tracing::info!(
         path,
         account = %account_id,
-        attester_id = %claims.attester_id,
-        mochi_account = %claims.account_id,
-        iat = claims.iat,
-        exp = claims.exp,
+        attester_id = %facts.attester_id(),
+        mochi_account = %facts.account_id(),
+        iat = facts.iat(),
+        exp = facts.exp(),
         "host attestation accepted"
     );
 }
@@ -984,42 +987,44 @@ async fn charge(
             json!({ "ok": false, "error": "attestation_required" }),
         ));
     };
-    let claims = match st.attest.verify(assertion, attest::now_unix_secs()).await {
-        Ok(c) => c,
+    // Bound to THIS charge: a different amount or idem_key hashes differently, so
+    // an assertion approved for one consume cannot be spent on another.
+    let facts = match st
+        .attest
+        .verify(
+            assertion,
+            &attest::charge_request_hash(&req.idem_key, req.amount),
+            attest::now_unix_secs(),
+        )
+        .await
+    {
+        Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "charge: assertion refused");
             return Ok(Json(json!({ "ok": false, "error": e.code() })));
         }
     };
-    // Bound to THIS charge: a different amount or idem_key hashes differently, so
-    // an assertion approved for one consume cannot be spent on another.
-    if let Err(code) = attest::check_claims(
-        &claims,
-        &attest::charge_request_hash(&req.idem_key, req.amount),
-    ) {
-        return Ok(Json(json!({ "ok": false, "error": code })));
-    }
     if !st.challenges.consume(
-        &claims.challenge,
+        facts.challenge(),
         &acct.account_id,
-        AttestPurpose::Charge,
+        AttestPurpose::Charge.as_str(),
         now_ms(),
     ) {
         return Ok(Json(json!({ "ok": false, "error": "attest_challenge" })));
     }
-    let Some(mc_uuid) = identity::normalize_uuid(&claims.subject) else {
-        tracing::error!(subject = %claims.subject,
+    let Some(mc_uuid) = identity::normalize_uuid(facts.subject()) else {
+        tracing::error!(subject = %facts.subject(),
             "charge: signed subject is not a UUID — refusing rather than routing to it");
         return Ok(Json(json!({ "ok": false, "error": "attest_invalid" })));
     };
-    log_accepted_assertion("wallet/charge", &acct.account_id, &claims);
+    log_accepted_assertion("wallet/charge", &acct.account_id, &facts);
     let value = st
         .charge
         .begin_charge(
             &req.idem_key,
             &acct.account_id,
             &mc_uuid,
-            &claims.attester_id,
+            facts.attester_id(),
             req.amount,
         )
         .await?;
@@ -1029,7 +1034,7 @@ async fn charge(
     // again just to see the resulting inventory.
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
         st.char_sessions
-            .put(&acct.account_id, &mc_uuid, &claims.attester_id, now_ms());
+            .put(&acct.account_id, &mc_uuid, facts.attester_id(), now_ms());
     }
     Ok(Json(value))
 }

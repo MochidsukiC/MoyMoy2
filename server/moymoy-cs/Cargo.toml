@@ -38,15 +38,6 @@ sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 
-# Ed25519 verification for Hub-signed host attestations (`crate::attest`). The
-# SAME primitive the Hub signs with (`hub/ipvm-router/src/attest.rs`), and already
-# in this tree via the rustls/rcgen `ring` provider pins above — a direct
-# dependency here unifies with it rather than adding a second crypto stack. The
-# claims struct is mirrored, not shared: pulling the Hub's router crate in for it
-# would drag quinn/axum/hyper into this build. What keeps the mirror honest is the
-# claims-version gate plus the fixed test vectors in `attest.rs`.
-ring = "0.17"
-
 # SQLite — bundled so there is no system libsqlite dependency. r2d2 pool for
 # read concurrency under WAL; writers serialize on BEGIN IMMEDIATE + busy_timeout.
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -69,8 +60,24 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 # Path-dep into the co-located MochiOS2.0 checkout.
 mochi-hub-cs-sdk = { path = "../../../MochiOS2.0/hub/cs-sdk" }
 
+# Host attestation (MochiOS DEV.md §7.3.10 G4) — the wire schema, the Ed25519
+# verification, the pubkey cache and the challenge store, in the SAME
+# implementation the Hub issues with. Deliberately not a Hub component: it pulls
+# no async runtime, no HTTP client and no QUIC, so depending on it does not drag
+# the Hub into this build. `challenge` adds the single-use nonce store; `issue`
+# stays OFF, because a backend that can sign is a backend that can forge the facts
+# it is supposed to be checking.
+mochi-proto-attest = { path = "../../../MochiOS2.0/protocols/attest", features = ["challenge"] }
+
 # Outbound email (OTP delivery) for account email verification / 2FA / PIN
 # recovery. Delivery is over the MNN overlay (`MnnMailSender`, `*.mnn`
 # recipients), authenticated with this process's own identity token. Absent
 # identity ⇒ email features degrade off.
 mochi-hub-mailer = { path = "../../../MochiOS2.0/hub/mailer" }
+
+[dev-dependencies]
+# `dev-signer` mints a VALID assertion from a fixed seed, so the accept path — the
+# one that decides whether a charge goes through — is testable without running a
+# Hub. Test-only by construction: the feature that lets this crate sign is never
+# enabled in the build above.
+mochi-proto-attest = { path = "../../../MochiOS2.0/protocols/attest", features = ["challenge", "dev-signer"] }

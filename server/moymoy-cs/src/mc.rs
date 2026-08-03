@@ -49,7 +49,8 @@ use mochi_hub_cs_sdk::{CsHttpResponse, CsHttpSender, HttpSendError};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::attest::core::{parse_pubkey_document, PublicKey};
+use mochi_proto_attest::{public_key_from_b64url, ATTEST_ALG};
+
 use crate::attest::pubkey_url as attest_pubkey_url;
 
 /// Deadline for one charge round-trip. Deliberately LONGER than the connector
@@ -229,24 +230,39 @@ impl McLink {
         Some((online, emeralds, blocks))
     }
 
-    /// Fetch the Hub's Ed25519 attestation public key from the directory zone.
+    /// Fetch the Hub's raw Ed25519 attestation public key from the directory
+    /// zone.
     ///
-    /// This half is the transport only: the document's shape is parsed by
-    /// `attest::core::parse_pubkey_document`, which is where every other consumer
-    /// of the platform's attestation will read it too. Every failure is an `Err`
+    /// The transport half only — which is the reason `mochi-proto-attest` is
+    /// sans-io. The one field that must not be read loosely goes through the
+    /// shared [`public_key_from_b64url`], which accepts only base64url decoding to
+    /// a 32-byte key. The `key_id` the endpoint also publishes is deliberately
+    /// ignored: `PubkeyCache` derives it from these bytes, so a server-supplied
+    /// label cannot disagree with the key it labels. Every failure is an `Err`
     /// carrying why; `crate::attest` turns that into `attest_unavailable` and
     /// refuses the assertion. There is no "assume the key" branch.
-    pub async fn fetch_attest_pubkey(&self) -> Result<PublicKey, String> {
+    pub async fn fetch_attest_pubkey(&self) -> Result<Vec<u8>, String> {
         let url = attest_pubkey_url();
         let resp = self
             .get(&url, PUBKEY_TIMEOUT)
             .await
             .map_err(|e| format!("GET {url}: {e}"))?;
+        let body = String::from_utf8_lossy(&resp.body).into_owned();
         if !is_success(resp.status) {
-            let body = String::from_utf8_lossy(&resp.body);
             return Err(format!("GET {url}: HTTP {} ({body})", resp.status));
         }
-        parse_pubkey_document(&resp.body).map_err(|e| format!("{url}: {e}"))
+        let doc: Value =
+            serde_json::from_str(&body).map_err(|e| format!("{url}: malformed reply: {e}"))?;
+        let alg = doc.get("alg").and_then(Value::as_str).unwrap_or_default();
+        if alg != ATTEST_ALG {
+            // Refuse rather than try the bytes as Ed25519 anyway: a hub that
+            // rotated to another algorithm needs a build that knows it.
+            return Err(format!("{url}: unsupported signature algorithm {alg:?}"));
+        }
+        doc.get("public_key")
+            .and_then(Value::as_str)
+            .and_then(public_key_from_b64url)
+            .ok_or_else(|| format!("{url}: reply has no usable ed25519 public_key"))
     }
 
     /// POST `payload` as JSON to `url` with a deadline. A timeout is reported as
@@ -288,9 +304,11 @@ impl McLink {
 /// `moymoy` is the mod's serve key; the path is `/` because the mod dispatches on
 /// the payload's `verb`, not on the URL.
 ///
-/// `attester_id` reaches here only out of signed claims that
-/// `crate::attest::check_claims` already held to a single routable LDH label, so
-/// it cannot introduce a second host or a reserved zone into the name.
+/// `attester_id` reaches here only out of an `AttestedFacts`, i.e. signed claims
+/// that `ClaimsPolicy` already parsed through `ExSoftServerId` — a single
+/// routable label, never one of the Hub-reserved zones. So it cannot introduce a
+/// second host into the name, and `cs` in particular (which would address this
+/// very backend) cannot get this far.
 fn direct_url(attester_id: &str) -> String {
     format!("http://moymoy.{attester_id}.mnn/")
 }
@@ -338,8 +356,8 @@ mod tests {
     fn the_direct_url_is_the_three_label_direct_form() {
         // `<serve_key>.<server_id>.mnn` — the Hub reads the middle label as the
         // connector zone. A fourth label (or a reserved one) would route
-        // somewhere else entirely, which is why `attest::check_claims` pins the
-        // shape before an id can reach here.
+        // somewhere else entirely, which is why the claims policy pins the shape
+        // before an id can reach here.
         assert_eq!(direct_url("mc1"), "http://moymoy.mc1.mnn/");
         assert_eq!(direct_url("my-server-2"), "http://moymoy.my-server-2.mnn/");
     }

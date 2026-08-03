@@ -1042,10 +1042,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "mochi-proto-attest"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "mochi-proto-exsoft-connector",
+ "rand 0.8.6",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mochi-proto-common"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "mochi-proto-exsoft-connector"
+version = "0.1.0"
+dependencies = [
+ "mochi-proto-common",
+ "mochi-proto-ipvm",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -1103,11 +1129,11 @@ dependencies = [
  "md5",
  "mochi-hub-cs-sdk",
  "mochi-hub-mailer",
+ "mochi-proto-attest",
  "r2d2",
  "r2d2_sqlite",
  "rand 0.8.6",
  "rcgen",
- "ring",
  "rusqlite",
  "rustls",
  "serde",

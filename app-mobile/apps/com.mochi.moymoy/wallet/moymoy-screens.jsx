@@ -520,24 +520,24 @@ const ERR_LABEL = {
   charge_failed: "チャージに失敗しました。もう一度お試しください",
   unauthorized: "セッションが切れました。ログインし直してください",
   // ── host attestation (DEV.md §7.3.10 G4) ──
-  // Each cause gets its own wording: "確認できませんでした" for everything would
-  // leave a user who declined, a user on an offline-mode server and a user
-  // hitting a packaging bug all staring at the same useless sentence.
+  // The codes the OS/SDK produce keep their own wording — a user who declined, a
+  // user on a phone with no host game and a user hitting a packaging bug each
+  // need a different sentence, and their remedies differ.
+  //
+  // The codes the BACKEND produces are deliberately coarser. Which of its policy
+  // checks an assertion fell at is not reported: answering differently per reason
+  // hands a caller a map of the policy. That detail is in the backend log, and an
+  // honest user's remedy ("confirm again") is the same either way.
   attestation_required: "キャラクターの確認が必要です",
   attest_denied: "キャラクターの確認をキャンセルしました",
   attest_timeout: "キャラクターの確認がタイムアウトしました。もう一度お試しください",
-  attest_unavailable: "この端末では Minecraft キャラクターを確認できません（ゲーム内から実行してください）",
+  attest_unavailable: "いまキャラクターを確認できません。しばらくしてからもう一度お試しください",
   attest_no_host: "この画面ではチャージできません。Minecraft 内の MochiOS からご利用ください",
   attest_no_scope: "アプリの設定が不足しています（attestation.request）。アプリを更新してください",
   attest_os_error: "MochiOS がキャラクターを確認できませんでした",
   attest_no_crypto: "この環境では確認に必要な暗号機能が使えません",
   attest_challenge: "確認の有効期限が切れました。もう一度お試しください",
-  attest_invalid: "キャラクターの確認結果を検証できませんでした",
-  attest_audience: "他のアプリ向けの確認結果は使えません",
-  attest_attester_kind: "Minecraft サーバー以外からの確認結果は使えません",
-  attest_offline_server: "このサーバーは online-mode ではないため、チャージには使えません",
-  attest_attester_id: "サーバーの識別子が不正です",
-  attest_request_hash: "確認結果がこの操作と一致しません。もう一度お試しください",
+  attest_invalid: "キャラクターの確認結果を受け付けられませんでした。もう一度お試しください",
 };
 function errLabel(code) {
   return ERR_LABEL[code] || "処理に失敗しました（" + (code || "error") + "）";

@@ -172,20 +172,37 @@
   // for anybody else, so this string must match its `attest::AUDIENCE`.
   const AUDIENCE = "moymoy";
 
-  async function sha256Hex(s) {
-    const bytes = new TextEncoder().encode(s);
-    const digest = await crypto.subtle.digest("SHA-256", bytes);
+  /**
+   * The platform's request binding: SHA-256, lower-case hex, over the domain
+   * followed by each part, every field framed as `<utf8_byte_len>:<field>`.
+   * `requestHash("d", ["ab", "c"])` hashes `"1:d2:ab1:c"`.
+   *
+   * This is `mochi_proto_attest::request_hash`, and it MUST agree byte for byte
+   * or nothing verifies. Two things to leave alone:
+   *  - the length is `encode(s).length` (UTF-8 bytes), never `s.length` (UTF-16
+   *    units) — they differ on any non-ASCII field;
+   *  - the framing is what makes the digest input parse back to exactly one field
+   *    list, so no value a caller passes can move a boundary. A plain separator
+   *    would let a field containing it read as two fields — a different request
+   *    approved by the same signature.
+   */
+  async function requestHash(domain, parts) {
+    const enc = new TextEncoder();
+    const framed = [domain].concat(parts).map((s) => enc.encode(s).length + ":" + s).join("");
+    const digest = await crypto.subtle.digest("SHA-256", enc.encode(framed));
     return Array.from(new Uint8Array(digest))
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
   }
-  // The two request bindings, spelled exactly as the backend spells them
-  // (server/moymoy-cs/src/attest.rs). The distinct prefixes are why an assertion
+  // The two bindings, spelled exactly as the backend spells them
+  // (server/moymoy-cs/src/attest.rs). The distinct DOMAINS are why an assertion
   // approved for a character check can never be spent as one that authorizes a
   // charge — the two hash spaces cannot collide.
   const chargeRequestHash = (idemKey, amount) =>
-    sha256Hex("moymoy.charge.v1\n" + idemKey + "\n" + amount);
-  const sessionRequestHash = (challenge) => sha256Hex("moymoy.session.v1\n" + challenge);
+    requestHash("moymoy.charge.v1", [idemKey, String(amount)]);
+  // No parts: a confirmation binds nothing but its purpose. The challenge is what
+  // makes it unreplayable, and it is inside the signed claims.
+  const sessionRequestHash = () => requestHash("moymoy.session.v1", []);
 
   /**
    * Get the backend a fresh nonce, then ask the OS to attest this host against
@@ -193,8 +210,11 @@
    * reason is always reported as its own code rather than collapsed into a
    * generic failure, so the UI can say what actually happened.
    *
-   * `makeRequestHash(challenge)` returns the digest that binds the assertion to
-   * the request it will authorize.
+   * `makeRequestHash()` returns the digest that binds the assertion to the
+   * request it will authorize. It takes no challenge: the backend cannot read the
+   * challenge out of an assertion before its policy check has passed, so the
+   * binding is over the request's own content (or, for a confirmation, over
+   * nothing but the purpose).
    */
   async function attest(purpose, makeRequestHash, reason) {
     // Browser-dev has no OS, hence no session credential to redeem: charging is
@@ -214,9 +234,9 @@
       return { ok: false, error: ch.error || "attest_challenge" };
     }
 
-    let requestHash;
+    let hash;
     try {
-      requestHash = await makeRequestHash(ch.challenge);
+      hash = await makeRequestHash();
     } catch (e) {
       console.error("MoyMoy.attest: could not compute the request hash", e);
       return { ok: false, error: "attest_no_crypto" };
@@ -227,7 +247,7 @@
       res = await mochi.os.hostAttestation({
         audience: AUDIENCE,
         challenge: ch.challenge,
-        requestHash,
+        requestHash: hash,
         reason,
       });
     } catch (e) {
