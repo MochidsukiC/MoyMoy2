@@ -1,6 +1,6 @@
 {
   "id": "com.mochi.moymoy",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "schema_version": 1,
   "name": { "default": "MoyMoy", "ja": "モイモイ" },
   "description": {
@@ -11,14 +11,14 @@
   "license": "Proprietary",
   "categories": ["finance", "utilities"],
   "bundle": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.2.3/com.mochi.moymoy-0.2.3.tar",
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.3.0/com.mochi.moymoy-0.3.0.tar",
     "sha256": "05e16ada9e7bee1c336e6c096e9de26aba2f57887e1b17c642b7098dee0a4580",
     "size": 138240,
     "format": "tar"
   },
   "runtime": { "kind": "js", "foreground": { "entry": "index.html" } },
   "icon": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.2.3/com.mochi.moymoy-0.2.3.png",
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.3.0/com.mochi.moymoy-0.3.0.png",
     "sha256": "cfd2d10d05f14df3ef79adbbc68c3447670b150634746d7076ea5090f409e988",
     "size_px": 512,
     "format": "png"
@@ -27,7 +27,7 @@
   "allowed_services": [],
   "requires": {
     "permissions": [],
-    "mochi_services": ["phone_state.read"],
+    "mochi_services": ["phone_state.read", "attestation.request"],
     "min_runtime_version": "0.1.0"
   },
   "supported_platforms": ["mc"]

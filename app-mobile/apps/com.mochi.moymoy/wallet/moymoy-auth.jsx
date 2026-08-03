@@ -571,32 +571,32 @@ function AccountMenu({ open, accounts, activeId, onSwitch, onAdd, onLogout, onSe
             background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)", cursor: "pointer",
             fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14, color: "var(--ink)" }}>＋ アカウントを追加</button>
           <button onClick={onSettings} style={{ width: "100%", padding: "13px", border: "none", background: "transparent",
-            cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 600, fontSize: 13, color: "var(--ink-soft)" }}>設定 · 連携キャラクター</button>
+            cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 600, fontSize: 13, color: "var(--ink-soft)" }}>設定</button>
         </div>
       </div>
     </div>
   );
 }
 
-/* ─── settings (linked MC characters + logout) ───────────────────────── */
+/* ─── settings (account + logout) ─────────────────────────────────────
+   No "linked characters" section any more: an account has no stored character
+   list to show (schema v5). Which character may be charged is decided per
+   charge by a Hub-signed attestation the user approves at the time, so listing a
+   previously-charged UUID here would name a relationship nothing maintains. */
 function SettingsSheet({ open, account, onLogout, onClose }) {
-  const [links, setLinks] = maState([]);
   const [email, setEmail] = maState(null);
-  const [loaded, setLoaded] = maState(false);
   const [failed, setFailed] = maState(false);
   maEffect(() => {
     if (!open) return;
-    setLoaded(false);
     setFailed(false);
     let alive = true;
     MoyMoy.me()
       .then((r) => {
         if (!alive) return;
-        if (r.ok) { setLinks(r.linked_mc || []); setEmail(r.email || null); }
+        if (r.ok) setEmail(r.email || null);
         else setFailed(true);
       })
       .catch((e) => { console.warn("MoyMoy: settings load (MoyMoy.me) failed", e); if (alive) setFailed(true); })
-      .finally(() => { if (alive) setLoaded(true); });
     return () => { alive = false; };
   }, [open]);
   if (!open) return null;
@@ -618,29 +618,12 @@ function SettingsSheet({ open, account, onLogout, onClose }) {
             )}
           </div>
         )}
-        <div className="h-section" style={{ marginTop: 20, marginBottom: 8 }}>連携キャラクター</div>
-        <div style={{ border: "1.5px solid var(--ink)" }}>
-          {links.map((l) => (
-            <div key={l.mc_uuid} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",
-              borderBottom: "1px solid rgba(0,0,0,0.08)" }}>
-              <div style={{ width: 34, height: 34 }}><CrystalIcon palette="meadow" glyph={(l.mcid && Array.from(l.mcid)[0]) || "◈"} size={34} /></div>
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 600 }}>{l.mcid || "（名前不明）"}</div>
-                <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--ink-soft)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.mc_uuid}</div>
-              </div>
-            </div>
-          ))}
-          {loaded && failed && (
-            <div style={{ padding: 18, textAlign: "center", fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)" }}>
-              連携キャラクターを読み込めませんでした。<br />通信状態をご確認のうえ、開き直してください。
-            </div>
-          )}
-          {loaded && !failed && links.length === 0 && (
-            <div style={{ padding: 18, textAlign: "center", fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)" }}>
-              まだ連携キャラクターはありません。<br />チャージするとそのキャラクターが自動で連携されます。
-            </div>
-          )}
-        </div>
+        {failed && (
+          <div style={{ marginTop: 18, padding: 14, border: "1.5px solid var(--carle-red)", textAlign: "center",
+            fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)" }}>
+            アカウント情報を読み込めませんでした。<br />通信状態をご確認のうえ、開き直してください。
+          </div>
+        )}
         <button onClick={onLogout} style={{ width: "100%", marginTop: 20, padding: "14px", border: "1.5px solid var(--carle-red)",
           background: "rgba(227,38,54,0.06)", cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700,
           fontSize: 15, color: "var(--carle-red)" }}>このアカウントからログアウト</button>

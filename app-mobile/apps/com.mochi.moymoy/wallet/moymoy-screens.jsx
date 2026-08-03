@@ -295,7 +295,7 @@ function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
 }
 
 /* ─── チャージ画面 (インベントリの手持ちエメラルドのみ) ──────────── */
-function MoyCharge({ balance, inv, canCharge, invStatus, onConfirm }) {
+function MoyCharge({ balance, inv, canCharge, invStatus, attesting, onConfirmCharacter, onConfirm }) {
   const available = inv.emeralds + inv.blocks * 9; // 9エメ = 1ブロック
   const [amt, setAmt] = msState(0);
   const press = (k) => {
@@ -323,9 +323,38 @@ function MoyCharge({ balance, inv, canCharge, invStatus, onConfirm }) {
     );
   }
 
+  // The character has to be confirmed before the backend knows whose inventory
+  // to read. The confirmation is a user action (it raises the OS consent modal),
+  // so it is a BUTTON here rather than something the screen does on open.
+  if (invStatus === "attestation_required" || (invStatus && invStatus.indexOf("attest_") === 0)) {
+    return (
+      <div style={{ padding: "40px 24px 120px", textAlign: "center" }}>
+        <EmeGem size={56} style={{ margin: "0 auto 16px", opacity: 0.5 }} />
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 15, fontWeight: 700, color: "var(--ink)" }}>
+          キャラクターの確認が必要です
+        </div>
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", marginTop: 8, lineHeight: 1.7 }}>
+          どのキャラクターのエメラルドを使うかを、<br />
+          MochiOS に確認してもらいます。
+        </div>
+        {invStatus !== "attestation_required" && (
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)", marginTop: 12, lineHeight: 1.7 }}>
+            {errLabel(invStatus)}
+          </div>
+        )}
+        <button disabled={attesting} onClick={onConfirmCharacter} style={{ marginTop: 20, padding: "14px 22px",
+          border: "1.5px solid #000", background: attesting ? "#bdbdbd" : "var(--moy)", color: "#fff",
+          boxShadow: attesting ? "none" : "4px 4px 0 #0B5A33", cursor: attesting ? "default" : "pointer",
+          fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15 }}>
+          {attesting ? "確認中…" : "キャラクターを確認"}
+        </button>
+      </div>
+    );
+  }
+
   // The backend distinguishes "couldn't reach the character" from a genuine 0, so
   // don't show a misleading empty inventory — say why and let the user retry.
-  if (invStatus === "character_unreachable" || invStatus === "character_offline") {
+  if (invStatus === "character_unreachable") {
     return (
       <div style={{ padding: "40px 24px 120px", textAlign: "center" }}>
         <EmeGem size={56} style={{ margin: "0 auto 16px", opacity: 0.5 }} />
@@ -333,9 +362,8 @@ function MoyCharge({ balance, inv, canCharge, invStatus, onConfirm }) {
           手持ちのエメラルドを取得できません
         </div>
         <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", marginTop: 8, lineHeight: 1.7 }}>
-          {invStatus === "character_offline"
-            ? <>このキャラクターがゲームにログインしていません。<br />Minecraft サーバーに参加してから、もう一度お試しください。</>
-            : <>Minecraft のキャラクターに接続できませんでした。<br />ゲームにログインしているか、サーバー側の連携（mod）設定をご確認ください。</>}
+          Minecraft のキャラクターに接続できませんでした。<br />
+          ゲームにログインしているか、サーバー側の連携（mod）設定をご確認ください。
         </div>
       </div>
     );
@@ -487,13 +515,29 @@ const ERR_LABEL = {
   self_transfer: "自分自身には送れません",
   unknown_target: "相手が見つかりません",
   mc_unavailable: "Minecraft サーバーに接続されていません",
-  no_character: "Minecraft キャラクターが見つかりません",
-  character_claimed: "このキャラクターは別のアカウントに連携されています",
-  character_offline: "キャラクターがゲームにログインしていません",
   character_unreachable: "キャラクターに接続できません（ゲーム／サーバー連携をご確認ください）",
   charge_pending: "チャージは保留中です（反映までお待ちください）",
   charge_failed: "チャージに失敗しました。もう一度お試しください",
   unauthorized: "セッションが切れました。ログインし直してください",
+  // ── host attestation (DEV.md §7.3.10 G4) ──
+  // Each cause gets its own wording: "確認できませんでした" for everything would
+  // leave a user who declined, a user on an offline-mode server and a user
+  // hitting a packaging bug all staring at the same useless sentence.
+  attestation_required: "キャラクターの確認が必要です",
+  attest_denied: "キャラクターの確認をキャンセルしました",
+  attest_timeout: "キャラクターの確認がタイムアウトしました。もう一度お試しください",
+  attest_unavailable: "この端末では Minecraft キャラクターを確認できません（ゲーム内から実行してください）",
+  attest_no_host: "この画面ではチャージできません。Minecraft 内の MochiOS からご利用ください",
+  attest_no_scope: "アプリの設定が不足しています（attestation.request）。アプリを更新してください",
+  attest_os_error: "MochiOS がキャラクターを確認できませんでした",
+  attest_no_crypto: "この環境では確認に必要な暗号機能が使えません",
+  attest_challenge: "確認の有効期限が切れました。もう一度お試しください",
+  attest_invalid: "キャラクターの確認結果を検証できませんでした",
+  attest_audience: "他のアプリ向けの確認結果は使えません",
+  attest_attester_kind: "Minecraft サーバー以外からの確認結果は使えません",
+  attest_offline_server: "このサーバーは online-mode ではないため、チャージには使えません",
+  attest_attester_id: "サーバーの識別子が不正です",
+  attest_request_hash: "確認結果がこの操作と一致しません。もう一度お試しください",
 };
 function errLabel(code) {
   return ERR_LABEL[code] || "処理に失敗しました（" + (code || "error") + "）";
@@ -508,6 +552,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   const [friends, setFriends] = msState([]);
   const [inv, setInv] = msState({ emeralds: 0, blocks: 0 });
   const [invStatus, setInvStatus] = msState(null); // null = ok; else the inventory error code
+  const [attesting, setAttesting] = msState(false); // a consent modal is up
   const [canCharge, setCanCharge] = msState(false);
   const [loaded, setLoaded] = msState(false);
   const mountedRef = msRef(true);
@@ -562,14 +607,42 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       const f = await MoyMoy.friends();
       if (isAlive() && f.ok) setFriends(f.friends.map(enrichFriend));
     } catch (e) { console.warn("MoyMoy: friends load failed", e); }
+    if (isAlive()) setLoaded(true);
+  }
+
+  // Inventory is NOT part of loadAll: it is only meaningful on the charge tab,
+  // and reading it on open would report `attestation_required` (and show the
+  // confirm prompt) the moment the wallet appears, for a user who came to check
+  // their balance.
+  async function refreshInventory(isAlive = () => true) {
     try {
       const i = await MoyMoy.inventory();
-      if (isAlive()) {
-        if (i.ok) { setInv({ emeralds: i.emeralds, blocks: i.blocks }); setInvStatus(null); }
-        else { setInv({ emeralds: 0, blocks: 0 }); setInvStatus(i.error || "inventory_error"); }
-      }
-    } catch (e) { console.warn("MoyMoy: inventory load failed", e); if (isAlive()) setInvStatus("inventory_error"); }
-    if (isAlive()) setLoaded(true);
+      if (!isAlive()) return;
+      if (i.ok) { setInv({ emeralds: i.emeralds, blocks: i.blocks }); setInvStatus(null); }
+      else { setInv({ emeralds: 0, blocks: 0 }); setInvStatus(i.error || "inventory_error"); }
+    } catch (e) {
+      console.warn("MoyMoy: inventory load failed", e);
+      if (isAlive()) setInvStatus("inventory_error");
+    }
+  }
+
+  // Ask the OS to confirm which character is playing. User-initiated only — this
+  // raises a consent modal.
+  async function confirmCharacter() {
+    if (attesting) return;
+    setAttesting(true);
+    try {
+      const r = await MoyMoy.attestSession();
+      if (!mountedRef.current) return;
+      if (r.error === "unauthorized") { onExpired(); return; }
+      if (!r.ok) { setInvStatus(r.error || "attest_os_error"); return; }
+      await refreshInventory(() => mountedRef.current);
+    } catch (e) {
+      console.warn("MoyMoy: character confirmation failed", e);
+      if (mountedRef.current) setInvStatus("attest_os_error");
+    } finally {
+      if (mountedRef.current) setAttesting(false);
+    }
   }
 
   msEffect(() => {
@@ -578,6 +651,15 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     loadAll(() => alive);
     return () => { alive = false; mountedRef.current = false; };
   }, []);
+
+  // Read the inventory when the charge tab opens (and on every return to it, so
+  // a character who moved servers is re-detected).
+  msEffect(() => {
+    if (tab !== "charge") return;
+    let alive = true;
+    refreshInventory(() => alive);
+    return () => { alive = false; };
+  }, [tab]);
 
   // Full history (separate from the home "recent" slice) when the history tab opens.
   msEffect(() => {
@@ -646,13 +728,11 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
 
       await refresh(() => mountedRef.current);
       if (!mountedRef.current) return;
-      try {
-        const i = await MoyMoy.inventory();
-        if (mountedRef.current) {
-          if (i.ok) { setInv({ emeralds: i.emeralds, blocks: i.blocks }); setInvStatus(null); }
-          else { setInv({ emeralds: 0, blocks: 0 }); setInvStatus(i.error || "inventory_error"); }
-        }
-      } catch (e) { console.warn("MoyMoy: inventory refresh after confirm failed", e); }
+      // Only a charge changes the in-world inventory; re-reading it after a send
+      // or a payment would be a pointless round-trip to the game server.
+      if (kind === "charge") {
+        await refreshInventory(() => mountedRef.current);
+      }
       if (!mountedRef.current) return;
 
       idemRef.current = null; // settled — the next transaction starts a fresh op
@@ -679,6 +759,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
         {tab === "pay" && <MoyPay merchants={merchants} onPick={t => setFlow({ kind: "pay", target: t })} />}
         {tab === "send" && <MoySend friends={friends} onPick={t => setFlow({ kind: "send", target: t })} />}
         {tab === "charge" && <MoyCharge balance={balance} inv={inv} canCharge={canCharge} invStatus={invStatus}
+          attesting={attesting} onConfirmCharacter={confirmCharacter}
           onConfirm={(amount) => { setErr(null); setConfirm({ kind: "charge", target: null, amount }); }} />}
         {tab === "history" && <MoyHistory txns={txns} />}
       </div>

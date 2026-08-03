@@ -3,7 +3,7 @@
 > **この文書は廃止済み（historical）。以下の手順に従ってはならない。**
 >
 > エメラルドチャージはコマンドバス（QUIC :7421, mTLS）を使わなくなり、バックエンド
-> 自身の cs トンネル上の **HTTP in MNN**（`http://moymoy.<UUID>.minecraft.auto.mnn/`）
+> 自身の cs トンネル上の **HTTP in MNN**（`http://moymoy.<コネクタID>.mnn/`）
 > になった（MochiOS DEV.md §7.3.10）。**バックエンド leaf（`--exsoft-id moymoy` /
 > 旧 `--mcserver-id moymoy`）はもう発行も配置も不要**で、`MOCHI_EXSOFT_CERT_DIR` /
 > `MOCHI_EXSOFT_HUB_QUIC` はコードから読まれない。`can_charge` は証明書の有無ではなく

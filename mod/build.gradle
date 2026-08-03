@@ -1,9 +1,10 @@
 // MoyMoy — Forge 1.20.1 receiver-extension mod (MochiOS connector, DEV.md 7.3).
 //
 // Pure-Java Forge mod. Depends on the MochiOS connector mod ("mochi") for
-// MochiMod.DISPATCH + CommandDispatch. The API surface we touch across the
-// connector boundary is (String, byte[]) only — no Minecraft types cross it — so
-// the connector's dev classes compile cleanly as a compileOnly dep.
+// MochiMod.MNN_SERVER + the MnnHandler/MnnRequest/MnnResponse records. The API
+// surface we touch across the connector boundary is plain JDK types only — no
+// Minecraft types cross it — so the connector's dev classes compile cleanly as a
+// compileOnly dep.
 // Pinned versions mirror MochiOS2.0/minecraft/forge.
 
 plugins {

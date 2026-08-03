@@ -172,7 +172,11 @@ pub fn lookup_handle(conn: &Connection, handle: &str) -> rusqlite::Result<Option
 
 /// Mint a session for `account_id`, persisting only the token hash. Returns the
 /// plaintext token (shown to the client once).
-pub fn create_session(conn: &Connection, account_id: &str, phone_id: Option<&str>) -> rusqlite::Result<String> {
+pub fn create_session(
+    conn: &Connection,
+    account_id: &str,
+    phone_id: Option<&str>,
+) -> rusqlite::Result<String> {
     let token = gen_token();
     let now = now_ms();
     conn.execute(
@@ -213,7 +217,8 @@ pub fn resolve_session(conn: &Connection, token: &str) -> rusqlite::Result<Optio
         }
         Some(_) => {
             // Expired — best-effort cleanup so the table doesn't accumulate dead rows.
-            if let Err(e) = conn.execute("DELETE FROM moymoy_sessions WHERE token_hash = ?1", [&th]) {
+            if let Err(e) = conn.execute("DELETE FROM moymoy_sessions WHERE token_hash = ?1", [&th])
+            {
                 tracing::debug!(error = %e, "resolve_session: expired-row cleanup failed");
             }
             Ok(None)
@@ -269,7 +274,15 @@ pub fn register(
 
     let pin_hash = hash_pin(pin)?;
     let account_id = Uuid::new_v4().to_string();
-    insert_account(conn, &account_id, &handle, &handle_lower, &display, &pin_hash, None)?;
+    insert_account(
+        conn,
+        &account_id,
+        &handle,
+        &handle_lower,
+        &display,
+        &pin_hash,
+        None,
+    )?;
     let token = create_session(conn, &account_id, phone_id)?;
     Ok(RegisterOutcome::Ok(SessionMint {
         token,
@@ -303,14 +316,34 @@ pub fn insert_account(
                 display_name, pin_hash, failed_pin_attempts, email, email_lower, \
                 email_verified_unix_ms, created_unix_ms, updated_unix_ms) \
              VALUES (?1, 0, ?2, ?3, 0, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?10, ?10)",
-            params![account_id, holder, card, handle, handle_lower, display, pin_hash, em, eml, now],
+            params![
+                account_id,
+                holder,
+                card,
+                handle,
+                handle_lower,
+                display,
+                pin_hash,
+                em,
+                eml,
+                now
+            ],
         )?,
         None => conn.execute(
             "INSERT INTO accounts \
                (account_id, balance, holder, card_number, is_merchant, handle, handle_lower, \
                 display_name, pin_hash, failed_pin_attempts, created_unix_ms, updated_unix_ms) \
              VALUES (?1, 0, ?2, ?3, 0, ?4, ?5, ?6, ?7, 0, ?8, ?8)",
-            params![account_id, holder, card, handle, handle_lower, display, pin_hash, now],
+            params![
+                account_id,
+                holder,
+                card,
+                handle,
+                handle_lower,
+                display,
+                pin_hash,
+                now
+            ],
         )?,
     };
     Ok(())
@@ -319,7 +352,11 @@ pub fn insert_account(
 /// Is `handle_lower` already registered?
 pub fn handle_taken(conn: &Connection, handle_lower: &str) -> rusqlite::Result<bool> {
     Ok(conn
-        .query_row("SELECT 1 FROM accounts WHERE handle_lower = ?1", [handle_lower], |_| Ok(()))
+        .query_row(
+            "SELECT 1 FROM accounts WHERE handle_lower = ?1",
+            [handle_lower],
+            |_| Ok(()),
+        )
         .optional()?
         .is_some())
 }
@@ -327,7 +364,11 @@ pub fn handle_taken(conn: &Connection, handle_lower: &str) -> rusqlite::Result<b
 /// Is `email_lower` already registered (1 email ↔ 1 account)?
 pub fn email_taken(conn: &Connection, email_lower: &str) -> rusqlite::Result<bool> {
     Ok(conn
-        .query_row("SELECT 1 FROM accounts WHERE email_lower = ?1", [email_lower], |_| Ok(()))
+        .query_row(
+            "SELECT 1 FROM accounts WHERE email_lower = ?1",
+            [email_lower],
+            |_| Ok(()),
+        )
         .optional()?
         .is_some())
 }
@@ -401,29 +442,49 @@ pub fn verify_credentials(
             },
         )
         .optional()?;
-    let (account_id, handle, display_name, pin_hash, attempts, locked_until, email, email_lower, ev) =
-        match row {
-            Some(x) => x,
-            None => return Ok(CredsOutcome::Invalid),
-        };
+    let (
+        account_id,
+        handle,
+        display_name,
+        pin_hash,
+        attempts,
+        locked_until,
+        email,
+        email_lower,
+        ev,
+    ) = match row {
+        Some(x) => x,
+        None => return Ok(CredsOutcome::Invalid),
+    };
 
     let now = now_ms();
     if let Some(until) = locked_until {
         if until > now {
-            return Ok(CredsOutcome::Locked { retry_after_ms: until - now });
+            return Ok(CredsOutcome::Locked {
+                retry_after_ms: until - now,
+            });
         }
     }
-    let ok = pin_hash.as_deref().map(|h| verify_pin(pin, h)).unwrap_or(false);
+    let ok = pin_hash
+        .as_deref()
+        .map(|h| verify_pin(pin, h))
+        .unwrap_or(false);
     if !ok {
         let na = attempts + 1;
-        let lock = if na >= MAX_FAILED_ATTEMPTS { Some(now + LOCKOUT_MS) } else { None };
+        let lock = if na >= MAX_FAILED_ATTEMPTS {
+            Some(now + LOCKOUT_MS)
+        } else {
+            None
+        };
         conn.execute(
             "UPDATE accounts SET failed_pin_attempts = ?2, locked_until_unix_ms = ?3, updated_unix_ms = ?4 \
              WHERE account_id = ?1",
             params![account_id, na, lock, now],
         )?;
         if lock.is_some() {
-            return Ok(CredsOutcome::Locked { retry_after_ms: LOCKOUT_MS });
+            return Ok(CredsOutcome::Locked {
+                retry_after_ms: LOCKOUT_MS,
+            });
         }
         return Ok(CredsOutcome::Invalid);
     }
@@ -433,7 +494,12 @@ pub fn verify_credentials(
         params![account_id, now],
     )?;
     Ok(CredsOutcome::Ok(info_from_row(
-        account_id, handle, display_name, email, email_lower, ev,
+        account_id,
+        handle,
+        display_name,
+        email,
+        email_lower,
+        ev,
     )))
 }
 
@@ -445,7 +511,12 @@ pub fn account_full(conn: &Connection, account_id: &str) -> rusqlite::Result<Opt
         [account_id],
         |r| {
             Ok(info_from_row(
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
             ))
         },
     )
@@ -453,7 +524,10 @@ pub fn account_full(conn: &Connection, account_id: &str) -> rusqlite::Result<Opt
 }
 
 /// Full account info by handle (recovery / 2FA lookups).
-pub fn account_full_by_handle(conn: &Connection, handle: &str) -> rusqlite::Result<Option<AccountInfo>> {
+pub fn account_full_by_handle(
+    conn: &Connection,
+    handle: &str,
+) -> rusqlite::Result<Option<AccountInfo>> {
     let hl = handle.trim().to_lowercase();
     if hl.is_empty() {
         return Ok(None);
@@ -464,7 +538,12 @@ pub fn account_full_by_handle(conn: &Connection, handle: &str) -> rusqlite::Resu
         [&hl],
         |r| {
             Ok(info_from_row(
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
             ))
         },
     )
@@ -544,7 +623,10 @@ pub struct AuthedAccount {
 impl FromRequestParts<AppState> for AuthedAccount {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let token = parts
             .headers
             .get(SESSION_HEADER)
@@ -554,11 +636,12 @@ impl FromRequestParts<AppState> for AuthedAccount {
             .ok_or_else(|| ApiError::unauthorized("missing session"))?
             .to_string();
         let pool = state.pool.clone();
-        let account_id = tokio::task::spawn_blocking(move || -> Result<Option<String>, ApiError> {
-            let conn = pool.get()?;
-            resolve_session(&conn, &token).map_err(ApiError::from)
-        })
-        .await??;
+        let account_id =
+            tokio::task::spawn_blocking(move || -> Result<Option<String>, ApiError> {
+                let conn = pool.get()?;
+                resolve_session(&conn, &token).map_err(ApiError::from)
+            })
+            .await??;
         match account_id {
             Some(account_id) => Ok(AuthedAccount { account_id }),
             None => Err(ApiError::unauthorized("invalid or expired session")),

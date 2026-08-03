@@ -10,8 +10,16 @@
 
    Identity (v2): a MoyMoy account (handle + PIN). The backend verifies every
    wallet request from the session token we send in the `X-MoyMoy-Session`
-   header (minted by register/login). The Minecraft UUID (os.gameUuid) is sent
-   ONLY for charge/inventory — the character whose emeralds to consume.
+   header (minted by register/login).
+
+   Which Minecraft character's emeralds a charge may consume is a SEPARATE
+   question, and one this app cannot answer about itself — it is the thing being
+   asserted about. So it no longer sends an `os.gameUuid` of its own. It asks the
+   OS for a Hub-signed host attestation (`mochi.os.hostAttestation`, DEV.md
+   §7.3.10 G4), which requires the user's consent and is bound to this backend
+   (`audience`), to a nonce the backend issued (`challenge`) and to the exact
+   request (`requestHash`). The backend verifies the signature; nothing here is
+   trusted on the app's word.
 
    Endpoint resolution:
      - in-world (mochi-internal:// origin): https://moymoy.cs.mnn
@@ -50,35 +58,6 @@
   function authHeaders(session) {
     const tok = session || _session;
     return tok ? { "X-MoyMoy-Session": tok } : {};
-  }
-
-  // ── Minecraft character identity (charge / inventory only) ──────────────────
-  // In-world via the OS API; in browser-dev via ?mc_uuid= / ?mcid=. This is the
-  // *character* (gameUuid), NOT the MoyMoy account identity.
-  let _identCache = null;
-  async function ident() {
-    if (_identCache) return _identCache;
-    let mc_uuid = "";
-    let mcid = "";
-    try {
-      if (window.mochi && mochi.os) {
-        if (mochi.os.gameUuid) mc_uuid = (await mochi.os.gameUuid()) || "";
-        if (mochi.os.gameName) mcid = (await mochi.os.gameName()) || "";
-      }
-    } catch (e) {
-      // The guard ensures this fires only when OS API exists but threw in-world.
-      // In browser-dev (mochi absent) the try block is skipped entirely.
-      console.warn("MoyMoy.ident: OS identity API threw", e);
-    }
-    if (!mc_uuid && !mcid) {
-      mc_uuid = qs.get("mc_uuid") || "";
-      mcid = qs.get("mcid") || "";
-    }
-    const resolved = { mc_uuid, mcid };
-    // Cache only a resolved identity. If the OS API wasn't ready yet (both
-    // empty), don't poison the cache — let the next ident() call retry.
-    if (mc_uuid || mcid) _identCache = resolved;
-    return resolved;
   }
 
   // Device id (self-asserted metadata for the session row). Best-effort.
@@ -188,10 +167,91 @@
       ? crypto.randomUUID()
       : "k-" + Date.now() + "-" + Math.floor(Math.random() * 1e9);
 
+  // ── host attestation ────────────────────────────────────────────────────────
+  // Who we are asking the assertion to be FOR. The backend refuses one minted
+  // for anybody else, so this string must match its `attest::AUDIENCE`.
+  const AUDIENCE = "moymoy";
+
+  async function sha256Hex(s) {
+    const bytes = new TextEncoder().encode(s);
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+  // The two request bindings, spelled exactly as the backend spells them
+  // (server/moymoy-cs/src/attest.rs). The distinct prefixes are why an assertion
+  // approved for a character check can never be spent as one that authorizes a
+  // charge — the two hash spaces cannot collide.
+  const chargeRequestHash = (idemKey, amount) =>
+    sha256Hex("moymoy.charge.v1\n" + idemKey + "\n" + amount);
+  const sessionRequestHash = (challenge) => sha256Hex("moymoy.session.v1\n" + challenge);
+
+  /**
+   * Get the backend a fresh nonce, then ask the OS to attest this host against
+   * it. Resolves `{ok:true, assertion}` or `{ok:false, error:<code>}` — the
+   * reason is always reported as its own code rather than collapsed into a
+   * generic failure, so the UI can say what actually happened.
+   *
+   * `makeRequestHash(challenge)` returns the digest that binds the assertion to
+   * the request it will authorize.
+   */
+  async function attest(purpose, makeRequestHash, reason) {
+    // Browser-dev has no OS, hence no session credential to redeem: charging is
+    // in-world only, by design (a dev bypass would be a way to spend somebody
+    // else's emeralds without ever proving anything).
+    if (!(window.mochi && mochi.os && mochi.os.hostAttestation)) {
+      return { ok: false, error: "attest_no_host" };
+    }
+    let ch;
+    try {
+      ch = await postJson("/wallet/attest/challenge", { purpose });
+    } catch (e) {
+      console.warn("MoyMoy.attest: challenge request failed", e);
+      return { ok: false, error: "attest_challenge" };
+    }
+    if (!ch.ok || !ch.challenge) {
+      return { ok: false, error: ch.error || "attest_challenge" };
+    }
+
+    let requestHash;
+    try {
+      requestHash = await makeRequestHash(ch.challenge);
+    } catch (e) {
+      console.error("MoyMoy.attest: could not compute the request hash", e);
+      return { ok: false, error: "attest_no_crypto" };
+    }
+
+    let res;
+    try {
+      res = await mochi.os.hostAttestation({
+        audience: AUDIENCE,
+        challenge: ch.challenge,
+        requestHash,
+        reason,
+      });
+    } catch (e) {
+      // A rejection is an OS-level fault, not an answer. The overwhelmingly
+      // likely one is a manifest missing `attestation.request`, so name it.
+      if (e && e.code === "SCOPE_DENIED") {
+        console.error("MoyMoy.attest: the app manifest does not declare attestation.request", e);
+        return { ok: false, error: "attest_no_scope" };
+      }
+      console.error("MoyMoy.attest: os.hostAttestation failed", e);
+      return { ok: false, error: "attest_os_error" };
+    }
+    const status = res && res.status;
+    if (status === "ok" && res.assertion) return { ok: true, assertion: res.assertion };
+    if (status === "denied") return { ok: false, error: "attest_denied" };
+    if (status === "timeout") return { ok: false, error: "attest_timeout" };
+    if (status === "unavailable") return { ok: false, error: "attest_unavailable" };
+    console.warn("MoyMoy.attest: unexpected attestation outcome", res);
+    return { ok: false, error: "attest_os_error" };
+  }
+
   window.MoyMoy = {
     inWorld,
     base,
-    ident,
     phoneId,
     newIdem,
     setSession,
@@ -228,11 +288,20 @@
     friends: () => getJson("/wallet/friends"),
     merchants: () => getJson("/wallet/merchants"),
 
-    // Inventory of the current Minecraft character (charge screen).
-    inventory: async () => {
-      const i = await ident();
-      return getJson("/wallet/inventory", { mc_uuid: i.mc_uuid, mcid: i.mcid });
+    // Confirm which character is playing, so the backend has somewhere to send
+    // an inventory query. Raises the OS consent modal — call it only from a user
+    // action, never on load.
+    attestSession: async (reason) => {
+      const a = await attest("session", sessionRequestHash, reason || "Minecraft のキャラクターを確認します");
+      if (!a.ok) return { ok: false, error: a.error };
+      return postJson("/wallet/attest/session", { assertion: a.assertion });
     },
+
+    // Inventory of the confirmed character. Takes no arguments and NEVER attests
+    // on its own: it is called on tab switches and refreshes, and a modal at
+    // those moments would be the phone asking for consent unprompted. An
+    // `attestation_required` answer is the app's cue to offer the button.
+    inventory: () => getJson("/wallet/inventory"),
 
     // Send to a MoyMoy handle (@id). Pass a stable `idemKey` so a retry of the
     // SAME send (e.g. after a lost response) replays the same transfer instead of
@@ -245,17 +314,29 @@
     pay: (merchantId, amount, idemKey) =>
       postJson("/wallet/pay", { idem_key: idemKey || newIdem(), merchant_id: merchantId, amount }),
 
-    // Charge from the current character's inventory emeralds (mod-backed).
+    // Charge from the confirmed character's inventory emeralds (mod-backed).
     // Returns a pending op; poll op(). Pass a stable `idemKey` so a retry of the
     // SAME charge attempt replays the same op instead of consuming twice.
+    //
+    // Posts WITHOUT an assertion first, on purpose: a retry of an already-created
+    // op replays server-side and comes back immediately, so the user is not asked
+    // to approve a charge they already approved. Only a genuinely new charge gets
+    // `attestation_required` back, and only then is the consent modal raised.
     charge: async (amount, idemKey) => {
-      const i = await ident();
-      return postJson("/wallet/charge", {
-        idem_key: idemKey || newIdem(),
-        amount,
-        mc_uuid: i.mc_uuid,
-        mcid: i.mcid,
-      });
+      const idem = idemKey || newIdem();
+      const first = await postJson("/wallet/charge", { idem_key: idem, amount });
+      if (first.ok || first.error !== "attestation_required") return first;
+
+      // The charge binding covers the idem_key and the amount, not the
+      // challenge — so the modal's reason can state the amount the user is about
+      // to approve, and an assertion for a different amount will not verify.
+      const a = await attest(
+        "charge",
+        () => chargeRequestHash(idem, amount),
+        amount + " エメのチャージ"
+      );
+      if (!a.ok) return { ok: false, error: a.error };
+      return postJson("/wallet/charge", { idem_key: idem, amount, assertion: a.assertion });
     },
 
     op: (opId) => getJson("/wallet/op", { op_id: opId }),

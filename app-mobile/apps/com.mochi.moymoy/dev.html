@@ -6,8 +6,9 @@
     <title>MoyMoy — dev</title>
     <!-- Browser-dev harness: loads React/Babel from a CDN and the design fonts
          from Google Fonts, so the bundle is testable WITHOUT the MochiOS host.
-         Point it at a local backend with ?moymoy_http=http://127.0.0.1:7433 and
-         pick an identity with ?mcid=Steve (the SDK reads these in browser-dev). -->
+         Point it at a local backend with ?moymoy_http=http://127.0.0.1:7433.
+         The wallet works here; CHARGING does not — it needs a Hub-signed host
+         attestation only the OS can produce (see moymoy-sdk.js). -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet" />

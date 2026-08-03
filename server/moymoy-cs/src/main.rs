@@ -12,6 +12,7 @@
 //!     is down, which is the only "unavailable" state left.
 
 mod api;
+mod attest;
 mod auth;
 mod charge;
 mod db;
@@ -43,7 +44,10 @@ async fn main() -> anyhow::Result<()> {
 
     // The launcher injects MOCHI_APP_LISTEN=127.0.0.1:<port>; fall back to a dev
     // default for a standalone smoke (tools/run-cs.ps1).
-    let listen = env_or("MOCHI_APP_LISTEN", &env_or("MOYMOY_CS_LISTEN", "127.0.0.1:7433"));
+    let listen = env_or(
+        "MOCHI_APP_LISTEN",
+        &env_or("MOYMOY_CS_LISTEN", "127.0.0.1:7433"),
+    );
     // Our single ingress. The wallet and emerald charging share ONE cs claim now
     // that the charge path is HTTP over this same tunnel — the sibling-sub-host
     // split (`wallet.moymoy` / `charge.moymoy`) existed only to give the old
@@ -67,10 +71,21 @@ async fn main() -> anyhow::Result<()> {
     // the live connection on connect (and cleared on drop), so the charge path can
     // hold it from the start and simply report "not connected" until then.
     let tunnel_sender = CsHttpSender::default();
-    let charge = Arc::new(ChargeCoordinator::new(
-        pool.clone(),
-        McLink::new(tunnel_sender.clone()),
-    ));
+    let mc = McLink::new(tunnel_sender.clone());
+    let charge = Arc::new(ChargeCoordinator::new(pool.clone(), mc.clone()));
+
+    // Host attestation (MochiOS DEV.md §7.3.10 G4): which in-world character a
+    // wallet request may spend the emeralds of. The verifier fetches the Hub's
+    // public key over the SAME tunnel, lazily — at this point the tunnel has not
+    // even been spawned, so fetching now could only fail.
+    //
+    // WHICH connectors deserve to be believed is the HUB's policy
+    // (`[attestation] trusted_exsoft_attesters`); it refuses to sign for an
+    // attester it does not trust, so this backend keeps no second allowlist that
+    // could drift out of step with it. See `attest.rs` for the full reasoning.
+    let attest_verifier = Arc::new(attest::AttestVerifier::new(mc));
+    let challenges = Arc::new(attest::ChallengeStore::new());
+    let char_sessions = Arc::new(attest::CharSessionStore::new());
 
     // Reconciliation: re-send non-terminal emerald ops so a dropped request/ack
     // eventually settles (at-least-once + op-idempotent mod), and age out ops too
@@ -95,6 +110,9 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         charge,
         mailer,
+        attest: attest_verifier,
+        challenges,
+        char_sessions,
     };
 
     // --- bind loopback listener ---

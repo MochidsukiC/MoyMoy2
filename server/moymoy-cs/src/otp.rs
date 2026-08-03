@@ -72,7 +72,10 @@ impl Mailer {
         {
             Some(token) => {
                 tracing::info!("email OTP enabled (MNN mail, per-process identity)");
-                Mailer { sender: Some(Arc::new(MnnMailSender::with_bearer(token))), dev_log }
+                Mailer {
+                    sender: Some(Arc::new(MnnMailSender::with_bearer(token))),
+                    dev_log,
+                }
             }
             None => {
                 if dev_log {
@@ -80,7 +83,10 @@ impl Mailer {
                 } else {
                     tracing::info!("email OTP disabled (no per-process identity token) — wallet runs handle+PIN only");
                 }
-                Mailer { sender: None, dev_log }
+                Mailer {
+                    sender: None,
+                    dev_log,
+                }
             }
         }
     }
@@ -98,7 +104,12 @@ impl Mailer {
                 .await
                 .map_err(|e| ApiError::internal(format!("email send failed: {e}")))
         } else if self.dev_log {
-            tracing::warn!(email, purpose, code, "DEV OTP LOG (email sending disabled) — for local testing only");
+            tracing::warn!(
+                email,
+                purpose,
+                code,
+                "DEV OTP LOG (email sending disabled) — for local testing only"
+            );
             Ok(())
         } else {
             Err(ApiError::internal("email is not enabled"))
@@ -135,7 +146,11 @@ pub fn valid_email(s: &str) -> Option<String> {
 fn otp_pepper() -> &'static [u8] {
     static PEPPER: OnceLock<Vec<u8>> = OnceLock::new();
     PEPPER
-        .get_or_init(|| std::env::var("MOYMOY_OTP_PEPPER").unwrap_or_default().into_bytes())
+        .get_or_init(|| {
+            std::env::var("MOYMOY_OTP_PEPPER")
+                .unwrap_or_default()
+                .into_bytes()
+        })
         .as_slice()
 }
 
@@ -279,7 +294,10 @@ pub fn verify(
     }
     if code_hash(code) == hash {
         conn.execute("DELETE FROM moymoy_otps WHERE otp_id = ?1", [&otp_id])?;
-        Ok(VerifyOtp::Ok { account_id, payload })
+        Ok(VerifyOtp::Ok {
+            account_id,
+            payload,
+        })
     } else {
         let next = attempts + 1;
         if next >= OTP_MAX_ATTEMPTS {

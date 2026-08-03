@@ -20,17 +20,16 @@ import jp.houlab.mochidsuki.mochi.MochiMod;
  *
  * <p>A MochiOS connector <b>receiver extension</b> (DEV.md §7.3): the in-world
  * emerald-charge executor for the {@code moymoy} app. The {@code moymoy.cs.mnn}
- * wallet backend owns the balance; on an app charge it sends a consume command
- * over the command bus to {@code moymoy.<UUID>.minecraft.auto.mnn}, the Hub
- * auto-routes it to the player's live server, the connector relays it as a
- * {@code CMD_INBOUND}, and {@link MoyMoyExtension} consumes the inventory emeralds.
+ * wallet backend owns the balance; on an app charge it sends a consume request as
+ * HTTP in MNN to {@code moymoy.<exsoft_id>.mnn} — the server named by the
+ * Hub-signed attestation the player approved — the connector relays it to
+ * {@link MoyMoyExtension}, and that consumes the inventory emeralds.
  *
- * <p>Depends on the MochiOS connector mod ({@code mochi}) for {@link MochiMod#DISPATCH}.
- * The connector auto-advertises every handler registered on {@code DISPATCH} to
- * the Hub ({@code hosted_app_ids} server config is deprecated — see
- * MochiServerConfig), so hosting {@code moymoy} needs no per-app config: just load
- * this jar next to the {@code mochi} connector mod and set a non-empty
- * {@code mcserver_id} in {@code mochi-server.toml} (empty ⇒ connector won't start).
+ * <p>Depends on the MochiOS connector mod ({@code mochi}) for
+ * {@link MochiMod#MNN_SERVER}. The connector advertises every served key to the
+ * Hub, so hosting {@code moymoy} needs no per-app config: just load this jar next
+ * to the {@code mochi} connector mod and set a non-empty {@code mcserver_id} in
+ * {@code mochi-server.toml} (empty ⇒ connector won't start).
  *
  * <p>Also registers a read-only {@code /eme} command that shows the player's
  * chargeable inventory (no backend call — the app's charge tab performs the
@@ -52,16 +51,23 @@ public final class MoyMoyMod {
     }
 
     /**
-     * Register the emerald-charge executor into the shared connector dispatch. The
-     * {@code mochi} mod loads first (mods.toml {@code ordering=AFTER}) and owns
-     * {@link MochiMod#DISPATCH}; we only add our app_id handler. Dispatch is keyed
-     * by app_id at command time, so registering here is sufficient.
+     * Serve the emerald-charge executor on the shared connector's in-JVM MNN
+     * server. The {@code mochi} mod loads first (mods.toml {@code ordering=AFTER})
+     * and owns {@link MochiMod#MNN_SERVER}; we only add our serve key, which the
+     * connector then advertises to the Hub.
+     *
+     * <p>The <b>new</b> API, not the legacy {@code CommandDispatch} one, because
+     * only this one carries {@code MnnRequest.caller()} — the Hub's authenticated
+     * statement of who sent the request. Without it the extension cannot tell the
+     * MoyMoy wallet backend from any other backend that can reach the name, and
+     * an emerald consume must not be open to "any backend" (see
+     * {@link MoyMoyExtension}).
      */
     @SubscribeEvent
     public void onServerStarting(ServerStartingEvent event) {
-        MochiMod.DISPATCH.register(APP_ID, new MoyMoyExtension(event.getServer()));
-        LOGGER.info("MoyMoy: emerald-charge executor registered for app_id '{}' "
-                + "(the connector auto-advertises it to the Hub; ensure mcserver_id is set).",
+        MochiMod.MNN_SERVER.serve(APP_ID, new MoyMoyExtension(event.getServer()));
+        LOGGER.info("MoyMoy: emerald-charge executor serving '{}' over MNN "
+                + "(the connector advertises it to the Hub; ensure mcserver_id is set).",
                 APP_ID);
     }
 

@@ -38,6 +38,15 @@ sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 
+# Ed25519 verification for Hub-signed host attestations (`crate::attest`). The
+# SAME primitive the Hub signs with (`hub/ipvm-router/src/attest.rs`), and already
+# in this tree via the rustls/rcgen `ring` provider pins above — a direct
+# dependency here unifies with it rather than adding a second crypto stack. The
+# claims struct is mirrored, not shared: pulling the Hub's router crate in for it
+# would drag quinn/axum/hyper into this build. What keeps the mirror honest is the
+# claims-version gate plus the fixed test vectors in `attest.rs`.
+ring = "0.17"
+
 # SQLite — bundled so there is no system libsqlite dependency. r2d2 pool for
 # read concurrency under WAL; writers serialize on BEGIN IMMEDIATE + busy_timeout.
 rusqlite = { version = "0.31", features = ["bundled"] }

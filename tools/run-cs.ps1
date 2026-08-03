@@ -10,9 +10,14 @@
 
     tools/run-cs.ps1                      # backend on http://127.0.0.1:7433
     tools/dev-serve.ps1                   # static server for the bundle (:8099)
-    # browser: http://127.0.0.1:8099/dev.html?moymoy_http=http://127.0.0.1:7433&mcid=Steve
-    #   (?mcid=Steve is the MC *character* for charge/inventory; the MoyMoy
-    #    account is created in the UI via 口座開設 — handle + PIN.)
+    # browser: http://127.0.0.1:8099/dev.html?moymoy_http=http://127.0.0.1:7433
+    #   (the MoyMoy account is created in the UI via 口座開設 — handle + PIN.)
+
+  CHARGING cannot be exercised here. Which character's emeralds a charge may
+  consume is decided by a Hub-signed host attestation the OS produces from the
+  game server's per-session credential; a browser holds no such credential, and a
+  dev bypass would be a way to spend somebody else's emeralds without proving
+  anything. Use dev-credit below for funds, and test charging in-world.
 
   Fund a test account (after registering @alice in the UI; dev-credit is by handle):
     Invoke-RestMethod -Method Post -Uri http://127.0.0.1:7433/wallet/_dev/credit `

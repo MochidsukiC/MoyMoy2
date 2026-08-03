@@ -3,15 +3,15 @@
 //!
 //! Since the v2 redesign an account is an **independent MoyMoy account**
 //! (handle + PIN — created by [`crate::auth`]); `account_id` is a server-generated
-//! UUID, no longer a Minecraft UUID. The Minecraft UUID survives only as a
-//! *linked resource* for emerald charging — recorded in `account_mc_links` by
-//! [`link_mc`], routed by `emerald_ops.mc_uuid`.
+//! UUID, no longer a Minecraft UUID.
+//!
+//! There is no account ↔ Minecraft-character mapping here any more. Schema v5
+//! dropped `account_mc_links`: which character a request may spend is decided per
+//! request by a Hub-signed assertion ([`crate::attest`]), not by a table this
+//! module wrote from an earlier self-asserted gameUuid.
 
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
-
-use crate::db::now_ms;
 
 /// One account row as the wallet consumes it (balance + card face + labels).
 #[derive(Debug, Clone)]
@@ -37,17 +37,12 @@ impl Account {
     }
 }
 
-/// A Minecraft character linked to an account (settings / `/auth/me`).
-#[derive(Debug, Clone, Serialize)]
-pub struct LinkedMc {
-    pub mc_uuid: String,
-    pub mcid: Option<String>,
-}
-
 /// Canonicalize a UUID string to lowercase hyphenated form, or `None` if it is
 /// not a UUID.
 pub fn normalize_uuid(s: &str) -> Option<String> {
-    Uuid::parse_str(s.trim()).ok().map(|u| u.hyphenated().to_string())
+    Uuid::parse_str(s.trim())
+        .ok()
+        .map(|u| u.hyphenated().to_string())
 }
 
 /// The Minecraft *offline-mode* UUID for `name`
@@ -98,53 +93,4 @@ pub fn get(conn: &Connection, account_id: &str) -> rusqlite::Result<Option<Accou
         row_to_account,
     )
     .optional()
-}
-
-/// Record (idempotently) that `account_id` owns Minecraft character `mc_uuid`.
-/// Called on charge — the gameUuid is runtime-attested in-world, so this is a
-/// verified link. Refreshes the cached `mcid` (latest name) on conflict.
-pub fn link_mc(
-    conn: &Connection,
-    account_id: &str,
-    mc_uuid: &str,
-    mcid: Option<&str>,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO account_mc_links (account_id, mc_uuid, mcid, linked_unix_ms) \
-         VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT(account_id, mc_uuid) DO UPDATE SET \
-           mcid = COALESCE(excluded.mcid, account_mc_links.mcid)",
-        params![account_id, mc_uuid, mcid, now_ms()],
-    )?;
-    Ok(())
-}
-
-/// The account that owns Minecraft character `mc_uuid`, if any. Since schema v3
-/// a character belongs to exactly one account (UNIQUE index), so this is the
-/// single owner. Used to reject charges/inventory for a character claimed by a
-/// different account.
-pub fn mc_link_owner(conn: &Connection, mc_uuid: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT account_id FROM account_mc_links WHERE mc_uuid = ?1",
-        [mc_uuid],
-        |r| r.get::<_, String>(0),
-    )
-    .optional()
-}
-
-/// The Minecraft characters linked to an account (most recent first).
-pub fn linked_mc(conn: &Connection, account_id: &str) -> rusqlite::Result<Vec<LinkedMc>> {
-    let mut stmt = conn.prepare(
-        "SELECT mc_uuid, mcid FROM account_mc_links \
-         WHERE account_id = ?1 ORDER BY linked_unix_ms DESC",
-    )?;
-    let rows = stmt
-        .query_map([account_id], |r| {
-            Ok(LinkedMc {
-                mc_uuid: r.get(0)?,
-                mcid: r.get(1)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
 }

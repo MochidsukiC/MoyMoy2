@@ -7,7 +7,13 @@
   .jsx as application/javascript so Babel-standalone can load the components.
   Open the dev harness against a running backend (tools/run-cs.ps1):
 
-    http://127.0.0.1:8099/dev.html?moymoy_http=http://127.0.0.1:7433&mcid=Steve
+    http://127.0.0.1:8099/dev.html?moymoy_http=http://127.0.0.1:7433
+
+  The wallet (register / login / balance / send / pay / history) is fully
+  exercisable here. CHARGING is not: it needs a Hub-signed host attestation from
+  the OS, which a browser has no way to produce, so the charge tab reports
+  "Minecraft 内の MochiOS からご利用ください". Fund a test account with
+  /wallet/_dev/credit instead (see tools/run-cs.ps1).
 
   Self-contained (System.Net.HttpListener) — no external dependency.
 #>
@@ -36,7 +42,7 @@ $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add("http://127.0.0.1:$Port/")
 $listener.Start()
 Write-Host "MoyMoy dev server: http://127.0.0.1:$Port/ (root: $Root)" -ForegroundColor Green
-Write-Host "  dev harness: http://127.0.0.1:$Port/dev.html?moymoy_http=http://127.0.0.1:7433&mcid=Steve" -ForegroundColor Cyan
+Write-Host "  dev harness: http://127.0.0.1:$Port/dev.html?moymoy_http=http://127.0.0.1:7433" -ForegroundColor Cyan
 
 try {
     while ($listener.IsListening) {

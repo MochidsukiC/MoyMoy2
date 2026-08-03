@@ -2,6 +2,7 @@ package jp.houlab.mochidsuki.moymoy;
 
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -11,19 +12,22 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
 
-import jp.houlab.mochidsuki.mochi.connector.CommandDispatch;
+import jp.houlab.mochidsuki.mochi.connector.net.MnnHandler;
+import jp.houlab.mochidsuki.mochi.connector.net.MnnRequest;
+import jp.houlab.mochidsuki.mochi.connector.net.MnnResponse;
 
 /**
  * MoyMoy receiver extension (DEV.md §7.3) — <b>emerald-charge executor</b>.
  *
  * <p>The {@code moymoy.cs.mnn} wallet backend owns the balance. When a player
- * charges from the app, the backend sends a command over the MochiOS command bus
- * to {@code moymoy.<UUID>.minecraft.auto.mnn}; the Hub auto-routes it to the
- * player's live server, the connector relays it here as a {@code CMD_INBOUND}, and
- * this handler consumes the player's inventory emeralds and acks the consumed
- * amount. The backend credits the balance ONLY on that ack.
+ * charges from the app, the backend sends a consume request as HTTP in MNN to
+ * {@code moymoy.<exsoft_id>.mnn} — the server the player's Hub-signed
+ * attestation named — the connector relays it here, and this handler consumes
+ * that player's inventory emeralds and acks the consumed amount. The backend
+ * credits the balance ONLY on that ack, and the ack is this request's own HTTP
+ * response.
  *
- * <p>Commands (opaque JSON {@code data}):
+ * <p>Requests (opaque JSON body, {@code POST /}):
  * <pre>
  * emerald.charge  {"op_id","idem_key","verb":"emerald.charge","target_uuid","amount"}
  *   ack → {"op_id","status":"ok|duplicate|unauthorized|unknown_verb|bad_request
@@ -33,29 +37,54 @@ import jp.houlab.mochidsuki.mochi.connector.CommandDispatch;
  *   reply → {"req_id","emeralds","blocks"}  (or "online":false when offline)
  * </pre>
  *
- * <p>Security: {@code src} is the Hub/cert-asserted backend app_id. We only accept
- * commands from the {@code moymoy} backend ({@link #ALLOWED_SRC}); any other src is
- * {@code unauthorized}.
+ * <h2>Who is allowed to spend a player's emeralds</h2>
+ *
+ * <p>This handler is registered on the <b>new</b> {@link
+ * jp.houlab.mochidsuki.mochi.connector.net.MnnServer} API rather than the legacy
+ * {@code CommandDispatch} one, for one reason: the legacy handler is only handed
+ * {@code src}, which over MNN is the <i>serve key</i> — the name that was
+ * addressed, not the party that addressed it. Comparing it to {@code "moymoy"},
+ * as this class used to, is not an authorization check at all: it succeeds for
+ * anyone who can reach the name, and the connector's own G1 gate only narrows
+ * that to "some CS backend or connector". Any other CS backend on the Hub could
+ * therefore have consumed any player's emeralds here.
+ *
+ * <p>{@link MnnRequest#caller()} is the Hub's authenticated statement of who
+ * sent the request, stamped after stripping whatever the client sent under the
+ * same name. {@link #ALLOWED_CALLER} pins it to the one backend whose ledger
+ * turns a consumption into wallet balance. Everything else — another CS backend,
+ * an {@code exsoft:} connector, a {@code user:} session, or an unattributed
+ * {@code null} — is refused with nothing consumed.
  *
  * <p>Idempotency: {@code op_id} consumption is claimed in a persistent
  * {@link EmeraldOpStore} only after a successful consume, so a transient failure
  * (player offline / no emeralds) is retryable, and a replay of a settled op re-acks
  * the same consumed amount without consuming again — surviving a server restart.
  */
-public final class MoyMoyExtension implements CommandDispatch.Handler {
+public final class MoyMoyExtension implements MnnHandler {
 
     private static final Logger LOGGER = LogUtils.getLogger();
 
-    /** The backend identity (cert SAN, stamped by the Hub as `src`) allowed to
-     *  issue commands — the wallet backend's command-bus cert `mcserver_id`. */
-    private static final String ALLOWED_SRC = "moymoy";
-
-    /** cs-host the reply is addressed to. The backend claims `charge.moymoy` on
-     *  its command-bus connection (a SIBLING of its wallet's `wallet.moymoy`), so
-     *  we reply to this sub-host — NOT the received `src` (which is the cert id
-     *  `moymoy`, whose `moymoy.cs.mnn` the backend does not claim). The sidecar
-     *  routes `reply.reply("charge.moymoy", …)` as `charge.moymoy.cs.mnn`. */
-    private static final String REPLY_HOST = "charge.moymoy";
+    /**
+     * The one caller whose consume requests are honoured.
+     *
+     * <p>{@code cs:} is the kind the Hub stamps for a Central-Server backend
+     * ({@link MnnRequest#CALLER_KIND_CS}); {@code app.moymoy} is the identity the
+     * MochiOS app-backend launcher mints for {@code app_backends/moymoy/} and
+     * registers the {@code moymoy} cs-host under (MochiOS
+     * {@code hub/server/src/launcher/mod.rs} → {@code app_service_name}, i.e.
+     * {@code "app." + <dir name>}). That directory name is fixed by MoyMoy's own
+     * {@code tools/deploy-backend.ps1}, and the wallet backend authenticates its
+     * tunnel with the launcher-minted per-process identity token
+     * ({@code MOCHI_SVC_IDENTITY_TOKEN}, see {@code server/moymoy-cs/src/tunnel.rs}),
+     * so this is the string the Hub derives for it.
+     *
+     * <p>A constant rather than a config key on purpose: making it settable would
+     * turn "which backend may spend my players' emeralds" into something a server
+     * operator can widen by accident, and there is exactly one right answer.
+     */
+    private static final String ALLOWED_CALLER =
+            MnnRequest.CALLER_KIND_CS + "app.moymoy";
 
     /** Bounds a single charge against a hostile/buggy backend. */
     private static final int MAX_AMOUNT = 1_000_000_000;
@@ -67,144 +96,170 @@ public final class MoyMoyExtension implements CommandDispatch.Handler {
     }
 
     @Override
-    public void handle(String src, byte[] data, CommandDispatch.Replier reply) {
+    public CompletableFuture<MnnResponse> handle(MnnRequest req) {
         JsonObject cmd;
         String verb;
         try {
-            cmd = JsonParser.parseString(new String(data, StandardCharsets.UTF_8)).getAsJsonObject();
+            cmd = JsonParser.parseString(req.bodyAsString()).getAsJsonObject();
             verb = optString(cmd, "verb");
         } catch (RuntimeException e) {
-            LOGGER.warn("moymoy: malformed command dropped from src '{}': {}", src, e.toString());
-            return;
+            LOGGER.warn("moymoy: malformed request dropped from caller '{}': {}",
+                    describe(req.caller()), e.toString());
+            return completed(MnnResponse.status(400));
         }
 
-        // Guard the whole flow against ANY Throwable so a single faulty command
+        // Authorize the CALLER before anything is consumed, and before the verb
+        // is even dispatched — a refusal after a consume would be no refusal.
+        if (!ALLOWED_CALLER.equals(req.caller())) {
+            LOGGER.warn("moymoy: refusing '{}' from caller '{}' — only the MoyMoy wallet backend "
+                    + "({}) may consume a player's emeralds", verb, describe(req.caller()), ALLOWED_CALLER);
+            return completed(refusal(cmd));
+        }
+
+        // Guard the whole flow against ANY Throwable so a single faulty request
         // cannot take down the shared connector IO thread (PiggleShop hardening).
         try {
             switch (verb) {
-                case "emerald.charge" -> handleCharge(src, cmd, reply);
-                case "inventory.query" -> handleInventory(src, cmd, reply);
-                default -> {
+                case "emerald.charge":
+                    return handleCharge(cmd);
+                case "inventory.query":
+                    return handleInventory(cmd);
+                default: {
                     String opId = optString(cmd, "op_id");
                     if (!opId.isEmpty()) {
-                        ackCharge(reply, opId, "unknown_verb", 0);
-                    } else {
-                        LOGGER.warn("moymoy: unknown verb '{}' from src '{}'", verb, src);
+                        return completed(ack(opId, "unknown_verb", 0));
                     }
+                    LOGGER.warn("moymoy: unknown verb '{}'", verb);
+                    return completed(MnnResponse.status(400));
                 }
             }
         } catch (Throwable t) {
-            LOGGER.error("moymoy: handler crashed (verb '{}', src '{}')", verb, src, t);
-            try {
-                String opId = optString(cmd, "op_id");
-                if (!opId.isEmpty()) {
-                    ackCharge(reply, opId, "internal_error", 0);
-                }
-            } catch (Throwable ackFailure) {
-                LOGGER.error("moymoy: failed to ack internal_error", ackFailure);
-            }
+            LOGGER.error("moymoy: handler crashed (verb '{}')", verb, t);
+            String opId = optString(cmd, "op_id");
+            return completed(opId.isEmpty()
+                    ? MnnResponse.status(500)
+                    : ack(opId, "internal_error", 0));
         }
+    }
+
+    /**
+     * The answer an unauthorized caller gets.
+     *
+     * <p>A charge (it carries an {@code op_id}) gets a {@code 200} with the
+     * ordinary {@code unauthorized} ack, because that is what makes the refusal
+     * <b>terminal</b> for the ledger on the other side: a non-2xx would be read
+     * as "the exchange failed with consumption unknown" and re-driven for a day
+     * before being escalated for manual review, which is exactly the wrong thing
+     * to say about a request that never touched an inventory.
+     *
+     * <p>Anything else gets a {@code 403}. An {@code inventory.query} in
+     * particular must NOT get a 200 with no counts: the caller's parser reads a
+     * missing {@code online} as "found, and they own nothing", turning a refusal
+     * into a believable zero balance.
+     */
+    private static MnnResponse refusal(JsonObject cmd) {
+        String opId = optString(cmd, "op_id");
+        return opId.isEmpty() ? MnnResponse.status(403) : ack(opId, "unauthorized", 0);
     }
 
     // ── emerald.charge ───────────────────────────────────────────────────────
 
-    private void handleCharge(String src, JsonObject cmd, CommandDispatch.Replier reply) {
+    private CompletableFuture<MnnResponse> handleCharge(JsonObject cmd) {
         String opId = optString(cmd, "op_id");
         if (opId.isEmpty()) {
-            LOGGER.warn("moymoy: charge without op_id from src '{}' (dropped)", src);
-            return;
-        }
-        if (!ALLOWED_SRC.equals(src)) {
-            LOGGER.warn("moymoy: rejected charge from unauthorized src '{}' (op {})", src, opId);
-            ackCharge(reply, opId, "unauthorized", 0);
-            return;
+            LOGGER.warn("moymoy: charge without op_id (dropped)");
+            return completed(MnnResponse.status(400));
         }
         UUID uuid = parseUuid(optString(cmd, "target_uuid"));
         int amount = optInt(cmd, "amount");
         if (uuid == null || amount <= 0 || amount > MAX_AMOUNT) {
-            ackCharge(reply, opId, "bad_request", 0);
-            return;
+            return completed(ack(opId, "bad_request", 0));
         }
 
         // Replay of a settled op ⇒ re-ack the same consumed amount (no re-consume).
         EmeraldOpStore store = EmeraldOpStore.get(server);
         Integer prior = store.recorded(opId);
         if (prior != null) {
-            ackCharge(reply, opId, "duplicate", prior);
-            return;
+            return completed(ack(opId, "duplicate", prior));
         }
 
-        // Consume atomically on the server thread. handle() runs on the connector
-        // IO thread, so blocking on the future does not deadlock the server.
-        Integer consumed = server.submit(() -> {
+        // Consume atomically on the server thread. Returning the future instead
+        // of joining on it keeps the connector IO thread free (MnnHandler's whole
+        // reason for being async) — the answer is sent once the hop completes.
+        return server.submit(() -> {
             ServerPlayer player = server.getPlayerList().getPlayer(uuid);
             if (player == null) {
                 return null; // offline — retryable
             }
             return EmeraldUtil.consume(player, amount);
-        }).join();
-
-        if (consumed == null) {
-            ackCharge(reply, opId, "player_offline", 0);
-            return;
-        }
-        if (consumed <= 0) {
-            // No emeralds to consume — retryable (the player may acquire some).
-            ackCharge(reply, opId, "insufficient_emeralds", 0);
-            return;
-        }
-
-        store.record(opId, consumed); // claim only after a real consume
-        LOGGER.info("moymoy: charged op {} → {} consumed {} エメ", opId, uuid, consumed);
-        ackCharge(reply, opId, "ok", consumed);
+        }).thenApply(consumed -> {
+            if (consumed == null) {
+                return ack(opId, "player_offline", 0);
+            }
+            if (consumed <= 0) {
+                // No emeralds to consume — retryable (the player may acquire some).
+                return ack(opId, "insufficient_emeralds", 0);
+            }
+            store.record(opId, consumed); // claim only after a real consume
+            LOGGER.info("moymoy: charged op {} → {} consumed {} エメ", opId, uuid, consumed);
+            return ack(opId, "ok", consumed);
+        });
     }
 
     // ── inventory.query ──────────────────────────────────────────────────────
 
-    private void handleInventory(String src, JsonObject cmd, CommandDispatch.Replier reply) {
+    private CompletableFuture<MnnResponse> handleInventory(JsonObject cmd) {
         String reqId = optString(cmd, "req_id");
-        if (reqId.isEmpty() || !ALLOWED_SRC.equals(src)) {
-            return; // nothing to reply to / unauthorized — drop silently
+        if (reqId.isEmpty()) {
+            return completed(MnnResponse.status(400));
         }
         UUID uuid = parseUuid(optString(cmd, "target_uuid"));
         if (uuid == null) {
-            return;
+            return completed(MnnResponse.status(400));
         }
-        int[] inv = server.submit(() -> {
+        return server.submit(() -> {
             ServerPlayer player = server.getPlayerList().getPlayer(uuid);
             return player == null ? null : EmeraldUtil.count(player);
-        }).join();
-
-        JsonObject o = new JsonObject();
-        o.addProperty("req_id", reqId);
-        if (inv == null) {
-            // No live player on THIS server for that UUID — the app's gameUuid does
-            // not match a logged-in player (offline, or an online/offline-mode UUID
-            // mismatch). Logged so a "0 emeralds" report is diagnosable.
-            LOGGER.info("moymoy: inventory.query {} — no online player for that UUID "
-                    + "(offline or UUID mismatch); replying online=false", uuid);
-            o.addProperty("online", false);
-            o.addProperty("emeralds", 0);
-            o.addProperty("blocks", 0);
-        } else {
-            LOGGER.info("moymoy: inventory.query {} — {} emeralds + {} blocks", uuid, inv[0], inv[1]);
-            o.addProperty("online", true);
-            o.addProperty("emeralds", inv[0]);
-            o.addProperty("blocks", inv[1]);
-        }
-        reply.reply(REPLY_HOST, o.toString().getBytes(StandardCharsets.UTF_8));
+        }).thenApply(inv -> {
+            JsonObject o = new JsonObject();
+            o.addProperty("req_id", reqId);
+            if (inv == null) {
+                // No live player on THIS server for that UUID — the attested
+                // character is not logged in here (they moved servers, or logged
+                // out). Logged so a "0 emeralds" report is diagnosable.
+                LOGGER.info("moymoy: inventory.query {} — no online player for that UUID; "
+                        + "replying online=false", uuid);
+                o.addProperty("online", false);
+                o.addProperty("emeralds", 0);
+                o.addProperty("blocks", 0);
+            } else {
+                LOGGER.info("moymoy: inventory.query {} — {} emeralds + {} blocks", uuid, inv[0], inv[1]);
+                o.addProperty("online", true);
+                o.addProperty("emeralds", inv[0]);
+                o.addProperty("blocks", inv[1]);
+            }
+            return MnnResponse.json(o.toString());
+        });
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    private static void ackCharge(CommandDispatch.Replier reply, String opId,
-                                  String status, int settled) {
+    /** The settlement ack, as this request's own HTTP response. */
+    private static MnnResponse ack(String opId, String status, int settled) {
         JsonObject o = new JsonObject();
         o.addProperty("op_id", opId);
         o.addProperty("status", status);
         o.addProperty("settled", settled);
-        // Reply to the backend's charge sub-host (see REPLY_HOST), not the src.
-        reply.reply(REPLY_HOST, o.toString().getBytes(StandardCharsets.UTF_8));
+        return MnnResponse.json(o.toString());
+    }
+
+    private static CompletableFuture<MnnResponse> completed(MnnResponse resp) {
+        return CompletableFuture.completedFuture(resp);
+    }
+
+    /** A caller for a log line — {@code null} means the Hub vouched for nobody. */
+    private static String describe(String caller) {
+        return caller == null ? "<unattributed>" : caller;
     }
 
     private static UUID parseUuid(String s) {

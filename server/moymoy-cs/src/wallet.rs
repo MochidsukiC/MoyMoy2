@@ -368,7 +368,10 @@ pub fn merchants(conn: &Connection) -> rusqlite::Result<Vec<Merchant>> {
 }
 
 /// Resolve a merchant_id to its backing account_id + display name.
-pub fn merchant_account(conn: &Connection, merchant_id: &str) -> rusqlite::Result<Option<(String, String)>> {
+pub fn merchant_account(
+    conn: &Connection,
+    merchant_id: &str,
+) -> rusqlite::Result<Option<(String, String)>> {
     conn.query_row(
         "SELECT account_id, name FROM merchants WHERE merchant_id = ?1",
         [merchant_id],

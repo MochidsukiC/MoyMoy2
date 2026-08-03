@@ -1,13 +1,23 @@
-//! In-world MC link — **HTTP in MNN** to the emerald mod on the player's live
-//! Minecraft server (MochiOS DEV.md §7.3.10).
+//! In-world MC link — **HTTP in MNN** to the emerald mod on the Minecraft server
+//! the user's consent named (MochiOS DEV.md §7.3.10).
 //!
 //! Both directions ride the backend's OWN reverse cs tunnel — the same one that
 //! makes `moymoy.cs.mnn` reachable. A request goes out as an ordinary
-//! `POST http://moymoy.<mc-uuid>.minecraft.auto.mnn/`; the Hub resolves the
-//! character through the presence directory to their live server, rewrites the
-//! target to `moymoy.<connector_id>.mnn`, and relays it to that server's
+//! `POST http://moymoy.<attester_id>.mnn/` and the Hub relays it to that server's
 //! connector, which hands it to the mod. **The mod's answer is the HTTP
 //! response.**
+//!
+//! ## Why the address is direct, not auto-routed
+//!
+//! This used to be `moymoy.<mc-uuid>.minecraft.auto.mnn` — the Hub resolved the
+//! character through the presence directory and picked the server. That made the
+//! DESTINATION a live lookup, re-evaluated on every send: a consume the user
+//! approved while on one server could be delivered to whichever server the
+//! directory named by the time the request (or a reconciliation re-send hours
+//! later) actually went out. Since G4 the destination comes from the same signed
+//! assertion that authorized the consume, so the server the user consented to is
+//! the server that is asked, and it stays that server across every retry (which
+//! is why `emerald_ops.attester_id` is persisted).
 //!
 //! ## What this replaced
 //!
@@ -39,6 +49,9 @@ use mochi_hub_cs_sdk::{CsHttpResponse, CsHttpSender, HttpSendError};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::attest::core::{parse_pubkey_document, PublicKey};
+use crate::attest::pubkey_url as attest_pubkey_url;
+
 /// Deadline for one charge round-trip. Deliberately LONGER than the connector
 /// sidecar's own 30 s mod deadline so the honest `504` it synthesises wins the
 /// race: a local timeout would leave consumption unknowable, while the sidecar's
@@ -51,6 +64,12 @@ const CHARGE_TIMEOUT: Duration = Duration::from_secs(35);
 /// a charge there is no ambiguity to protect against.)
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Deadline for fetching the Hub's attestation public key. Short: it is a
+/// Hub-terminated directory read with no game server in the path, and a slow one
+/// stalls a user waiting on a charge. Failing means the assertion is refused as
+/// `attest_unavailable`, which a retry resolves.
+const PUBKEY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Outcome of asking the mod to consume emeralds.
 ///
 /// The variants exist to keep **whether emeralds may have been consumed**
@@ -61,9 +80,11 @@ pub enum ChargeOutcome {
     /// The mod answered. The value is its settlement ack (`{op_id, status,
     /// settled}`) — feed it to `charge::settle_ack`.
     Acked(Value),
-    /// The Hub could not route the character to a live server (404). Nothing
-    /// reached a server, so nothing was consumed.
-    PlayerOffline,
+    /// The Hub had no live connector for that server (404/503). The address is a
+    /// fixed server now, not a character lookup, so this means "that server is
+    /// not connected", not "the player is offline". Either way the Hub decided it
+    /// before dialing anyone, so nothing was consumed.
+    ServerUnreachable,
     /// Nothing left this process (the tunnel is down, or the request could not be
     /// built). Nothing was consumed.
     NotSent,
@@ -96,10 +117,14 @@ impl McLink {
         self.sender.is_connected()
     }
 
-    /// Ask the mod to consume `amount` emeralds for `uuid`, and read its
-    /// settlement ack off the response.
+    /// Ask the mod on `attester_id` to consume `amount` emeralds for `uuid`, and
+    /// read its settlement ack off the response.
+    ///
+    /// `attester_id` is the server the user's signed assertion named — see the
+    /// module docs for why the destination is carried rather than looked up.
     pub async fn send_charge(
         &self,
+        attester_id: &str,
         uuid: &Uuid,
         op_id: &str,
         idem_key: &str,
@@ -112,7 +137,7 @@ impl McLink {
             "target_uuid": uuid.to_string(),
             "amount": amount,
         });
-        let url = auto_url(uuid);
+        let url = direct_url(attester_id);
         let resp = match self.post(&url, &payload, CHARGE_TIMEOUT).await {
             Ok(r) => r,
             Err(e) => return charge_send_failure(&url, op_id, e),
@@ -120,14 +145,14 @@ impl McLink {
 
         let body = String::from_utf8_lossy(&resp.body).into_owned();
         if !is_success(resp.status) {
-            // 404 (no live server hosts this character) and 503 (the resolved
-            // server has no live node) are both decided by the Hub BEFORE any
-            // server is dialed, so they are the two statuses that provably
-            // consumed nothing. Anything else got at least as far as a connector.
+            // 404 (nothing claims that server's zone) and 503 (the claim has no
+            // live node) are both decided by the Hub BEFORE any server is dialed,
+            // so they are the two statuses that provably consumed nothing.
+            // Anything else got at least as far as a connector.
             if resp.status == 404 || resp.status == 503 {
                 tracing::info!(%url, op_id, status = resp.status, %body,
-                    "charge not routable — character is on no live server (nothing consumed)");
-                return ChargeOutcome::PlayerOffline;
+                    "charge not routable — that server's connector is not live (nothing consumed)");
+                return ChargeOutcome::ServerUnreachable;
             }
             tracing::warn!(%url, op_id, status = resp.status, %body,
                 "charge failed past the Hub — consumption is UNKNOWN; leaving the op for reconciliation");
@@ -151,7 +176,8 @@ impl McLink {
         }
     }
 
-    /// Round-trip the character's chargeable inventory through the mod.
+    /// Round-trip the character's chargeable inventory through the mod on
+    /// `attester_id`.
     ///
     /// Returns `Some((online, emeralds, blocks))` when the mod answered —
     /// `online` distinguishes "this character is a live player there" (real
@@ -161,7 +187,11 @@ impl McLink {
     /// (tunnel down, not routable, or no answer within the deadline). Callers
     /// MUST keep these three states distinct rather than collapsing them into
     /// "0 emeralds".
-    pub async fn query_inventory(&self, uuid: &Uuid) -> Option<(bool, i64, i64)> {
+    pub async fn query_inventory(
+        &self,
+        attester_id: &str,
+        uuid: &Uuid,
+    ) -> Option<(bool, i64, i64)> {
         let payload = serde_json::json!({
             // The mod silently drops a query with an empty req_id, so it is still
             // sent — but nothing here matches on it any more: the answer arrives
@@ -170,12 +200,12 @@ impl McLink {
             "verb": "inventory.query",
             "target_uuid": uuid.to_string(),
         });
-        let url = auto_url(uuid);
+        let url = direct_url(attester_id);
         let resp = match self.post(&url, &payload, INVENTORY_TIMEOUT).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(%url, error = %e,
-                    "inventory.query failed — character offline, the server doesn't host moymoy, or the tunnel is down");
+                    "inventory.query failed — that server's connector is down, it doesn't host moymoy, or our tunnel is down");
                 return None;
             }
         };
@@ -199,6 +229,26 @@ impl McLink {
         Some((online, emeralds, blocks))
     }
 
+    /// Fetch the Hub's Ed25519 attestation public key from the directory zone.
+    ///
+    /// This half is the transport only: the document's shape is parsed by
+    /// `attest::core::parse_pubkey_document`, which is where every other consumer
+    /// of the platform's attestation will read it too. Every failure is an `Err`
+    /// carrying why; `crate::attest` turns that into `attest_unavailable` and
+    /// refuses the assertion. There is no "assume the key" branch.
+    pub async fn fetch_attest_pubkey(&self) -> Result<PublicKey, String> {
+        let url = attest_pubkey_url();
+        let resp = self
+            .get(&url, PUBKEY_TIMEOUT)
+            .await
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        if !is_success(resp.status) {
+            let body = String::from_utf8_lossy(&resp.body);
+            return Err(format!("GET {url}: HTTP {} ({body})", resp.status));
+        }
+        parse_pubkey_document(&resp.body).map_err(|e| format!("{url}: {e}"))
+    }
+
     /// POST `payload` as JSON to `url` with a deadline. A timeout is reported as
     /// [`HttpSendError::Http`] so the caller classifies it the same way as any
     /// other mid-exchange failure (the request was already on the wire).
@@ -219,14 +269,30 @@ impl McLink {
             ))),
         }
     }
+
+    /// GET `url` with a deadline (bodyless request, same tunnel as [`post`]).
+    async fn get(&self, url: &str, deadline: Duration) -> Result<CsHttpResponse, HttpSendError> {
+        match tokio::time::timeout(deadline, self.sender.request("GET", url, &[], Vec::new())).await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => Err(HttpSendError::Http(format!(
+                "no answer within {}s",
+                deadline.as_secs()
+            ))),
+        }
+    }
 }
 
-/// The auto-route address of the mod on whichever server `uuid` is playing on:
-/// `<identifier>.<player>.<title>.auto.mnn` (>=5 labels, right-anchored). The
-/// identifier `moymoy` is the mod's serve key; the path is `/` because the mod
-/// dispatches on the payload's `verb`, not on the URL.
-fn auto_url(uuid: &Uuid) -> String {
-    format!("http://moymoy.{uuid}.minecraft.auto.mnn/")
+/// The direct address of the mod on the server the assertion named:
+/// `<identifier>.<server_id>.mnn` (3 labels, right-anchored). The identifier
+/// `moymoy` is the mod's serve key; the path is `/` because the mod dispatches on
+/// the payload's `verb`, not on the URL.
+///
+/// `attester_id` reaches here only out of signed claims that
+/// `crate::attest::check_claims` already held to a single routable LDH label, so
+/// it cannot introduce a second host or a reserved zone into the name.
+fn direct_url(attester_id: &str) -> String {
+    format!("http://moymoy.{attester_id}.mnn/")
 }
 
 fn is_success(status: u16) -> bool {
@@ -269,12 +335,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_auto_url_is_the_five_label_auto_route_form() {
-        let uuid = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
-        assert_eq!(
-            auto_url(&uuid),
-            "http://moymoy.11111111-2222-4333-8444-555555555555.minecraft.auto.mnn/"
-        );
+    fn the_direct_url_is_the_three_label_direct_form() {
+        // `<serve_key>.<server_id>.mnn` — the Hub reads the middle label as the
+        // connector zone. A fourth label (or a reserved one) would route
+        // somewhere else entirely, which is why `attest::check_claims` pins the
+        // shape before an id can reach here.
+        assert_eq!(direct_url("mc1"), "http://moymoy.mc1.mnn/");
+        assert_eq!(direct_url("my-server-2"), "http://moymoy.my-server-2.mnn/");
     }
 
     #[test]

@@ -5,9 +5,13 @@
 //!
 //! Identity (v2): callers authenticate with a MoyMoy account (handle + PIN — see
 //! [`crate::auth`]). Wallet endpoints resolve the account from the
-//! `X-MoyMoy-Session` header via the [`AuthedAccount`] extractor — no more
-//! self-asserted mc_uuid. The Minecraft UUID is supplied only for charge /
-//! inventory (the character whose emeralds to consume).
+//! `X-MoyMoy-Session` header via the [`AuthedAccount`] extractor.
+//!
+//! **The session is the only thing that says whose wallet this is.** Since v5 a
+//! Hub-signed assertion ([`crate::attest`]) decides the separate question of
+//! which in-world character's emeralds a request may consume — the app no longer
+//! asserts an `mc_uuid` of its own, and an assertion is never accepted in place
+//! of a session. See the `attest` module docs for the full boundary.
 //!
 //! Endpoints:
 //!   GET  /healthz
@@ -21,10 +25,12 @@
 //!   GET  /wallet/history?limit=&filter=  (auth)
 //!   GET  /wallet/friends  (auth)
 //!   GET  /wallet/merchants (auth)
-//!   GET  /wallet/inventory?mc_uuid=&mcid= (auth; mod-backed)
+//!   POST /wallet/attest/challenge {purpose}   (auth)
+//!   POST /wallet/attest/session   {assertion} (auth — confirm the character)
+//!   GET  /wallet/inventory (auth; mod-backed, no query args)
 //!   POST /wallet/send     {idem_key, to_handle, amount}            (auth)
 //!   POST /wallet/pay      {idem_key, merchant_id, amount}          (auth)
-//!   POST /wallet/charge   {idem_key, amount, mc_uuid, mcid?}       (auth)
+//!   POST /wallet/charge   {idem_key, amount, assertion?}           (auth)
 //!   GET  /wallet/op?op_id=                                         (auth)
 
 use std::sync::Arc;
@@ -38,9 +44,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::attest::{self, AttestPurpose, AttestVerifier, ChallengeStore, CharSessionStore};
 use crate::auth::{self, AuthedAccount, CredsOutcome, RegisterOutcome, VerifiedSignup};
 use crate::charge::ChargeCoordinator;
-use crate::db::{self, Pool};
+use crate::db::{self, now_ms, Pool};
 use crate::error::ApiError;
 use crate::identity;
 use crate::otp::{self, CreateOtp, Mailer, PendingSignup, VerifyOtp};
@@ -52,6 +59,12 @@ pub struct AppState {
     pub pool: Pool,
     pub charge: Arc<ChargeCoordinator>,
     pub mailer: Mailer,
+    /// Verifies Hub-signed host attestations (holds the fetched public key).
+    pub attest: Arc<AttestVerifier>,
+    /// Anti-replay nonces for those assertions.
+    pub challenges: Arc<ChallengeStore>,
+    /// The character each account most recently confirmed (inventory reads).
+    pub char_sessions: Arc<CharSessionStore>,
 }
 
 impl AppState {
@@ -92,6 +105,10 @@ pub fn router(state: AppState) -> Router {
         .route("/wallet/history", get(history))
         .route("/wallet/friends", get(friends))
         .route("/wallet/merchants", get(merchants))
+        // Host attestation (DEV.md §7.3.10 G4): challenge → assertion → the
+        // character whose emeralds may be consumed.
+        .route("/wallet/attest/challenge", post(attest_challenge))
+        .route("/wallet/attest/session", post(attest_session))
         .route("/wallet/inventory", get(inventory))
         .route("/wallet/send", post(send))
         .route("/wallet/pay", post(pay))
@@ -144,12 +161,22 @@ async fn register(
     if !st.email_enabled() {
         let value = blocking(st.pool, move |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let outcome = auth::register(&tx, &req.handle, &req.display_name, &req.pin, req.phone_id.as_deref())?;
+            let outcome = auth::register(
+                &tx,
+                &req.handle,
+                &req.display_name,
+                &req.pin,
+                req.phone_id.as_deref(),
+            )?;
             let v = match outcome {
-                RegisterOutcome::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
+                RegisterOutcome::Ok(m) => {
+                    json!({ "ok": true, "session": m.token, "account": m.account })
+                }
                 RegisterOutcome::BadHandle => json!({ "ok": false, "error": "bad_handle" }),
                 RegisterOutcome::BadPin => json!({ "ok": false, "error": "bad_pin" }),
-                RegisterOutcome::BadDisplayName => json!({ "ok": false, "error": "bad_display_name" }),
+                RegisterOutcome::BadDisplayName => {
+                    json!({ "ok": false, "error": "bad_display_name" })
+                }
                 RegisterOutcome::HandleTaken => json!({ "ok": false, "error": "handle_taken" }),
             };
             tx.commit()?;
@@ -208,19 +235,25 @@ async fn register(
     match start {
         SignupStart::HandleTaken => Ok(Json(json!({ "ok": false, "error": "handle_taken" }))),
         SignupStart::EmailTaken => Ok(Json(json!({ "ok": false, "error": "email_taken" }))),
-        SignupStart::TooSoon(ms) => Ok(Json(json!({ "ok": false, "error": "too_soon", "retry_after_ms": ms }))),
+        SignupStart::TooSoon(ms) => Ok(Json(
+            json!({ "ok": false, "error": "too_soon", "retry_after_ms": ms }),
+        )),
         SignupStart::Issued(code) => {
             if let Err(e) = st.mailer.send(&email, &code, otp::PURPOSE_SIGNUP).await {
                 // Roll back the OTP so the resend cooldown doesn't strand the user.
                 let el = email_lower.clone();
                 if let Err(re) = blocking(st.pool.clone(), move |conn| {
                     otp::revoke(conn, otp::PURPOSE_SIGNUP, &el)
-                }).await {
+                })
+                .await
+                {
                     tracing::warn!(error = %re, "failed to roll back undelivered signup OTP");
                 }
                 return Err(e);
             }
-            Ok(Json(json!({ "ok": true, "pending": "verify_email", "email": email })))
+            Ok(Json(
+                json!({ "ok": true, "pending": "verify_email", "email": email }),
+            ))
         }
     }
 }
@@ -249,11 +282,20 @@ async fn register_verify(
                 // A corrupt/missing payload is a server fault, not a wrong code.
                 // Returning 500 here rolls back the transaction so the OTP is not
                 // consumed, allowing the user to retry with a fresh resend.
-                let raw = payload.ok_or_else(|| ApiError::internal("signup OTP missing payload"))?;
+                let raw =
+                    payload.ok_or_else(|| ApiError::internal("signup OTP missing payload"))?;
                 let pending: PendingSignup = serde_json::from_str(&raw)
                     .map_err(|e| ApiError::internal(format!("corrupt signup payload: {e}")))?;
-                match auth::register_verified(&tx, &pending, &email, &email_lower, req.phone_id.as_deref())? {
-                    VerifiedSignup::Ok(m) => json!({ "ok": true, "session": m.token, "account": m.account }),
+                match auth::register_verified(
+                    &tx,
+                    &pending,
+                    &email,
+                    &email_lower,
+                    req.phone_id.as_deref(),
+                )? {
+                    VerifiedSignup::Ok(m) => {
+                        json!({ "ok": true, "session": m.token, "account": m.account })
+                    }
                     VerifiedSignup::HandleTaken => json!({ "ok": false, "error": "handle_taken" }),
                     VerifiedSignup::EmailTaken => json!({ "ok": false, "error": "email_taken" }),
                 }
@@ -278,7 +320,11 @@ enum LoginStart {
     Terminal(Value),
     /// `email_lower` mirrors the key passed to `otp::create` so the revoke on
     /// SMTP failure uses the identical key (symmetry with register and recover).
-    TwoFactor { email: String, email_lower: String, code: Option<String> },
+    TwoFactor {
+        email: String,
+        email_lower: String,
+        code: Option<String>,
+    },
 }
 
 /// Login step 1: verify handle + PIN. If the account has a verified email and
@@ -318,7 +364,11 @@ async fn login(
 
     match start {
         LoginStart::Terminal(v) => Ok(Json(v)),
-        LoginStart::TwoFactor { email, email_lower, code } => {
+        LoginStart::TwoFactor {
+            email,
+            email_lower,
+            code,
+        } => {
             if let Some(c) = code {
                 if let Err(e) = st.mailer.send(&email, &c, otp::PURPOSE_LOGIN2FA).await {
                     // Use the same email_lower key that otp::create used, not a
@@ -326,13 +376,17 @@ async fn login(
                     // targets the right row even on data-inconsistency edge cases.
                     if let Err(re) = blocking(st.pool.clone(), move |conn| {
                         otp::revoke(conn, otp::PURPOSE_LOGIN2FA, &email_lower)
-                    }).await {
+                    })
+                    .await
+                    {
                         tracing::warn!(error = %re, "failed to roll back undelivered 2FA OTP");
                     }
                     return Err(e);
                 }
             }
-            Ok(Json(json!({ "ok": true, "pending": "2fa", "email": email })))
+            Ok(Json(
+                json!({ "ok": true, "pending": "2fa", "email": email }),
+            ))
         }
     }
 }
@@ -351,7 +405,14 @@ async fn login_verify(
 ) -> Result<Json<Value>, ApiError> {
     let value = blocking(st.pool, move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let v = finish_otp_session(&tx, otp::PURPOSE_LOGIN2FA, &req.handle, &req.code, None, req.phone_id.as_deref())?;
+        let v = finish_otp_session(
+            &tx,
+            otp::PURPOSE_LOGIN2FA,
+            &req.handle,
+            &req.code,
+            None,
+            req.phone_id.as_deref(),
+        )?;
         tx.commit()?;
         Ok::<Value, ApiError>(v)
     })
@@ -371,18 +432,30 @@ async fn recover_start(
     Json(req): Json<RecoverStartReq>,
 ) -> Result<Json<Value>, ApiError> {
     if !st.email_enabled() {
-        return Ok(Json(json!({ "ok": false, "error": "recovery_unavailable" })));
+        return Ok(Json(
+            json!({ "ok": false, "error": "recovery_unavailable" }),
+        ));
     }
     let created = blocking(st.pool.clone(), move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let out = match auth::account_full_by_handle(&tx, &req.handle)? {
             Some(info) if info.email_verified && info.email_lower.is_some() => {
                 let el = info.email_lower.clone().unwrap_or_default();
-                match otp::create(&tx, otp::PURPOSE_RECOVERY, &el, Some(&info.account_id), None)? {
+                match otp::create(
+                    &tx,
+                    otp::PURPOSE_RECOVERY,
+                    &el,
+                    Some(&info.account_id),
+                    None,
+                )? {
                     // Carry `el` (the key used for OTP creation) alongside the
                     // display email so the revoke below uses the identical key.
-                    CreateOtp::Issued(code) => Some((info.email.clone().unwrap_or_default(), el, Some(code))),
-                    CreateOtp::TooSoon { .. } => Some((info.email.clone().unwrap_or_default(), el, None)),
+                    CreateOtp::Issued(code) => {
+                        Some((info.email.clone().unwrap_or_default(), el, Some(code)))
+                    }
+                    CreateOtp::TooSoon { .. } => {
+                        Some((info.email.clone().unwrap_or_default(), el, None))
+                    }
                 }
             }
             _ => None,
@@ -404,7 +477,9 @@ async fn recover_start(
             let el = email_lower.clone();
             if let Err(re) = blocking(st.pool.clone(), move |conn| {
                 otp::revoke(conn, otp::PURPOSE_RECOVERY, &el)
-            }).await {
+            })
+            .await
+            {
                 tracing::warn!(error = %re, "failed to roll back undelivered recovery OTP");
             }
         }
@@ -427,7 +502,14 @@ async fn recover_verify(
 ) -> Result<Json<Value>, ApiError> {
     let value = blocking(st.pool, move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let v = finish_otp_session(&tx, otp::PURPOSE_RECOVERY, &req.handle, &req.code, Some(req.new_pin.as_str()), req.phone_id.as_deref())?;
+        let v = finish_otp_session(
+            &tx,
+            otp::PURPOSE_RECOVERY,
+            &req.handle,
+            &req.code,
+            Some(req.new_pin.as_str()),
+            req.phone_id.as_deref(),
+        )?;
         tx.commit()?;
         Ok::<Value, ApiError>(v)
     })
@@ -473,7 +555,9 @@ fn finish_otp_session(
                 // an internal error so the tx rolls back (OTP not burned) and the
                 // user can retry, mirroring register_verify's server-fault path.
                 if !auth::set_pin(tx, &info.account_id, pin)? {
-                    return Err(ApiError::internal("set_pin rejected an already-validated PIN"));
+                    return Err(ApiError::internal(
+                        "set_pin rejected an already-validated PIN",
+                    ));
                 }
             }
             let token = auth::create_session(tx, &info.account_id, phone_id)?;
@@ -501,13 +585,14 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<V
     Ok(Json(json!({ "ok": true })))
 }
 
+/// The signed-in account. No `linked_mc`: character ownership is not a stored
+/// property of an account any more (schema v5), and reporting the last-charged
+/// UUID as "your linked character" would state a relationship nothing maintains.
 async fn me(State(st): State<AppState>, acct: AuthedAccount) -> Result<Json<Value>, ApiError> {
     let id = acct.account_id;
-    let (info, links) = blocking(st.pool, move |conn| {
-        let info = auth::account_full(conn, &id)?
-            .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
-        let links = identity::linked_mc(conn, &id)?;
-        Ok::<_, ApiError>((info, links))
+    let info = blocking(st.pool, move |conn| {
+        auth::account_full(conn, &id)?
+            .ok_or_else(|| ApiError::unauthorized("account no longer exists"))
     })
     .await?;
     Ok(Json(json!({
@@ -515,7 +600,6 @@ async fn me(State(st): State<AppState>, acct: AuthedAccount) -> Result<Json<Valu
         "account": { "account_id": info.account_id, "handle": info.handle, "display_name": info.display_name },
         "email": info.email,
         "email_verified": info.email_verified,
-        "linked_mc": links,
     })))
 }
 
@@ -599,17 +683,17 @@ async fn merchants(
     Ok(Json(json!({ "ok": true, "merchants": list })))
 }
 
-#[derive(Deserialize)]
-struct InventoryQuery {
-    mc_uuid: Option<String>,
-    #[allow(dead_code)]
-    mcid: Option<String>,
-}
-
+/// The character's chargeable inventory. Takes **no arguments**: the character is
+/// whichever one this account last confirmed via `/wallet/attest/session`.
+///
+/// This endpoint deliberately never triggers an attestation itself. Consent is a
+/// user action, and an inventory read is something the app does on its own
+/// initiative (opening a tab, refreshing after a charge) — wiring a modal to it
+/// would make the phone ask for approval at moments the user did not initiate.
+/// Instead it reports `attestation_required` and lets the app offer the button.
 async fn inventory(
     State(st): State<AppState>,
     acct: AuthedAccount,
-    Query(q): Query<InventoryQuery>,
 ) -> Result<Json<Value>, ApiError> {
     if !st.can_charge() {
         return Ok(Json(json!({
@@ -617,33 +701,18 @@ async fn inventory(
             "emeralds": 0, "blocks": 0, "chargeable": 0,
         })));
     }
-    let mc_uuid = match q.mc_uuid.as_deref().and_then(identity::normalize_uuid) {
-        Some(u) => u,
-        None => {
-            return Ok(Json(json!({
-                "ok": false, "error": "no_character", "can_charge": true,
-                "emeralds": 0, "blocks": 0, "chargeable": 0,
-            })))
-        }
-    };
-    // R007: don't reveal a character's inventory to an account that doesn't own
-    // it. Unclaimed (first charge) or self-owned is fine; another account's is not.
-    let id = acct.account_id.clone();
-    let mu = mc_uuid.clone();
-    let claimed_by_other = blocking(st.pool.clone(), move |conn| {
-        Ok::<bool, ApiError>(matches!(identity::mc_link_owner(conn, &mu)?, Some(o) if o != id))
-    })
-    .await?;
-    if claimed_by_other {
+    let Some(session) = st.char_sessions.get(&acct.account_id, now_ms()) else {
         return Ok(Json(json!({
-            "ok": false, "error": "character_claimed", "can_charge": true,
+            "ok": false, "error": "attestation_required", "can_charge": true,
             "emeralds": 0, "blocks": 0, "chargeable": 0,
         })));
-    }
-    let inv = st.charge.query_inventory(&mc_uuid).await?;
+    };
+    let inv = st
+        .charge
+        .query_inventory(&session.attester_id, &session.mc_uuid)
+        .await?;
     // Surface the real outcome instead of a misleading 0 (CLAUDE.md: no symptom
-    // hiding). `reachable=false` ⇒ the mod never answered; `online=false` ⇒ the
-    // character (this gameUuid) isn't a live player on the server it routed to.
+    // hiding). `reachable=false` ⇒ that server's mod never answered.
     if !inv.reachable {
         return Ok(Json(json!({
             "ok": false, "error": "character_unreachable", "can_charge": true,
@@ -651,8 +720,13 @@ async fn inventory(
         })));
     }
     if !inv.online {
+        // The mod answered "that UUID is nobody here". Our cached route is what
+        // went stale — typically the player moved to another server — so drop it
+        // and ask for a fresh confirmation. Reporting "you are not logged in"
+        // would state as fact something we no longer have any basis for.
+        st.char_sessions.invalidate(&acct.account_id);
         return Ok(Json(json!({
-            "ok": false, "error": "character_offline", "can_charge": true,
+            "ok": false, "error": "attestation_required", "can_charge": true,
             "emeralds": 0, "blocks": 0, "chargeable": 0,
         })));
     }
@@ -660,6 +734,107 @@ async fn inventory(
         "ok": true, "can_charge": true,
         "emeralds": inv.emeralds, "blocks": inv.blocks, "chargeable": inv.chargeable,
     })))
+}
+
+// ── host attestation ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChallengeReq {
+    purpose: String,
+}
+
+/// Issue a single-use nonce for one attestation, bound to this account and to
+/// what the assertion will be allowed to authorize.
+async fn attest_challenge(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<ChallengeReq>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(purpose) = AttestPurpose::parse(&req.purpose) else {
+        return Ok(Json(json!({ "ok": false, "error": "bad_purpose" })));
+    };
+    let (challenge, expires_unix_ms) = st.challenges.issue(&acct.account_id, purpose, now_ms());
+    Ok(Json(json!({
+        "ok": true,
+        "challenge": challenge,
+        "purpose": purpose.as_str(),
+        "expires_unix_ms": expires_unix_ms,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AttestSessionReq {
+    assertion: String,
+}
+
+/// Confirm which character this account is playing, so inventory reads have
+/// something to address.
+///
+/// A confirmation is NOT authorization to consume: a charge always carries its
+/// own assertion, bound to its own amount and idem_key.
+async fn attest_session(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<AttestSessionReq>,
+) -> Result<Json<Value>, ApiError> {
+    let claims = match st
+        .attest
+        .verify(&req.assertion, attest::now_unix_secs())
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "attest/session: assertion refused");
+            return Ok(Json(json!({ "ok": false, "error": e.code() })));
+        }
+    };
+    // The session assertion binds to its own challenge (there is no other request
+    // content to bind to), in a hash space disjoint from the charge one.
+    if let Err(code) =
+        attest::check_claims(&claims, &attest::session_request_hash(&claims.challenge))
+    {
+        return Ok(Json(json!({ "ok": false, "error": code })));
+    }
+    if !st.challenges.consume(
+        &claims.challenge,
+        &acct.account_id,
+        AttestPurpose::Session,
+        now_ms(),
+    ) {
+        return Ok(Json(json!({ "ok": false, "error": "attest_challenge" })));
+    }
+    let Some(mc_uuid) = identity::normalize_uuid(&claims.subject) else {
+        tracing::error!(subject = %claims.subject,
+            "attest/session: signed subject is not a UUID — refusing rather than routing to it");
+        return Ok(Json(json!({ "ok": false, "error": "attest_invalid" })));
+    };
+    st.char_sessions
+        .put(&acct.account_id, &mc_uuid, &claims.attester_id, now_ms());
+    log_accepted_assertion("attest/session", &acct.account_id, &claims);
+    Ok(Json(json!({
+        "ok": true,
+        "mc_uuid": mc_uuid,
+        "expires_unix_ms": now_ms() + attest::CHAR_SESSION_TTL_MS,
+    })))
+}
+
+/// Record an accepted assertion.
+///
+/// `mochi_account` is the account the OS redeemed the credential under. It is
+/// logged so one request can be traced across the phone, the Hub and this
+/// backend — it is deliberately NOT what `account` says, and no code path reads
+/// it for a decision. `iat`/`exp` make a clock skew against the Hub (which would
+/// otherwise present as every assertion being `attest_invalid`) visible here.
+fn log_accepted_assertion(path: &str, account_id: &str, claims: &attest::AttestClaims) {
+    tracing::info!(
+        path,
+        account = %account_id,
+        attester_id = %claims.attester_id,
+        mochi_account = %claims.account_id,
+        iat = claims.iat,
+        exp = claims.exp,
+        "host attestation accepted"
+    );
 }
 
 #[derive(Deserialize)]
@@ -712,7 +887,9 @@ async fn send(
         }
         let to = match auth::lookup_handle(&tx, &req.to_handle)? {
             Some(a) => a,
-            None => return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" })),
+            None => {
+                return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" }))
+            }
         };
         let label = format!("@{} へ送金", to.handle);
         let result = wallet::transfer(&tx, &from_id, &to.account_id, req.amount, "send", &label)?;
@@ -750,7 +927,9 @@ async fn pay(
         }
         let (to_id, merchant_name) = match wallet::merchant_account(&tx, &req.merchant_id)? {
             Some(m) => m,
-            None => return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" })),
+            None => {
+                return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" }))
+            }
         };
         let result = wallet::transfer(&tx, &from_id, &to_id, req.amount, "pay", &merchant_name)?;
         let (v, ok) = tx_result_json(result);
@@ -768,10 +947,19 @@ async fn pay(
 struct ChargeReq {
     idem_key: String,
     amount: i64,
-    mc_uuid: Option<String>,
-    mcid: Option<String>,
+    /// Absent on the first attempt: the app posts without one, and only produces
+    /// an assertion if the answer is `attestation_required`. That ordering is
+    /// what lets a retry replay silently instead of raising a second consent
+    /// modal for a charge the user already approved.
+    assertion: Option<String>,
 }
 
+/// Consume in-world emeralds and credit this account.
+///
+/// The account is the SESSION's, always. The assertion decides only which
+/// character's emeralds are consumed and on which server — it is never an
+/// alternative way to name the account being credited, and `claims.account_id`
+/// (a Mochi account, a different namespace entirely) is not read here at all.
 async fn charge(
     State(st): State<AppState>,
     acct: AuthedAccount,
@@ -783,20 +971,66 @@ async fn charge(
     if !st.can_charge() {
         return Ok(Json(json!({ "ok": false, "error": "mc_unavailable" })));
     }
-    let mc_uuid = match req.mc_uuid.as_deref().and_then(identity::normalize_uuid) {
-        Some(u) => u,
-        None => return Ok(Json(json!({ "ok": false, "error": "no_character" }))),
+    // A replay cannot consume anything new, so it needs no fresh consent.
+    if let Some(prev) = st
+        .charge
+        .replay_charge(&acct.account_id, &req.idem_key)
+        .await?
+    {
+        return Ok(Json(prev));
+    }
+    let Some(assertion) = req.assertion.as_deref().filter(|a| !a.trim().is_empty()) else {
+        return Ok(Json(
+            json!({ "ok": false, "error": "attestation_required" }),
+        ));
     };
+    let claims = match st.attest.verify(assertion, attest::now_unix_secs()).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "charge: assertion refused");
+            return Ok(Json(json!({ "ok": false, "error": e.code() })));
+        }
+    };
+    // Bound to THIS charge: a different amount or idem_key hashes differently, so
+    // an assertion approved for one consume cannot be spent on another.
+    if let Err(code) = attest::check_claims(
+        &claims,
+        &attest::charge_request_hash(&req.idem_key, req.amount),
+    ) {
+        return Ok(Json(json!({ "ok": false, "error": code })));
+    }
+    if !st.challenges.consume(
+        &claims.challenge,
+        &acct.account_id,
+        AttestPurpose::Charge,
+        now_ms(),
+    ) {
+        return Ok(Json(json!({ "ok": false, "error": "attest_challenge" })));
+    }
+    let Some(mc_uuid) = identity::normalize_uuid(&claims.subject) else {
+        tracing::error!(subject = %claims.subject,
+            "charge: signed subject is not a UUID — refusing rather than routing to it");
+        return Ok(Json(json!({ "ok": false, "error": "attest_invalid" })));
+    };
+    log_accepted_assertion("wallet/charge", &acct.account_id, &claims);
     let value = st
         .charge
         .begin_charge(
             &req.idem_key,
             &acct.account_id,
             &mc_uuid,
-            req.mcid.as_deref(),
+            &claims.attester_id,
             req.amount,
         )
         .await?;
+    // A charge carries the same (character, server) pair a session confirmation
+    // would, freshly consented to, so record it: without this the user would
+    // approve a charge and then immediately be asked to confirm the character
+    // again just to see the resulting inventory.
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        st.char_sessions
+            .put(&acct.account_id, &mc_uuid, &claims.attester_id, now_ms());
+    }
     Ok(Json(value))
 }
 
@@ -813,7 +1047,9 @@ async fn dev_credit(
     Json(req): Json<DevCreditReq>,
 ) -> Result<Json<Value>, ApiError> {
     if !crate::env_flag("MOYMOY_DEV_CREDIT", false) {
-        return Err(ApiError::forbidden("dev credit disabled (set MOYMOY_DEV_CREDIT=1)"));
+        return Err(ApiError::forbidden(
+            "dev credit disabled (set MOYMOY_DEV_CREDIT=1)",
+        ));
     }
     if req.amount <= 0 || req.amount > wallet::MAX_AMOUNT {
         return Err(ApiError::bad_request("bad amount"));
@@ -822,7 +1058,9 @@ async fn dev_credit(
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let acct = match auth::lookup_handle(&tx, &req.handle)? {
             Some(a) => a,
-            None => return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" })),
+            None => {
+                return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" }))
+            }
         };
         let after = wallet::credit_charge(
             &tx,
