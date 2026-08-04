@@ -30,7 +30,7 @@ MochiOS2.0 プラットフォーム向けの電子マネー / ウォレット / 
 UIフロー:
 - **home**: 利用可能残高 + カード(holder/number/expiry) + クイックアクション(pay/send/charge) + 最近の取引4件。
 - **send**: フレンド(プレイヤー)選択 → 金額 → 確認 → 完了。残高減・相手は receive。
-- **pay**: 近くの加盟店選択 → 金額 → 確認 → 完了、というデザイン当初の直接送金フローは v6 で廃止（`/wallet/pay` 削除、§EC決済）。決済は加盟店が発行する PaymentIntent の承認画面に置き換わる予定だが、アプリ側の承認 UI（Phase 2）は未実装。
+- **pay**: 近くの加盟店選択 → 金額 → 確認 → 完了、というデザイン当初の直接送金フローは v6 で廃止（`/wallet/pay` 削除、§EC決済）。決済は加盟店が発行する PaymentIntent の承認画面に置き換わった（実装済み、§EC決済）。
 - **charge**: チャージ/出金セグメント切替。チャージはインベントリ(手持ちエメラルド + ブロック、9エメ=1ブロック)を換算 → 金額 → 確認 → 完了、エメラルド消費し残高加算。出金は金額 → 着金先キャラクター確認 → 完了、残高減で mod がエメラルド付与（§出金整合）。いずれも**MC mod 依存**。
 - **history**: 全取引リスト(フィルタ: すべて/支払い/送金/チャージ/出金)。
 
@@ -88,7 +88,7 @@ MochiOS 内の EC サイトが MoyMoy で決済する仕組み。VISA 3D Secure 
 
 intent の状態機械: `created → paid / declined / canceled / expired`。全終端は最終（`paid` はリファンドでも巻き戻らず、逆方向の別トランザクションになる）。二重承認・期限切れ直前承認・加盟店キャンセルとの競合は上記 UPDATE 一文で排他される。承認前チェックとして `merchants.status='active'` を必須、`payer_hint_account_id` 指定時は他口座からの承認/拒否を `payer_mismatch` で拒否、リプレイ（`paid` かつ同一 payer）は PIN 検証より前に応答して試行回数を消費しない。
 
-加盟店: セルフサーブ登録。1口座あたり保有できる加盟店は `MAX_MERCHANTS_PER_ACCOUNT`（3件、`status != 'deleted'` を数える。停止(disabled)中も枠を占有し続ける — 名前とスロットは同じ予算で、`close` 以外に返す手段が無いため）。API キーは `moy_sk_` + 256bit CSPRNG、DB には SHA-256 ハッシュのみ保存、平文は登録/rotate 応答で一度だけ返す。`/merchant/v1/*`（API キー認証、intent の作成・照会・取消。移動可能な金額はゼロ）と `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・閉店・上限変更）の2系統分離。加盟店名は UTS #39 confusable skeleton で一意化（`lower`+NFKC だけでは別スクリプトの同形異字 `PiggleShoр2`(Cyrillic er) が素通りする）し、スクリプト混在を拒否、運営語彙（`moymoy`/`公式`等）を予約語として禁止。**リネーム API は存在しない**（登録時固定）。`description`/`sub`/`name` は NFKC 後 Cc+Cf（bidi制御・ZWJ含む）+未割当+私用領域を拒否し結合文字を基底1文字あたり3個までに制限（`U+202E` 等での承認画面偽装を防ぐ）。
+加盟店: セルフサーブ登録。1口座あたり保有できる加盟店は `MAX_MERCHANTS_PER_ACCOUNT`（3件、`status != 'deleted'` を数える。停止(disabled)中も枠を占有し続ける — 名前とスロットは同じ予算で、`close` 以外に返す手段が無いため）。API キーは `moy_sk_` + 256bit CSPRNG、DB には SHA-256 ハッシュのみ保存、平文は登録/rotate 応答で一度だけ返す。`/merchant/v1/*`（API キー認証、intent の作成・照会・取消。移動可能な金額はゼロ）と `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・閉店・上限変更）の2系統分離。加盟店名は UTS #39 confusable skeleton で一意化（`lower`+NFKC だけでは別スクリプトの同形異字 `PiggleShoр2`(Cyrillic er) が素通りする）し、スクリプト混在を拒否、運営語彙（`moymoy`/`公式`等）を予約語として禁止。**リネーム API は存在しない**（登録時固定）。`description`/`sub`/`name` は NFKC 後 Cc+Cf（bidi制御・ZWJ含む）+未割当+私用領域を拒否し結合文字を基底1文字あたり3個までに制限（`U+202E` 等での承認画面偽装を防ぐ）。**登録のレート制限は2段構え**: 実際に店が作られた（＝有効な名前・PIN・空き枠がすべて揃った）ときだけ10分に1回の枠を消費する（名前の打ち間違い等の失敗では消費しない）。別に、試行そのもの（成否問わず）を絞る5回/10秒のバースト枠があり、これはセッションを握った攻撃者が無効な名前を連打してPIN照合のCPUを消費させる手口を防ぐためのもの。
 
 **閉店（`POST /merchant/portal/close`、セッション+PIN）**: `status='deleted'` の soft delete（`name_skeleton`/`api_key_hash`/`api_key_prefix` を NULL・`listed=0`）で、名前・資格情報・枠を解放しつつ台帳（`payment_intents.merchant_id` の参照先）は残す。行ごと削除すると「一度でも取引した店は閉じられない」か「注文履歴を道連れにする」のどちらかになるため。**未決済 intent が1件でもあれば拒否される**（`open_intents`、count 付き）。閉じた加盟店は再オープン不可（登録し直す）。
 
@@ -103,7 +103,16 @@ OS 依存（決定、未照合）: MochiOS の `os.apps.launch` / `os.apps.takeL
 ### リスクベース段階認証（riskauth、v6）
 機能別に PIN を撒かず、資金流出の唯一の関門にする。`/wallet/send`・`/wallet/withdraw`・決済承認 (`/wallet/payment/approve`) が同じ関門 (`riskauth::step_up`) を通る。`/wallet/charge` は資金流入なので対象外。
 
-閾値（コード定数、環境変数化はしない。実運用で調整する前提）: 単発 **200 エメ以下**かつ 24h 累計流出 **1,000 エメ以下**かつ端末一致なら認証なし、いずれか超過または端末不一致で PIN。決済は既定で常に PIN（Requirement::Pin が floor で、金額はそれを上回ることしかできない）。端末一致は `moymoy_sessions.phone_id`（account の最古の phone_id 保持セッションとの照合）。**この列は v6 以前は保存されるだけで一度も照合されていなかった。**
+3段階の閾値（コード定数、環境変数化はしない。実運用で調整する前提）:
+- 単発 **200 エメ以下**かつ 24h 累計流出 **1,000 エメ以下**かつ端末一致 → **認証なし**
+- それ以外 → **PIN**
+- 単発 **5,000 エメ超**、または 24h 累計流出 **10,000 エメ超**、または**端末不一致** → **PIN + メール OTP**
+
+決済は既定で常に PIN 以上（`Requirement::Pin` が floor で、金額・端末不一致はそれをさらに引き上げることしかできない）。端末一致は `moymoy_sessions.phone_id`（account の最古の phone_id 保持セッションとの照合、一度も device id を送っていないアカウントは既存ユーザー保護のため常に「一致」扱い）。**この列は v6 以前は保存されるだけで一度も照合されていなかった。**
+
+メール OTP を要求する第三段階で、口座にメール未検証（または deploy 側でメール未設定）の場合は **PIN だけで通さず拒否する**（`otp_unavailable`）。閾値が「決めない」状態を作らないための fail-closed。
+
+**OTP の検証は送金・決済の確定トランザクションとは別のトランザクションで、両方の結果で必ず commit する。** 畳んで確定処理の中で検証すると、コード誤り時にロールバックで OTP の失敗カウンタごと巻き戻ってしまい、6桁コードへの総当りに5回の上限が掛からなくなる（一度実際に起きた不具合）。正しい PIN・誤った OTP の場合は PIN の失敗カウンタだけ払い戻す（OTP を打ち間違えただけで口座がロックされないように）。この分離は「後で統合した方が綺麗」に見えて壊れる箇所なので、理由ごと維持する。
 
 PIN 検証は「短いトランザクションで失敗カウンタを先に書いて commit → トランザクション外で Argon2id → 短いトランザクションでロックアウト再検証しカウンタをクリア」の3段構え。単一トランザクション内で Argon2id を回すと SQLite の単一ライタロックを数百ミリ秒保持し、ウォレット全体が停止するため。PIN が正しかったが操作自体が成立しなかった場合（残高不足等）は `refund_attempt` で消費した試行を返却する（さもないと残高不足への正しい PIN リトライ5回で自分の口座をロックする）。
 
@@ -122,11 +131,10 @@ PIN 検証は「短いトランザクションで失敗カウンタを先に書�
 - `.dat` 破損時にバニラの `DimensionDataStorage#get` が例外を握り潰しストアを丸ごと空扱いにする窓（`ops`/`grants` 共通、チャージにも元からある）。
 - **出金の信頼境界**: 出金先 MC サーバーへの信用が新たに発生する。悪意あるサーバーは `ok` を返しつつ実際には付与しないことができ、機能の性質上これは回避ではなく同意の上で受容するリスク。
 - **決済の信頼境界（同じ性質のリスク）**: 加盟店売上を拘束しない設計決定（下記）により、詐欺加盟店が集金直後に `/wallet/withdraw` で MC 世界へ抜けた場合、強制返金の原資が残らず回収不能になる。出金機能で「出金先 MC サーバーを信用する」を受容したのと同じ性質の、同意の上で受け入れるリスク。代償措置として加盟店ごとの未決済 intent 件数上限・24h 発行合計金額上限で集金速度を制限（§EC決済）。
-- **MoyMoy の資金流出は第二要素を持たない**（riskauth の決定。開設/ログイン2FA/PINリカバリのメール OTP は別物で健在、§アカウントモデル）。send・withdraw・決済の資金流出側に emailed OTP の階層があったが撤去した（稼働環境にメール設定がなく配達不能で、5,000エメ超〜出金上限20,736エメの範囲が事実上ブロックされていたため）。黙って降格させるのではなく「PIN までと決めた」という明示的な宣言で、PIN が漏れた場合の防御層は無い。端末不一致による PIN 昇格は残る。
 - **`LockoutPolicy::Bypass`（加盟店の緊急停止）の増幅**: `/merchant/portal/status` で shop を disabled にする操作は口座ロックアウト中でも PIN を試させるが、`begin_pin_attempt` は Bypass でも `locked_until` への書き込み自体は行う（拒否判定だけスキップする）。セッションを奪った攻撃者が被害者の他エンドポイントを誤 PIN で継続的にロックできる増幅がある。auth の意味論変更になるため未対処。
 - `riskauth::outflow_24h` は `transactions` の負の amount を全て合算するため、返金済みの出金も 24h 枠を消費し続ける（摩擦が増える安全側の歪み）。
 - PIN のロックアウトカウンタ（`accounts.failed_pin_attempts`、5回で15分ロック）はログインと共有のため、handle を知る第三者が誤 PIN 5回で被害者の送金/出金/決済を15分単位で止められる。決済・送金・出金側はセッション単位の指数バックオフ（`PinBackoff`）を併用して緩和している。
-- 加盟店の `launch_app_id` は intent 作成時の自己申告で、その app_id が本当にその加盟店のものかを moymoy-cs は検証できない。承認画面での OS 由来 `from` との突き合わせ・警告表示は Phase 2（未実装）が担う予定。
+- 加盟店の `launch_app_id` は intent 作成時の自己申告で、その app_id が本当にその加盟店のものかを moymoy-cs は検証できない。承認画面での OS 由来 `from` との不一致警告は実装済みだが、これは表示レベルの注意喚起であり、`launch_app_id` の真正性を moymoy-cs 側で検証する仕組みではない。
 - **CodeX 再レビュー（反映済）**: v2 再設計に recursive-codex-reviewer を実施。妥当指摘を反映 — backend `382acc2`（冪等の複合PK化で二重決済防止 / `user_version` を tx 内へ移しマイグレーション原子化 / 握り潰しログ化 ほか）、frontend `ffb40c8`（`me()` を ok/expired/unknown で識別し一時エラーで口座を消さない / アンマウントガード / 401 即時処理 ほか）。
 - **承認ゲート保留（共有層に跨る設計課題・未着手）**: 着手前に設計案の承認が必要。
   - **R008**: `reconcile` の op TTL / dead-letter。`sent` の消費済みエメラルドを安全に失効させる escalate フロー（単純 TTL は消費済み無クレジット化の危険）。
@@ -161,14 +169,14 @@ PIN 検証は「短いトランザクションで失敗カウンタを先に書�
   - [x] **② backend cert**: `deploy-backend.ps1 -EnableCharge` で mc-pki CA から `--mcserver-id moymoy` leaf 発行＋`MOCHI_MC_CERT_DIR` 設定。`run/app_backends/moymoy` に適用済（`can_charge=true`）。
   - [x] **③ Hub の :7421 有効化（真の根本原因）**: Hub が `MOCHI_HUB_MC_PKI_DIR` 未設定で「MC command bus (mTLS :7421) disabled」→ backend が connect timeout を繰り返し在庫0。`run/` の起動元 `MochiOS2.0/tools/win-hub-dev.ps1` に `MOCHI_HUB_MC_PKI_DIR=<repo>\.devstack\mc-pki\ca`＋`MOCHI_HUB_MC_PKI_FLAT=1` を追加（backend cert と同一 CA）。**Hub 再起動が必要**。
   - [ ] **④ MC サーバ側**: moymoy mod jar（`mod/build/libs/moymoy-*.jar`）＋ mochi connector mod を導入、`mochi-server.toml` の `mcserver_id` を非空に、mochi-mc-connector サイドカー稼働。※`hosted_app_ids` は**廃止**（自動広告）。
-- [ ] backend 再配置（`deploy-backend.ps1 -EnableCharge` で moymoy-cs＋MC証明書を Hub workdir へ）※**EC決済 Phase 2（アプリ承認UI）完了まで実施しない**。v6 で `/wallet/pay` 削除・send の PIN 要求が入っており、現行フロントエンドのまま配置すると壊れる
+- [ ] backend 再配置（`deploy-backend.ps1 -EnableCharge` で moymoy-cs＋MC証明書を Hub workdir へ）。EC決済 Phase 2 完了により、フロントエンドが壊れる懸念は解消したので実施可能
 - [ ] フル E2E（in-world で 0.2.2 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
 - [ ] 承認ゲート保留: `MOYMOY_OTP_PEPPER` の本番 fail-closed 化 / `AccountInfo` の email 型統合 / refresh 失敗の UI エラー状態化 / `run_inbound` 切断理由の可視化（mc-sdk 共有層）
 - [x] **出金**（エメ→エメラルド）: backend（先引落→付与要求→ack確定、`AttestPurpose::Withdraw`、dead-letter方向別処理）／mod（`grants` 冪等ストア・二相コミット）／アプリ（チャージタブ内チャージ/出金セグメント＋ホームのクイックアクション）
 - [x] 出金のフル E2E 実機検証（本番・online-mode サーバーで成功）。出金3件が `granted` = 要求額・返金0で `settled`（192 / 2,414 / 64 エメ、予約から決着まで 30〜50ms）。assertion の拒否は0件
 - [ ] 出金の UX 再評価: 認証モーダルの成功表示は `ph-done` 700ms 固定（MochiOS `apps/com.mochi.ui/os-chrome.js`）。承認直後に閉じる不具合（エンベロープ読み違い）は MochiOS `eafd935d` で解消したので、本来の振り付けが出る状態で短すぎないかを実機で判断する
 - [x] EC決済 Phase 1: backend 決済ドメイン（riskauth / merchant / payments、schema v6）
-- [ ] EC決済 Phase 2: MoyMoy アプリの承認オーバーレイ（`@owner_handle` 主表示・description の引用枠づけ・`from`/`launch_app_id` 不一致警告・新規加盟店バッジ・個人化シール）＋ 加盟店管理画面（登録・キー表示/rotate・停止・閉店・上限引き上げ・利用状況）
-- [ ] EC決済 Phase 3: PiggleShop2 側の注文事前永続化（`state=awaiting_payment`、`order_id` サーバー発行化）＋ intent 作成 → launch → サーバー照会確定への作り替え、既存 `MoyMoyRedirect` モック削除、実機 E2E
+- [x] EC決済 Phase 2: MoyMoy アプリの承認オーバーレイ（`@owner_handle` 主表示・description の引用枠づけ・`from`/`launch_app_id` 不一致警告・新規加盟店バッジ・個人化シール）＋ 加盟店管理画面（登録・キー表示/rotate・停止・閉店・上限引き上げ）
+- [x] EC決済 Phase 3: PiggleShop2 側の注文事前永続化・intent 作成→launch→サーバー照会確定への作り替え・**実機 E2E 成功**（本番の識別トークンで PiggleShop2 backend が moymoy-cs へ CONNECT、決済状態照会→配送まで到達を確認）
 - [ ] リスクベース閾値（200 / 1,000 エメ）の実運用調整
 - [ ] **将来実装**（着手前に承認要）: Web 決済（`return_url` 追加・MoyMoy ホスト型承認ページ、現行スキーマ/状態機械は無変更で使える）／ 返金 API（加盟店主導、加盟店口座から金が出る唯一の経路になるため着手時に別途承認）／ 署名レシート（moymoy-cs は `mochi-proto-attest` の `issue` feature を OFF にしており署名鍵を持たないため webhook 導入時に別途判断）／ 猶予付き二重 API キー（無停止ローテーション）／ webhook 通知
