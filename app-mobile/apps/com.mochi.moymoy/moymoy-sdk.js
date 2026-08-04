@@ -140,15 +140,28 @@
       .join("&");
   }
 
+  // 429 is a DOMAIN answer, not a transport fault: the merchant endpoints answer
+  // `{ok:false, error:"rate_limited", retry_after_ms}` with that status. Throwing
+  // on it turned a legitimate "you registered a shop 3 minutes ago, wait 7 more"
+  // into 「通信に失敗しました」 — reporting a cause the app had already been told
+  // was something else. Handled alongside 401 for the same reason.
+  async function readAnswer(res, what) {
+    if (res.status === 401) return { ok: false, error: "unauthorized", status: 401 };
+    if (res.status === 429) {
+      const body = await res.json().catch(() => null);
+      return body || { ok: false, error: "rate_limited", status: 429 };
+    }
+    if (!res.ok) throw new Error("moymoy " + what + " → HTTP " + res.status);
+    return res.json();
+  }
+
   async function getJson(path, params, session) {
     const query = qstr(params || {});
     const res = await fetch(base() + path + (query ? "?" + query : ""), {
       method: "GET",
       headers: authHeaders(session),
     });
-    if (res.status === 401) return { ok: false, error: "unauthorized", status: 401 };
-    if (!res.ok) throw new Error("moymoy GET " + path + " → HTTP " + res.status);
-    return res.json();
+    return readAnswer(res, "GET " + path);
   }
 
   async function postJson(path, body, session) {
@@ -157,15 +170,43 @@
       headers: Object.assign({ "Content-Type": "application/json" }, authHeaders(session)),
       body: JSON.stringify(body || {}),
     });
-    if (res.status === 401) return { ok: false, error: "unauthorized", status: 401 };
-    if (!res.ok) throw new Error("moymoy POST " + path + " → HTTP " + res.status);
-    return res.json();
+    return readAnswer(res, "POST " + path);
   }
 
   const newIdem = () =>
     window.crypto && crypto.randomUUID
       ? crypto.randomUUID()
       : "k-" + Date.now() + "-" + Math.floor(Math.random() * 1e9);
+
+  // ── launch intent (OS → this app) ───────────────────────────────────────────
+  /**
+   * Reduce one OS launch intent to the only field this app is willing to act on.
+   *
+   * `params` is whatever the LAUNCHING app chose to put there, and it is not
+   * trusted for anything: only `intent_id` is lifted out, every other key is
+   * dropped unread. The approval screen's amount, merchant and description come
+   * from `GET /wallet/payment/intent` — the backend's own record — so a shop
+   * cannot make the screen say one thing while billing another (WYSIWYS).
+   *
+   * `from` and `age_ms` DO come from here, and only from here: the OS stamps
+   * `from` with the attested sender id, which is the one thing about the caller
+   * that cannot be forged.
+   */
+  function readLaunchIntent(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const params = raw.params;
+    const id = params && typeof params.intent_id === "string" ? params.intent_id.trim() : "";
+    // Prefix and length only. Deliberately NOT a charset rule: `payments.rs`
+    // mints `pi_` + URL-safe base64, and pinning the alphabet here would couple
+    // the app to an encoding it does not own — the day that changes, every
+    // payment would vanish silently, because a rejected id produces no screen
+    // and no error. Whether an id exists is the backend's call (`unknown_intent`),
+    // and `qstr` escapes whatever we pass.
+    if (id.indexOf("pi_") !== 0 || id.length > 128) return null;
+    const from = typeof raw.from === "string" ? raw.from : "";
+    const age = Number(raw.age_ms);
+    return { intent_id: id, from, age_ms: Number.isFinite(age) && age >= 0 ? age : 0 };
+  }
 
   // ── host attestation ────────────────────────────────────────────────────────
   // Who we are asking the assertion to be FOR. The backend refuses one minted
@@ -330,13 +371,92 @@
     // Send to a MoyMoy handle (@id). Pass a stable `idemKey` so a retry of the
     // SAME send (e.g. after a lost response) replays the same transfer instead of
     // sending twice.
-    send: (toHandle, amount, idemKey) =>
-      postJson("/wallet/send", { idem_key: idemKey || newIdem(), to_handle: toHandle, amount }),
+    //
+    // `pin` is absent on the first attempt on purpose: riskauth decides from the
+    // amount whether one is needed, and answers `pin_required` when it is. Asking
+    // for a PIN up front would charge every 20 エメ send the friction of a
+    // 20,000 エメ one. The retry MUST carry the same `idemKey`.
+    send: (toHandle, amount, idemKey, pin) =>
+      postJson("/wallet/send", { idem_key: idemKey || newIdem(), to_handle: toHandle, amount, pin }),
 
-    // Pay a merchant by id. Pass a stable `idemKey` so a retry replays the same
-    // payment instead of paying twice.
-    pay: (merchantId, amount, idemKey) =>
-      postJson("/wallet/pay", { idem_key: idemKey || newIdem(), merchant_id: merchantId, amount }),
+    // ── EC payment, payer side ──
+    // The approval screen's ONLY source. Everything it renders comes from here,
+    // never from the launch params (see readLaunchIntent).
+    paymentIntent: (intentId) => getJson("/wallet/payment/intent", { intent_id: intentId }),
+
+    // Approve and pay. No `idem_key`: the intent row IS the idempotency record —
+    // the backend rebuilds the same response from `state`/`payer`/`tx_id`, so a
+    // retry after a lost response replays server-side. Minting a key here would
+    // add a second, weaker notion of "the same payment".
+    paymentApprove: (intentId, pin) =>
+      postJson("/wallet/payment/approve", { intent_id: intentId, pin }),
+
+    // Refuse it. No PIN: nothing moves, and making somebody authenticate to say
+    // "no" is how people are taught to type their PIN into whatever asks.
+    paymentDecline: (intentId) => postJson("/wallet/payment/decline", { intent_id: intentId }),
+
+    // ── merchant portal (session + PIN) ──
+    // The credential-issuing half. Separate from the API-key half on purpose: a
+    // leaked key cannot reach any of these, and a stolen session cannot use them
+    // without the PIN.
+    merchantList: () => getJson("/merchant/portal/list"),
+    merchantRegister: ({ name, sub, pin }) =>
+      postJson("/merchant/portal/register", { name, sub, pin }),
+    // Both of these answer with a NEW plaintext key, shown once and never stored.
+    merchantRotateKey: (merchantId, pin) =>
+      postJson("/merchant/portal/key", { merchant_id: merchantId, pin }),
+    merchantSetStatus: (merchantId, status, pin) =>
+      postJson("/merchant/portal/status", { merchant_id: merchantId, status, pin }),
+    merchantSetLimits: (merchantId, pin, limits) =>
+      postJson("/merchant/portal/limits", {
+        merchant_id: merchantId,
+        pin,
+        max_open_intents: limits ? limits.max_open_intents : undefined,
+        daily_issue_cap: limits ? limits.daily_issue_cap : undefined,
+      }),
+
+    // ── OS launch intent ──
+    // Consume the payload another app launched us with. Single-use: a second call
+    // reads null, which is what makes it safe to call on every boot AND from the
+    // onLaunchIntent push without re-running an action the user already answered.
+    takeLaunchIntent: async () => {
+      if (!(window.mochi && mochi.os && mochi.os.apps && mochi.os.apps.takeLaunchIntent)) return null;
+      try {
+        return readLaunchIntent(await mochi.os.apps.takeLaunchIntent());
+      } catch (e) {
+        // An OS-level rejection is not "no intent pending" — say so rather than
+        // letting a broken bridge look like an ordinary empty mailbox.
+        console.error("MoyMoy: os.apps.takeLaunchIntent failed", e);
+        return null;
+      }
+    },
+    // Register for the warm-switch push. The host's notification carries no
+    // payload — it only says "call takeLaunchIntent again" — and there is no way
+    // to unregister, so `cb` must be safe to run at any time.
+    onLaunchIntent: (cb) => {
+      if (window.mochi && mochi.os && mochi.os.apps && mochi.os.apps.onLaunchIntent) {
+        mochi.os.apps.onLaunchIntent(cb);
+      }
+    },
+    // Go back to the app that launched us. The id passed here must be the OS's
+    // attested `from`, never a merchant-declared `return_app_id` / `launch_app_id`
+    // — those are self-reported and would make the shop the authority on where
+    // the user lands after paying.
+    launchApp: async (appId) => {
+      if (!(window.mochi && mochi.os && mochi.os.apps && mochi.os.apps.launch)) {
+        return { accepted: false, reason: "no_host" };
+      }
+      try {
+        return await mochi.os.apps.launch(appId);
+      } catch (e) {
+        if (e && e.code === "SCOPE_DENIED") {
+          console.error("MoyMoy: the app manifest does not declare apps.launch", e);
+          return { accepted: false, reason: "no_scope" };
+        }
+        console.error("MoyMoy: os.apps.launch failed", e);
+        return { accepted: false, reason: "os_error" };
+      }
+    },
 
     // Charge from the confirmed character's inventory emeralds (mod-backed).
     // Returns a pending op; poll op(). Pass a stable `idemKey` so a retry of the
@@ -378,9 +498,13 @@
     // "moymoy.withdraw.v1") — never the charge one. A charge assertion says
     // "I consent to spend my in-world emeralds"; it must not also be usable to
     // authorize the opposite operation, paying emeralds back OUT to the world.
-    withdraw: async (amount, idemKey) => {
+    // `pin` rides along for the same reason it does on send: a withdrawal is an
+    // outflow, so riskauth gates it, and anything over the frictionless band
+    // answers `pin_required`. The caller collects one and retries with the SAME
+    // idemKey.
+    withdraw: async (amount, idemKey, pin) => {
       const idem = idemKey || newIdem();
-      const first = await postJson("/wallet/withdraw", { idem_key: idem, amount });
+      const first = await postJson("/wallet/withdraw", { idem_key: idem, amount, pin });
       if (first.ok || first.error !== "attestation_required") return first;
 
       const a = await attest(
@@ -389,7 +513,7 @@
         amount + " エメの出金"
       );
       if (!a.ok) return { ok: false, error: a.error };
-      return postJson("/wallet/withdraw", { idem_key: idem, amount, assertion: a.assertion });
+      return postJson("/wallet/withdraw", { idem_key: idem, amount, pin, assertion: a.assertion });
     },
 
     op: (opId) => getJson("/wallet/op", { op_id: opId }),

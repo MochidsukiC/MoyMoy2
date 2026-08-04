@@ -27,7 +27,7 @@
   "allowed_services": [],
   "requires": {
     "permissions": [],
-    "mochi_services": ["phone_state.read", "attestation.request"],
+    "mochi_services": ["phone_state.read", "attestation.request", "apps.launch"],
     "min_runtime_version": "0.1.0"
   },
   "supported_platforms": ["mc"]

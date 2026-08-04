@@ -1,4 +1,4 @@
-/* global React, MoyMoy, MoyMoyApp, EmeGem, CrystalIcon */
+/* global React, MoyMoy, MoyMoyApp, EmeGem, CrystalIcon, MoySealBadge */
 /* =====================================================================
    MoyMoy — auth shell & multi-account (v2)
 
@@ -12,7 +12,7 @@
    switcher / settings (linked MC characters + logout).
    ===================================================================== */
 
-const { useState: maState, useEffect: maEffect } = React;
+const { useState: maState, useEffect: maEffect, useRef: maRef } = React;
 
 const STORE_KEY = "moymoy.accounts.v1";
 
@@ -136,10 +136,18 @@ function AuthScene({ title, sub, onBack, children }) {
 }
 
 /* ─── onboarding ─────────────────────────────────────────────────────── */
-function AuthWelcome({ canCancel, onRegister, onLogin, onCancel }) {
+function AuthWelcome({ canCancel, notice, onRegister, onLogin, onCancel }) {
   return (
     <AuthScene title="MoyMoy" sub="ゲーム内エメラルド決済ウォレット" onBack={canCancel ? onCancel : null}>
       <div style={{ padding: "28px 22px", display: "flex", flexDirection: "column", gap: 16 }}>
+        {/* 支払いを承認するために開かれたのに、いきなりログインを求められる理由を
+            書いておく。文脈が無いと「なぜ今 PIN を聞かれているのか」が分からず、
+            偽のログイン画面との区別がつきにくくなる。 */}
+        {notice && (
+          <div style={{ padding: "11px 13px", border: "1.5px solid var(--moy-deep)",
+            background: "var(--moy-mint)", fontFamily: "var(--font-jp)", fontSize: 13,
+            fontWeight: 700, color: "var(--moy-deep)", lineHeight: 1.7 }}>{notice}</div>
+        )}
         <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, color: "var(--ink-soft)", lineHeight: 1.8 }}>
           MoyMoy の口座を{canCancel ? "追加" : "作成"}します。口座は MoyMoy 独自のアカウントで、
           ID と PIN で保護されます。
@@ -583,7 +591,7 @@ function AccountMenu({ open, accounts, activeId, onSwitch, onAdd, onLogout, onSe
    list to show (schema v5). Which character may be charged is decided per
    charge by a Hub-signed attestation the user approves at the time, so listing a
    previously-charged UUID here would name a relationship nothing maintains. */
-function SettingsSheet({ open, account, onLogout, onClose }) {
+function SettingsSheet({ open, account, seal, onLogout, onMerchant, onSeal, onClose }) {
   const [email, setEmail] = maState(null);
   const [failed, setFailed] = maState(false);
   maEffect(() => {
@@ -624,7 +632,33 @@ function SettingsSheet({ open, account, onLogout, onClose }) {
             アカウント情報を読み込めませんでした。<br />通信状態をご確認のうえ、開き直してください。
           </div>
         )}
-        <button onClick={onLogout} style={{ width: "100%", marginTop: 20, padding: "14px", border: "1.5px solid var(--carle-red)",
+        {onSeal && (
+          <div style={{ marginTop: 20 }}>
+            <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 8 }}>あなたのシール</div>
+            <MoySealBadge seal={seal} onSetup={onSeal} />
+            <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11,
+              color: "var(--ink-soft)", lineHeight: 1.7 }}>
+              PIN を入力する画面に必ず出ます。出ていない画面は MoyMoy ではありません。
+            </div>
+            {seal && (
+              <button onClick={onSeal} style={{ width: "100%", marginTop: 8, padding: "11px",
+                border: "1.5px solid var(--ink)", background: "var(--bg-white)", cursor: "pointer",
+                fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 13 }}>
+                シールを変更する
+              </button>
+            )}
+          </div>
+        )}
+
+        {onMerchant && (
+          <button onClick={onMerchant} style={{ width: "100%", marginTop: 20, padding: "14px",
+            border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)",
+            cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15 }}>
+            加盟店管理（MoyMoy で代金を受け取る）
+          </button>
+        )}
+
+        <button onClick={onLogout} style={{ width: "100%", marginTop: 12, padding: "14px", border: "1.5px solid var(--carle-red)",
           background: "rgba(227,38,54,0.06)", cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700,
           fontSize: 15, color: "var(--carle-red)" }}>このアカウントからログアウト</button>
       </div>
@@ -640,6 +674,11 @@ function MoyMoyRoot({ onClose }) {
   const [authMode, setAuthMode] = maState("welcome"); // welcome | register | login | recover
   const [adding, setAdding] = maState(false);
   const [emailEnabled, setEmailEnabled] = maState(false);
+  // 承認待ちの支払い。**メモリだけ**で持ち、mochi.storage には書かない —
+  // 永続化すると、期限切れになった古い intent の残骸が次の起動で承認画面として
+  // 蘇り、文脈のない支払い要求をユーザーに見せることになる。
+  const [pendingPayment, setPendingPayment] = maState(null);
+  const liveRef = maRef(true);
 
   // Whether the backend has email verification / 2FA / recovery active.
   maEffect(() => {
@@ -648,6 +687,28 @@ function MoyMoyRoot({ onClose }) {
       .then((r) => { if (alive && r && r.ok) setEmailEnabled(!!r.email_enabled); })
       .catch((e) => { console.warn("MoyMoy: /auth/config failed; email UI hidden until reload", e); });
     return () => { alive = false; };
+  }, []);
+
+  /* OS の launch-intent を受け取る (DEV.md §4.5c.8)。
+     二段構え: コールドスタートは boot 時の consume で、既に起動中のところへ
+     intent が届くウォームスイッチは host の push (onLaunchIntent) で拾う。
+     どちらも同じ takeLaunchIntent を叩き、消費は単回なので二重には走らない。
+
+     onLaunchIntent には解除 API が無く、登録したコールバックはこの
+     コンポーネントより長く生きる。だから「intent が読めたときだけ差し替える」
+     以外の書き方をしない — 状態を読んで分岐すると、古いクロージャの値で
+     保持中の支払いを消しかねない。 */
+  maEffect(() => {
+    liveRef.current = true;
+    async function take() {
+      const intent = await MoyMoy.takeLaunchIntent();
+      // null は「自分宛の intent は無い」。保持中のものには一切触らない。
+      if (!intent || !liveRef.current) return;
+      setPendingPayment({ ...intent, taken_at: Date.now() });
+    }
+    take();
+    MoyMoy.onLaunchIntent(take);
+    return () => { liveRef.current = false; };
   }, []);
 
   // Boot: restore the persisted session list and validate the active one.
@@ -789,6 +850,7 @@ function MoyMoyRoot({ onClose }) {
     if (authMode === "login") return <AuthLogin emailEnabled={emailEnabled} onDone={onAuthDone} onBack={() => setAuthMode("welcome")} onForgot={() => setAuthMode("recover")} />;
     if (authMode === "recover") return <AuthRecover onDone={onAuthDone} onBack={() => setAuthMode("login")} />;
     return <AuthWelcome canCancel={adding && !!accounts.find((a) => a.account_id === activeId)}
+      notice={pendingPayment ? "お支払いの承認が待っています。先にログインしてください。" : null}
       onRegister={() => setAuthMode("register")} onLogin={() => setAuthMode("login")} onCancel={cancelAdd} />;
   }
 
@@ -802,6 +864,8 @@ function MoyMoyRoot({ onClose }) {
       onSwitchAccount={switchTo}
       onAddAccount={addAccount}
       onLogoutAccount={logoutAccount}
+      pendingPayment={pendingPayment}
+      onPaymentDone={() => setPendingPayment(null)}
     />
   );
 }
