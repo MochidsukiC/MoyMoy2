@@ -219,9 +219,11 @@ function MoySealSetup({ open, seal, onSave, onClose }) {
   );
 }
 
-/* ─── PIN 入力ステップ (決済承認 / 送金の step-up / 加盟店ポータル 共用) ──
+/* ─── 秘密の数字を集める画面 (PIN / メールコード 共用) ──────────────
    PIN を集める画面はここ 1 箇所しかない。分裂させると、片方だけがシールや
-   注意文を失い、そちらが偽画面と見分けのつかない画面になる。
+   注意文を失い、そちらが偽画面と見分けのつかない画面になる。第二要素の
+   6桁コードも同じ枠で集める（`minLen`/`maxLen` が違うだけ）— コード入力だけ
+   別デザインにすると、そこがいちばん模倣しやすい画面になる。
    注意文とシールを props にしてあるのは、加盟店ポータルの PIN 確認で
    「決済画面以外で PIN を求めません」と表示すると、その文自身と矛盾するため。
 
@@ -231,11 +233,11 @@ function MoySealSetup({ open, seal, onSave, onClose }) {
    決めた合言葉」であることに価値がある。PIN 画面から登録させると、偽画面が
    「未設定ですね、設定しましょう」とユーザーにシールを決めさせ、それを見せ返す
    経路ができてしまい、前提そのものが崩れる。登録は設定画面だけで行う。 */
-function MoyPinStep({ title, sub, summary, notice, showSeal, seal, busy, error,
-  cta, onCancel, onSubmit, zIndex = 150 }) {
+function MoyPinStep({ title, sub, summary, notice, extra, showSeal, seal, busy, error,
+  cta, minLen = 4, maxLen = 6, onCancel, onSubmit, zIndex = 150 }) {
   const [pin, setPin] = msState("");
-  const press = (k) => setPin((p) => (k === "⌫" ? p.slice(0, -1) : p.length >= 6 ? p : p + k));
-  const canSubmit = pin.length >= 4 && !busy;
+  const press = (k) => setPin((p) => (k === "⌫" ? p.slice(0, -1) : p.length >= maxLen ? p : p + k));
+  const canSubmit = pin.length >= minLen && !busy;
   return (
     <div className="fade-in" style={{ position: "absolute", inset: 0, zIndex,
       background: "var(--bg-white)", display: "flex", flexDirection: "column" }}>
@@ -272,9 +274,10 @@ function MoyPinStep({ title, sub, summary, notice, showSeal, seal, busy, error,
             background: "rgba(0,0,0,0.04)", fontFamily: "var(--font-jp)", fontSize: 12,
             fontWeight: 700, color: "var(--ink)", lineHeight: 1.6 }}>{notice}</div>
         )}
+        {extra}
 
         <div style={{ marginTop: 20, display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
-          <PinDots len={pin.length} />
+          <PinDots len={pin.length} max={maxLen} />
           {error && (
             <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
               color: "var(--carle-red)", textAlign: "center", lineHeight: 1.6 }}>{error}</div>
@@ -293,6 +296,193 @@ function MoyPinStep({ title, sub, summary, notice, showSeal, seal, busy, error,
         </div>
       </div>
     </div>
+  );
+}
+
+/* ─── 段階認証 (PIN → メールコード) ────────────────────────────────
+   riskauth が要求する要素を集めて、呼び出し元に一度だけ渡す。送金・出金・
+   決済承認がすべてここを通るので、片方だけ挙動が変わることがない。
+
+   **PIN とコードは 2 画面に分けるが、送信は 1 回にまとめる。**
+   `PinKeypad` は一度に 1 つの入力しか受けられないので、1 画面に 2 欄を置くと
+   「どちらに入力しているか」を別途示す仕掛けが要る（打ち間違いの温床）。
+   一方でサーバへの往復は、集め終えてから 1 回投げれば済む。分けて集め、
+   まとめて送ることで、両方の利点を取っている。
+
+   `required` が最初から `pin_otp` なら PIN → コードと続けて集める。決済は
+   PIN 必須なので最初の応答が `otp_required` で返ってきて初めて第二要素が
+   要ると分かる。その場合も保持した PIN を使い、PIN の再入力は求めない。 */
+
+/** 再送クールダウン (otp.rs の `OTP_RESEND_COOLDOWN_MS` と同じ 60 秒)。 */
+const MOY_OTP_RESEND_MS = 60 * 1000;
+
+/**
+ * コードの送り先。ローカル部を伏せる。
+ *
+ * ドメインは残す（どのメールボックスを見ればよいかは、それで分かる）。
+ * 全部出さないのは、決済の承認はレジ前など人目のある場所で起きるからで、
+ * 肩越しに見た第三者にメールアドレスを渡すと、そのままフィッシングの宛先に
+ * なる。本人は先頭一文字とドメインで自分のものと判別できる。
+ */
+function maskEmail(email) {
+  if (!email) return "";
+  const at = email.lastIndexOf("@");
+  if (at <= 0) return email;
+  return email.slice(0, 1) + "***" + email.slice(at);
+}
+
+function MoyStepUp({ required, title, sub, summary, notice, showSeal, seal,
+  busy, error, cta, onCancel, onSubmit, zIndex = 150 }) {
+  const needsOtp = required === "pin_otp";
+  // 2 段階のあいだ PIN を保持する。サーバは呼び出し間で状態を持たないので、
+  // コードだけ送り直すことはできず、常に PIN と一緒に投げ直す必要がある。
+  // 保持しないと、コードを打ち間違えるたびに PIN の再入力になる。
+  const [held, setHeld] = msState("");
+  const [localStage, setLocalStage] = msState("pin");
+  const [sent, setSent] = msState(null);      // {email} 送信できたとき
+  const [sending, setSending] = msState(false);
+  const [sendErr, setSendErr] = msState(null);
+  const [coolUntil, setCoolUntil] = msState(0);
+  const [now, setNow] = msState(Date.now());
+  // 「戻る」で自分から離れた応答。これを覚えていないと、`invalid_code` の error が
+  // 残っているせいで段の導出がコード欄に張り付き、戻るボタンが効かなくなる。
+  const [dismissed, setDismissed] = msState(null);
+  const askedRef = msRef(false);
+
+  const active = error && error !== dismissed ? error : null;
+
+  // どの欄が間違っていたかは応答が決めるので、表示する段は応答から導出する
+  // （state に持って effect で追随させると、描画とズレる瞬間ができる）。
+  const stage = !needsOtp ? "pin"
+    : active && active.code === "invalid_pin" ? "pin"
+    : active && (active.code === "invalid_code" || active.code === "otp_required") ? "otp"
+    : localStage;
+
+  // PIN が間違っていたときだけ保持を捨てる。`invalid_code` では PIN は
+  // 消費されておらず正しいので、そのまま次の送信に使う。
+  msEffect(() => {
+    if (active && active.code === "invalid_pin") setHeld("");
+  }, [active]);
+
+  async function requestCode() {
+    if (sending) return;
+    setSending(true); setSendErr(null);
+    try {
+      const r = await MoyMoy.stepupOtp();
+      if (r.ok) { setSent({ email: r.email }); setCoolUntil(Date.now() + MOY_OTP_RESEND_MS); }
+      else if (r.error === "too_soon") {
+        // 直前に送ったコードがまだ生きている。失敗ではないので入力はそのまま。
+        setCoolUntil(Date.now() + (r.retry_after_ms > 0 ? r.retry_after_ms : MOY_OTP_RESEND_MS));
+      } else setSendErr({ code: r.error || "error" });
+    } catch (e) {
+      // 5xx = メール送信自体の失敗。サーバ側でコードは取り消されるので、
+      // クールダウンを待たずに押し直してよい。
+      console.warn("MoyMoy: step-up code request failed", e);
+      setSendErr({ code: "network" });
+    }
+    setSending(false);
+  }
+
+  // 第二要素が要ると分かった時点で送っておく。ユーザーが PIN を打っている
+  // あいだにメールが飛ぶので、コード欄に着いたときには届いている。
+  msEffect(() => {
+    if (!needsOtp || askedRef.current) return;
+    askedRef.current = true;
+    requestCode();
+  }, [needsOtp]);
+
+  msEffect(() => {
+    if (stage !== "otp") return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [stage]);
+
+  // メール未登録は行き止まり。この口座ではこの金額を動かせず、押し直しても
+  // 変わらない。アプリにメール追加の導線が無いことも隠さず書く。
+  const dead = (active && active.code === "otp_unavailable") ||
+    (sendErr && sendErr.code === "otp_unavailable");
+  if (dead) {
+    return (
+      <div className="fade-in" style={{ position: "absolute", inset: 0, zIndex,
+        background: "var(--bg-white)", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center", padding: "24px 26px", textAlign: "center" }}>
+        <EmeGem size={48} style={{ marginBottom: 16, opacity: 0.6 }} />
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 17, fontWeight: 800, color: "var(--ink)" }}>
+          この金額にはメール確認が必要です
+        </div>
+        <div style={{ marginTop: 12, fontFamily: "var(--font-jp)", fontSize: 13,
+          color: "var(--ink-soft)", lineHeight: 1.9, maxWidth: 340 }}>
+          この口座には確認済みのメールアドレスが登録されていないため、この操作は
+          完了できません。金額を小さくするか、メールアドレスを登録した口座を
+          ご利用ください。
+          <br /><br />
+          いまのアプリでは、開設済みの口座にあとからメールアドレスを追加できません。
+        </div>
+        <button onClick={onCancel} style={{ width: "100%", maxWidth: 320, marginTop: 24,
+          padding: "15px", border: "1.5px solid var(--ink)", background: "var(--bg-white)",
+          boxShadow: "3px 3px 0 var(--ink)", cursor: "pointer", fontFamily: "var(--font-jp)",
+          fontWeight: 700, fontSize: 15 }}>
+          戻る
+        </button>
+      </div>
+    );
+  }
+
+  if (stage === "pin") {
+    return (
+      <MoyPinStep zIndex={zIndex} title={title} sub={sub} summary={summary} notice={notice}
+        showSeal={showSeal} seal={seal} busy={busy}
+        error={active ? errLabelFor(active) : null}
+        cta={needsOtp ? "次へ（コード入力）" : cta}
+        onCancel={onCancel}
+        onSubmit={(pin) => {
+          // 送信前でも必ず保持する。決済は最初の応答で初めて `otp_required` と
+          // 分かるので、そこで PIN を持っていないと再入力になる。
+          setHeld(pin);
+          if (needsOtp) { setLocalStage("otp"); return; }
+          onSubmit(pin, null);
+        }} />
+    );
+  }
+
+  const waitMs = Math.max(0, coolUntil - now);
+  const extra = (
+    <div style={{ marginTop: 12, border: "1.5px solid var(--ink)", padding: "11px 13px" }}>
+      <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink)", lineHeight: 1.7 }}>
+        {sending ? "確認コードを送信しています…"
+          : sent ? <>確認コードを <b>{maskEmail(sent.email)}</b> に送りました。電話のメールアプリで確認してください。</>
+          : "送信済みの確認コードを入力してください。"}
+      </div>
+      <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)" }}>
+        6桁・10分で失効・1回かぎり有効です。
+      </div>
+      {sendErr && (
+        <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
+          color: "var(--carle-red)", lineHeight: 1.6 }}>{errLabelFor(sendErr)}</div>
+      )}
+      <button disabled={sending || waitMs > 0} onClick={requestCode}
+        style={{ width: "100%", marginTop: 8, padding: "10px", cursor: sending || waitMs > 0 ? "default" : "pointer",
+        border: "1.5px solid " + (sending || waitMs > 0 ? "var(--ink-soft)" : "var(--moy-deep)"),
+        background: sending || waitMs > 0 ? "transparent" : "var(--moy-mint)",
+        color: sending || waitMs > 0 ? "var(--ink-soft)" : "var(--moy-deep)",
+        fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 13 }}>
+        {waitMs > 0 ? "再送は " + moyDuration(waitMs) + "後" : "コードを再送する"}
+      </button>
+    </div>
+  );
+
+  return (
+    <MoyPinStep zIndex={zIndex} title="確認コードを入力" sub={sub} summary={summary}
+      extra={extra} busy={busy} minLen={6} maxLen={6}
+      error={active ? errLabelFor(active) : null}
+      cta={cta}
+      onCancel={() => {
+        // PIN の段へ戻る。保持している PIN は捨てる — 打ち直してもらう方が、
+        // 画面を離れているあいだ持ち続けるより短く済む。応答も「見送った」印を
+        // つける。つけないと段の導出がここに張り付いて戻れない。
+        setDismissed(error); setHeld(""); setLocalStage("pin");
+      }}
+      onSubmit={(code) => onSubmit(held, code)} />
   );
 }
 
@@ -947,6 +1137,13 @@ const ERR_LABEL = {
   invalid_pin: "PIN が違います",
   locked: "PIN の入力を一時的に制限しています",
   too_many_attempts: "PIN の入力を一時的に制限しています",
+  // 第二要素。`otp_required` は「PIN が通った」ではなく「コードがまだ無い」で、
+  // サーバは PIN の照合前にこれを返す（riskauth: 足りない要求のために
+  // PIN 試行を消費しないため）。だから「PIN は確認できました」とは書かない。
+  otp_required: "確認コードを入力してください",
+  invalid_code: "確認コードが正しくありません",
+  otp_unavailable: "この操作にはメールアドレスの確認が必要です",
+  too_soon: "確認コードは送信済みです。しばらく待ってから再送してください",
   // ── EC 決済 ──
   unknown_intent: "この支払いは見つかりませんでした（期限切れの可能性があります）",
   payer_mismatch: "この支払いは別の口座あてに発行されています",
@@ -1059,7 +1256,7 @@ function MoyWarnBanner({ children }) {
   );
 }
 
-function MoyPaymentApproval({ pending, intent, loading, error, balance, busy, step, done,
+function MoyPaymentApproval({ pending, intent, loading, error, required, balance, busy, step, done,
   seal, onToPin, onApprove, onDecline, onClose, onCharge, onReturn, onBackToReview }) {
   // 残り時間と経過時間を進めるためだけの時計。
   const [now, setNow] = msState(Date.now());
@@ -1315,10 +1512,10 @@ function MoyPaymentApproval({ pending, intent, loading, error, balance, busy, st
       )}
 
       {step === "pin" && (
-        <MoyPinStep zIndex={160} title="PIN で承認" sub="この支払いを実行します"
+        <MoyStepUp zIndex={160} required={required} cta="支払う" title="PIN で承認" sub="この支払いを実行します"
           summary={summary} showSeal seal={seal}
           notice="MoyMoy は決済画面以外で PIN を求めません。"
-          busy={busy} error={errText} cta="支払う"
+          busy={busy} error={error}
           onCancel={onBackToReview} onSubmit={onApprove} />
       )}
     </>
@@ -1371,6 +1568,8 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   // 送金・出金の step-up PIN。承認画面の PIN ステップと同じ MoyPinStep を使う。
   const [pinAsk, setPinAsk] = msState(false);
   const [pinErr, setPinErr] = msState(null);
+  // riskauth が要求した要素 ("pin" | "pin_otp")。応答が教えてくれるまで分からない。
+  const [pinRequired, setPinRequired] = msState("pin");
 
   // 個人化シール（口座ごと）。PIN 画面が開く前に読んでおく — あとから
   // 遅れて現れるシールは「出ていないこと」を手がかりにできなくなる。
@@ -1385,6 +1584,9 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   const [payDone, setPayDone] = msState(null);       // "paid" | "declined" | null
   const [payBusy, setPayBusy] = msState(false);
   const [payMin, setPayMin] = msState(false);        // チャージへ寄り道中
+  // 決済は PIN 必須なので最初の投稿には必ず PIN が乗る。第二要素が要ることは
+  // `otp_required` が返って初めて分かるので、そこで引き上げる。
+  const [payRequired, setPayRequired] = msState("pin");
 
   // A session that expired mid-use ⇒ drop this account and re-authenticate.
   function onExpired() {
@@ -1522,14 +1724,14 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     const id = pendingPayment && pendingPayment.intent_id;
     if (!id) return;
     let alive = true;
-    setPayIntent(null); setPayErr(null); setPayDone(null);
+    setPayIntent(null); setPayErr(null); setPayDone(null); setPayRequired("pin");
     setPayStep("review"); setPayMin(false); setPayBusy(false); setPayLoading(true);
     loadPaymentIntent(id, () => alive);
     return () => { alive = false; };
   }, [pendingPayment && pendingPayment.intent_id]);
 
   function clearPayment() {
-    setPayIntent(null); setPayErr(null); setPayDone(null);
+    setPayIntent(null); setPayErr(null); setPayDone(null); setPayRequired("pin");
     setPayStep("review"); setPayMin(false); setPayBusy(false); setPayLoading(false);
     if (onPaymentDone) onPaymentDone();
   }
@@ -1541,11 +1743,11 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
    * リトライは同じ intent_id を投げ直せばサーバが同じ答えを組み立て直す。
    * ここで鍵を作ると「同じ支払い」の定義が二重になる。
    */
-  async function doApprove(pin) {
+  async function doApprove(pin, otp) {
     if (!pendingPayment || payBusy) return;
     setPayBusy(true); setPayErr(null);
     try {
-      const r = await MoyMoy.paymentApprove(pendingPayment.intent_id, pin);
+      const r = await MoyMoy.paymentApprove(pendingPayment.intent_id, pin, otp);
       if (!mountedRef.current) return;
       if (r.ok) {
         await refresh(() => mountedRef.current);
@@ -1557,9 +1759,13 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
         return;
       }
       if (r.error === "unauthorized") { setPayBusy(false); onExpired(); return; }
-      // PIN の打ち直しで解決するものだけ PIN 画面に留める。それ以外は
-      // 内容確認に戻す — 期限切れや加盟店停止は、PIN を入れ直しても変わらない。
-      if (r.error !== "invalid_pin") setPayStep("review");
+      // サーバが第二要素を要ると言ってきた。以後この支払いはコードも集める。
+      if (r.required) setPayRequired(r.required);
+      // 入力の打ち直しで解決するものだけ入力画面に留める。それ以外は内容確認へ
+      // 戻す — 期限切れや加盟店停止は、PIN を入れ直しても変わらない。
+      const retryable = r.error === "invalid_pin" || r.error === "invalid_code" ||
+        r.error === "otp_required" || r.error === "otp_unavailable";
+      if (!retryable) setPayStep("review");
       setPayBusy(false);
 
       // サーバ側で状態が変わっているもの。手元の payer_view は古いので取り直す
@@ -1678,7 +1884,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
    * 金額の小さい送金まで PIN を取ると、閾値を設けた意味が無くなる。
    * `pin_required` が返ったら PIN を集めて、**同じ idem_key で**投げ直す。
    */
-  async function doConfirm(pin) {
+  async function doConfirm(pin, otp) {
     if (!confirm || busy) return;
     const { kind, target, amount } = confirm;
     setBusy(true);
@@ -1689,9 +1895,9 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       // network error or poll timeout) replays the same op, never executing twice.
       if (!idemRef.current) idemRef.current = MoyMoy.newIdem();
       if (kind === "send") {
-        res = await MoyMoy.send(target.handle, amount, idemRef.current, pin);
+        res = await MoyMoy.send(target.handle, amount, idemRef.current, pin, otp);
       } else if (kind === "withdraw") {
-        res = await MoyMoy.withdraw(amount, idemRef.current, pin);
+        res = await MoyMoy.withdraw(amount, idemRef.current, pin, otp);
       } else {
         // チャージは資金の流入なので riskauth の対象外 — PIN は渡さない。
         res = await MoyMoy.charge(amount, idemRef.current);
@@ -1699,12 +1905,17 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
 
       if (!res.ok) {
         if (res.error === "unauthorized") { setBusy(false); setConfirm(null); onExpired(); return; }
+        // 何を集めればよいかはサーバが教えてくれる。`pin_otp` なら PIN と
+        // コードを続けて集めてから 1 回で投げ直す。
+        if (res.required) setPinRequired(res.required);
         if (res.error === "pin_required") {
           setPinErr(null); setPinAsk(true); setBusy(false);
           return;
         }
-        if (res.error === "invalid_pin" || res.error === "locked" || res.error === "too_many_attempts") {
-          // PIN の打ち直しで解決するので、確認シートには戻さず PIN 画面に留める。
+        if (res.error === "invalid_pin" || res.error === "invalid_code" ||
+            res.error === "otp_required" || res.error === "otp_unavailable" ||
+            res.error === "locked" || res.error === "too_many_attempts") {
+          // 打ち直しで解決するので、確認シートには戻さず入力画面に留める。
           setPinErr({ code: res.error, retry_after_ms: res.retry_after_ms });
           setPinAsk(true); setBusy(false);
           return;
@@ -1714,7 +1925,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
         setBusy(false);
         return;
       }
-      setPinAsk(false); setPinErr(null);
+      setPinAsk(false); setPinErr(null); setPinRequired("pin");
 
       let shownAmount = amount;
       if (kind === "charge" || kind === "withdraw") {
@@ -1812,14 +2023,15 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       {/* confirm sheet */}
       {confirm && (
         <MoyConfirmSheet {...confirm} balance={balance} busy={busy} error={err}
-          onCancel={() => { idemRef.current = null; setConfirm(null); setErr(null); setPinAsk(false); setPinErr(null); }}
+          onCancel={() => { idemRef.current = null; setConfirm(null); setErr(null);
+            setPinAsk(false); setPinErr(null); setPinRequired("pin"); }}
           onConfirm={() => doConfirm()} />
       )}
 
       {/* riskauth の step-up。承認画面と同じ MoyPinStep を使う — PIN を集める
           画面が 2 つに分かれると、片方だけがシールと注意文を失う。 */}
       {confirm && pinAsk && (
-        <MoyPinStep zIndex={150}
+        <MoyStepUp zIndex={150} required={pinRequired} cta="実行する"
           title="PIN で確認" sub={confirm.kind === "withdraw" ? "この出金を実行します" : "この送金を実行します"}
           summary={
             <div style={{ border: "1.5px solid var(--ink)", padding: "12px 14px" }}>
@@ -1833,16 +2045,16 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
           }
           showSeal seal={seal}
           notice="MoyMoy は決済画面以外で PIN を求めません。"
-          busy={busy} error={pinErr ? errLabelFor(pinErr) : null} cta="実行する"
+          busy={busy} error={pinErr}
           onCancel={() => { setPinAsk(false); setPinErr(null); }}
-          onSubmit={(pin) => doConfirm(pin)} />
+          onSubmit={(pin, otp) => doConfirm(pin, otp)} />
       )}
 
       {/* EC 決済の承認。zIndex 150 — 確認シート(110)より上、完了演出(200)より下。 */}
       {pendingPayment && !payMin && (
         <MoyPaymentApproval
           pending={pendingPayment} intent={payIntent} loading={payLoading} error={payErr}
-          balance={balance} busy={payBusy} step={payStep} done={payDone}
+          required={payRequired} balance={balance} busy={payBusy} step={payStep} done={payDone}
           seal={seal}
           onToPin={() => { setPayErr(null); setPayStep("pin"); }}
           onBackToReview={() => { setPayErr(null); setPayStep("review"); }}
@@ -1879,6 +2091,6 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
 Object.assign(window, {
   MoyKeypad, MineSlot, EmeBlockMini, MoyPay, MoySend, MoyAmountEntry, MoyEmeModeSwitch,
   MoyCharge, MoyWithdraw, MoyHistory, MoyConfirmSheet, MoyMoyApp,
-  MoyPinStep, MoySealBadge, MoySealSetup, MoyPaymentApproval, MoyPaymentResumeBar,
-  errLabel, errLabelFor,
+  MoyPinStep, MoyStepUp, maskEmail, MoySealBadge, MoySealSetup,
+  MoyPaymentApproval, MoyPaymentResumeBar, errLabel, errLabelFor,
 });

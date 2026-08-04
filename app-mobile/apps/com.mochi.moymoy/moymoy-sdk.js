@@ -384,8 +384,18 @@
     // amount whether one is needed, and answers `pin_required` when it is. Asking
     // for a PIN up front would charge every 20 エメ send the friction of a
     // 20,000 エメ one. The retry MUST carry the same `idemKey`.
-    send: (toHandle, amount, idemKey, pin) =>
-      postJson("/wallet/send", { idem_key: idemKey || newIdem(), to_handle: toHandle, amount, pin }),
+    send: (toHandle, amount, idemKey, pin, otp) =>
+      postJson("/wallet/send", { idem_key: idemKey || newIdem(), to_handle: toHandle, amount, pin, otp }),
+
+    // Mail a step-up code to the account's verified address. Its own OTP purpose,
+    // so a code the user asked for to confirm a payment cannot be replayed as a
+    // login — and a login code cannot be spent here either.
+    //
+    // `{ok:false,error:"too_soon",retry_after_ms}` means a code was sent moments
+    // ago and is still valid, NOT that sending failed. A 5xx means the mail
+    // itself did not go out; the server rolls the code back, so a retry is safe
+    // and does not have to wait out the cooldown.
+    stepupOtp: () => postJson("/wallet/stepup/otp", {}),
 
     // ── EC payment, payer side ──
     // The approval screen's ONLY source. Everything it renders comes from here,
@@ -396,8 +406,8 @@
     // the backend rebuilds the same response from `state`/`payer`/`tx_id`, so a
     // retry after a lost response replays server-side. Minting a key here would
     // add a second, weaker notion of "the same payment".
-    paymentApprove: (intentId, pin) =>
-      postJson("/wallet/payment/approve", { intent_id: intentId, pin }),
+    paymentApprove: (intentId, pin, otp) =>
+      postJson("/wallet/payment/approve", { intent_id: intentId, pin, otp }),
 
     // Refuse it. No PIN: nothing moves, and making somebody authenticate to say
     // "no" is how people are taught to type their PIN into whatever asks.
@@ -510,9 +520,9 @@
     // outflow, so riskauth gates it, and anything over the frictionless band
     // answers `pin_required`. The caller collects one and retries with the SAME
     // idemKey.
-    withdraw: async (amount, idemKey, pin) => {
+    withdraw: async (amount, idemKey, pin, otp) => {
       const idem = idemKey || newIdem();
-      const first = await postJson("/wallet/withdraw", { idem_key: idem, amount, pin });
+      const first = await postJson("/wallet/withdraw", { idem_key: idem, amount, pin, otp });
       if (first.ok || first.error !== "attestation_required") return first;
 
       const a = await attest(
@@ -521,7 +531,7 @@
         amount + " エメの出金"
       );
       if (!a.ok) return { ok: false, error: a.error };
-      return postJson("/wallet/withdraw", { idem_key: idem, amount, pin, assertion: a.assertion });
+      return postJson("/wallet/withdraw", { idem_key: idem, amount, pin, otp, assertion: a.assertion });
     },
 
     op: (opId) => getJson("/wallet/op", { op_id: opId }),
