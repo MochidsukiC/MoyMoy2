@@ -116,8 +116,10 @@ fn verify_pin(pin: &str, hash: &str) -> bool {
     }
 }
 
-/// A new 256-bit session token, URL-safe base64 (no padding).
-fn gen_token() -> String {
+/// A new 256-bit CSPRNG token, URL-safe base64 (no padding). Session tokens and
+/// merchant API keys are both minted from here — one bearer-secret discipline,
+/// one place it can be got wrong.
+pub(crate) fn gen_token() -> String {
     let mut rng = OsRng;
     let mut buf = [0u8; 32];
     rng.fill_bytes(&mut buf);
@@ -125,7 +127,7 @@ fn gen_token() -> String {
 }
 
 /// SHA-256(token) as base64 — what we persist (never the token itself).
-fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
 }
@@ -195,25 +197,44 @@ pub fn create_session(
     Ok(token)
 }
 
-/// Resolve a presented token to its account_id, if a non-expired session exists.
+/// A live session, as [`resolve_session`] reads it.
+#[derive(Debug, Clone)]
+pub struct ResolvedSession {
+    pub account_id: String,
+    /// The device id the client asserted at login. **Self-asserted, so not a
+    /// security boundary** — [`crate::riskauth`] reads it only as a friction
+    /// signal, never as proof of anything.
+    pub phone_id: Option<String>,
+}
+
+/// Resolve a presented token to its session, if a non-expired one exists.
 /// Refreshes `last_seen`. Expired/unknown ⇒ `None`.
-pub fn resolve_session(conn: &Connection, token: &str) -> rusqlite::Result<Option<String>> {
+pub fn resolve_session(conn: &Connection, token: &str) -> rusqlite::Result<Option<ResolvedSession>> {
     let th = token_hash(token);
     let now = now_ms();
     let row = conn
         .query_row(
-            "SELECT account_id, expires_unix_ms FROM moymoy_sessions WHERE token_hash = ?1",
+            "SELECT account_id, phone_id, expires_unix_ms FROM moymoy_sessions WHERE token_hash = ?1",
             [&th],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
         )
         .optional()?;
     match row {
-        Some((account_id, expires)) if expires > now => {
+        Some((account_id, phone_id, expires)) if expires > now => {
             conn.execute(
                 "UPDATE moymoy_sessions SET last_seen_unix_ms = ?2 WHERE token_hash = ?1",
                 params![th, now],
             )?;
-            Ok(Some(account_id))
+            Ok(Some(ResolvedSession {
+                account_id,
+                phone_id,
+            }))
         }
         Some(_) => {
             // Expired — best-effort cleanup so the table doesn't accumulate dead rows.
@@ -503,6 +524,185 @@ pub fn verify_credentials(
     )))
 }
 
+// ── PIN re-authentication (already-signed-in caller) ─────────────────────────
+//
+// [`verify_credentials`] answers "is this handle+PIN pair a login". These three
+// answer a different question — "is the person holding this session the account
+// holder" — for an operation that then MOVES MONEY in the same breath.
+//
+// They are three calls and not one because of what sits between them. Argon2id
+// is deliberately slow (hundreds of ms), SQLite has exactly one writer, and a
+// `BEGIN IMMEDIATE` held across the hash would stall every charge, withdrawal,
+// send and payment in the wallet for the duration — a wallet-wide denial of
+// service triggered by anyone willing to type a PIN. So:
+//
+//   1. [`begin_pin_attempt`] — short write tx: judge the lockout, record the
+//      failure UP FRONT, commit. Fail-closed: a request that dies mid-flight has
+//      already been counted.
+//   2. [`verify_pin_hash`] — no transaction at all.
+//   3. [`settle_pin_success`] — inside the caller's money transaction: re-check
+//      the lockout, then clear the failure this attempt recorded.
+
+/// Whether a lockout is allowed to stop a PIN attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockoutPolicy {
+    /// A locked account is refused.
+    Enforce,
+    /// The lockout is recorded but is not a gate. Used by exactly one operation:
+    /// stopping a merchant whose API key is being abused. Somebody in the middle
+    /// of an incident, fumbling their PIN, must not be locked out of the switch
+    /// that stops the bleeding — and the switch moves no money.
+    Bypass,
+}
+
+/// Stage 1 of a PIN re-authentication.
+#[derive(Debug)]
+pub enum PinAttempt {
+    /// Compare `pin_hash` OUTSIDE any transaction. `epoch` is the failure
+    /// counter as this attempt left it, and is what stage 3 matches on to know
+    /// nothing else has happened in between.
+    Ready { pin_hash: String, epoch: i64 },
+    Locked { retry_after_ms: i64 },
+    /// No such account, or an account with no PIN (a pre-v6 merchant row). Never
+    /// treated as permission.
+    NoPin,
+}
+
+/// Stage 1: judge the lockout and record this attempt's failure before it is
+/// made, in its own short transaction.
+///
+/// Recording the failure first is what makes an abandoned request safe: the
+/// counter has already moved, so a client that drops the connection mid-Argon2
+/// has spent an attempt rather than gaining a free one.
+pub fn begin_pin_attempt(
+    conn: &mut Connection,
+    account_id: &str,
+    policy: LockoutPolicy,
+) -> Result<PinAttempt, ApiError> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let row = tx
+        .query_row(
+            "SELECT pin_hash, failed_pin_attempts, locked_until_unix_ms FROM accounts \
+             WHERE account_id = ?1",
+            [account_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let now = now_ms();
+    let Some((pin_hash, attempts, locked_until)) = row else {
+        tx.commit()?;
+        return Ok(PinAttempt::NoPin);
+    };
+    if policy == LockoutPolicy::Enforce {
+        if let Some(until) = locked_until {
+            if until > now {
+                tx.commit()?;
+                return Ok(PinAttempt::Locked {
+                    retry_after_ms: until - now,
+                });
+            }
+        }
+    }
+    let Some(pin_hash) = pin_hash else {
+        tx.commit()?;
+        return Ok(PinAttempt::NoPin);
+    };
+    let epoch = attempts + 1;
+    // The lockout is written up front too, on the same fail-closed reasoning —
+    // and stage 3 clears it again when the PIN turns out to be right. The one
+    // case it costs anything is a process death between the two, which leaves a
+    // correct fifth attempt locked out for the window. That is the price of not
+    // holding the wallet's only write lock across a password hash.
+    let lock = if epoch >= MAX_FAILED_ATTEMPTS {
+        Some(now + LOCKOUT_MS)
+    } else {
+        locked_until
+    };
+    tx.execute(
+        "UPDATE accounts SET failed_pin_attempts = ?2, locked_until_unix_ms = ?3, \
+                updated_unix_ms = ?4 WHERE account_id = ?1",
+        params![account_id, epoch, lock, now],
+    )?;
+    tx.commit()?;
+    Ok(PinAttempt::Ready { pin_hash, epoch })
+}
+
+/// Stage 2: the Argon2id comparison. Takes no connection **on purpose** — see the
+/// module note above; if this ever grows a `&Connection` parameter the DoS is back.
+pub fn verify_pin_hash(pin: &str, pin_hash: &str) -> bool {
+    verify_pin(pin, pin_hash)
+}
+
+/// Stage 3's answer.
+#[derive(Debug)]
+pub enum PinSettle {
+    Ok,
+    /// A concurrent attempt locked the account between stages.
+    Locked { retry_after_ms: i64 },
+}
+
+/// Stage 3: re-check the lockout and clear this attempt's recorded failure,
+/// inside the caller's money transaction.
+///
+/// The `epoch` match is what makes the clear safe. If the counter still reads
+/// what stage 1 left, nothing else has touched this account, so both the counter
+/// and any lockout belong to this attempt — which just proved the PIN correct —
+/// and both are cleared. If it does not, some other attempt is in flight: its
+/// record is not ours to erase, and a lockout it wrote is a real one.
+pub fn settle_pin_success(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    epoch: i64,
+    now: i64,
+) -> rusqlite::Result<PinSettle> {
+    let (attempts, locked_until) = tx.query_row(
+        "SELECT failed_pin_attempts, locked_until_unix_ms FROM accounts WHERE account_id = ?1",
+        [account_id],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+    )?;
+    if attempts != epoch {
+        if let Some(until) = locked_until {
+            if until > now {
+                return Ok(PinSettle::Locked {
+                    retry_after_ms: until - now,
+                });
+            }
+        }
+        tracing::debug!(
+            account = %account_id, epoch, attempts,
+            "another PIN attempt moved the counter between stages; leaving its record alone"
+        );
+        return Ok(PinSettle::Ok);
+    }
+    clear_pin_failures(tx, account_id, epoch)?;
+    Ok(PinSettle::Ok)
+}
+
+/// Clear the failure a correct PIN recorded in stage 1, guarded by its epoch.
+///
+/// Called from stage 3, and again — on its own, after a rollback — by the paths
+/// where the PIN was right but the operation did not commit (insufficient funds,
+/// a lost race for the intent). Without that second call, five honest retries
+/// against an empty balance would lock the account out of its own wallet.
+pub fn clear_pin_failures(
+    conn: &Connection,
+    account_id: &str,
+    epoch: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE accounts SET failed_pin_attempts = 0, locked_until_unix_ms = NULL, \
+                updated_unix_ms = ?3 \
+         WHERE account_id = ?1 AND failed_pin_attempts = ?2",
+        params![account_id, epoch, now_ms()],
+    )
+}
+
 /// Full account info by id (email flows + `/auth/me`).
 pub fn account_full(conn: &Connection, account_id: &str) -> rusqlite::Result<Option<AccountInfo>> {
     conn.query_row(
@@ -617,6 +817,13 @@ pub fn register_verified(
 #[derive(Debug, Clone)]
 pub struct AuthedAccount {
     pub account_id: String,
+    /// The device id recorded when this session was minted (self-asserted).
+    pub phone_id: Option<String>,
+    /// SHA-256 of the presented token. Identifies the session without being the
+    /// session — it is the key the payment-PIN backoff is counted against, and a
+    /// per-session counter is one only the real holder can spend (unlike the
+    /// account-wide lockout, which anyone who knows a handle can trip).
+    pub session_key: String,
 }
 
 #[axum::async_trait]
@@ -635,15 +842,20 @@ impl FromRequestParts<AppState> for AuthedAccount {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ApiError::unauthorized("missing session"))?
             .to_string();
+        let session_key = token_hash(&token);
         let pool = state.pool.clone();
-        let account_id =
-            tokio::task::spawn_blocking(move || -> Result<Option<String>, ApiError> {
+        let session =
+            tokio::task::spawn_blocking(move || -> Result<Option<ResolvedSession>, ApiError> {
                 let conn = pool.get()?;
                 resolve_session(&conn, &token).map_err(ApiError::from)
             })
             .await??;
-        match account_id {
-            Some(account_id) => Ok(AuthedAccount { account_id }),
+        match session {
+            Some(s) => Ok(AuthedAccount {
+                account_id: s.account_id,
+                phone_id: s.phone_id,
+                session_key,
+            }),
             None => Err(ApiError::unauthorized("invalid or expired session")),
         }
     }

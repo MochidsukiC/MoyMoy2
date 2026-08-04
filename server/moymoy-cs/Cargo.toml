@@ -30,6 +30,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 md5 = "0.7"  # Minecraft offline-mode player UUID (nameUUIDFromBytes of "OfflinePlayer:<name>")
 
+# Merchant-name impersonation defence (see src/merchant.rs). Pure lookup tables,
+# no runtime deps: NFKC so one name has one form; the UTS #39 confusable skeleton
+# so uniqueness is decided on what a name LOOKS like rather than on its code
+# points; the restriction level so a Latin/Cyrillic hybrid is refused while a
+# normal Japanese name (Han + Hiragana + Katakana + Latin) is not; and the raw
+# general category so the invisible classes (Cf bidi controls, unassigned,
+# private use) can be refused by what they ARE.
+unicode-normalization = "0.1"
+unicode-security = "0.1"
+unicode-general-category = "1"
+
 # Independent-account auth: Argon2id for PINs (never store plaintext), SHA-256 for
 # session-token hashes (fast per-request verify), a CSPRNG for token bytes, and
 # base64 for opaque token/hash encoding. All pure-Rust, no ring/system deps.

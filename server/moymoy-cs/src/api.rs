@@ -28,16 +28,32 @@
 //!   POST /wallet/attest/challenge {purpose}   (auth)
 //!   POST /wallet/attest/session   {assertion} (auth — confirm the character)
 //!   GET  /wallet/inventory (auth; mod-backed, no query args)
-//!   POST /wallet/send     {idem_key, to_handle, amount}            (auth)
-//!   POST /wallet/pay      {idem_key, merchant_id, amount}          (auth)
+//!   POST /wallet/send     {idem_key, to_handle, amount, pin?, otp?}  (auth)
 //!   POST /wallet/charge   {idem_key, amount, assertion?}           (auth)
-//!   POST /wallet/withdraw {idem_key, amount, assertion?}           (auth)
+//!   POST /wallet/withdraw {idem_key, amount, assertion?, pin?, otp?} (auth)
 //!   GET  /wallet/op?op_id=                                         (auth)
+//!   POST /wallet/stepup/otp                                        (auth)
+//!   GET  /wallet/payment/intent?intent_id=                         (auth)
+//!   POST /wallet/payment/approve {intent_id, pin, otp?}            (auth)
+//!   POST /wallet/payment/decline {intent_id}                       (auth)
+//!   POST /merchant/portal/register {name, sub?, pin, glyph?, pal?} (auth + PIN)
+//!   POST /merchant/portal/key      {merchant_id, pin}              (auth + PIN)
+//!   POST /merchant/portal/status   {merchant_id, status, pin}      (auth + PIN)
+//!   POST /merchant/portal/limits   {merchant_id, pin, …}           (auth + PIN)
+//!   GET  /merchant/portal/list                                     (auth)
+//!   POST /merchant/v1/intent/create {…}                            (API key)
+//!   GET  /merchant/v1/intent?intent_id=                            (API key)
+//!   POST /merchant/v1/intent/cancel {intent_id}                    (API key)
+//!
+//! `/wallet/pay` is gone. It sent a client-chosen amount to a client-chosen
+//! merchant, which is the thing `payment_intents` exists to make impossible: the
+//! amount and the recipient now come from a record the merchant created and the
+//! client can only point at.
 
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::{header, HeaderMap, HeaderName, Method};
+use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -46,12 +62,17 @@ use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::attest::{self, AttestPurpose, AttestVerifier, ChallengeStore, CharSessionStore};
-use crate::auth::{self, AuthedAccount, CredsOutcome, RegisterOutcome, VerifiedSignup};
+use crate::auth::{
+    self, AuthedAccount, CredsOutcome, LockoutPolicy, PinAttempt, RegisterOutcome, VerifiedSignup,
+};
 use crate::charge::ChargeCoordinator;
 use crate::db::{self, now_ms, Pool};
 use crate::error::ApiError;
 use crate::identity;
+use crate::merchant::{self, IssueGuard, MerchantAuth, RateLimiter};
 use crate::otp::{self, CreateOtp, Mailer, PendingSignup, VerifyOtp};
+use crate::payments::{self, CreateOutcome, NewIntent};
+use crate::riskauth::{self, PinBackoff, Requirement};
 use crate::wallet::{self, TxResult};
 
 /// Shared handler state (cheap to clone — the pool and coordinator are `Arc`-ish).
@@ -66,6 +87,10 @@ pub struct AppState {
     pub challenges: Arc<ChallengeStore>,
     /// The character each account most recently confirmed (inventory reads).
     pub char_sessions: Arc<CharSessionStore>,
+    /// Per-merchant call counters (creation / lookup / registration).
+    pub rate: Arc<RateLimiter>,
+    /// Per-session PIN backoff for the money paths.
+    pub pin_backoff: Arc<PinBackoff>,
 }
 
 impl AppState {
@@ -112,10 +137,25 @@ pub fn router(state: AppState) -> Router {
         .route("/wallet/attest/session", post(attest_session))
         .route("/wallet/inventory", get(inventory))
         .route("/wallet/send", post(send))
-        .route("/wallet/pay", post(pay))
         .route("/wallet/charge", post(charge))
         .route("/wallet/withdraw", post(withdraw))
         .route("/wallet/op", get(op_status))
+        // Step-up second factor for the movements riskauth escalates.
+        .route("/wallet/stepup/otp", post(stepup_otp))
+        // EC payment, payer side. The approval screen's only source of truth.
+        .route("/wallet/payment/intent", get(payment_intent))
+        .route("/wallet/payment/approve", post(payment_approve))
+        .route("/wallet/payment/decline", post(payment_decline))
+        // Merchant portal (session + PIN): the credential-issuing half.
+        .route("/merchant/portal/register", post(portal_register))
+        .route("/merchant/portal/key", post(portal_rotate_key))
+        .route("/merchant/portal/status", post(portal_set_status))
+        .route("/merchant/portal/limits", post(portal_set_limits))
+        .route("/merchant/portal/list", get(portal_list))
+        // Merchant API (Bearer moy_sk_…): intents only, never a balance.
+        .route("/merchant/v1/intent/create", post(intent_create))
+        .route("/merchant/v1/intent", get(intent_get))
+        .route("/merchant/v1/intent/cancel", post(intent_cancel))
         // Dev-only funding affordance (MC-less E2E). Gated by MOYMOY_DEV_CREDIT=1;
         // 403 otherwise. Never enable in a real deploy.
         .route("/wallet/_dev/credit", post(dev_credit))
@@ -871,6 +911,11 @@ struct SendReq {
     idem_key: String,
     to_handle: String,
     amount: i64,
+    /// Present once [`riskauth`] asks for it — the client posts without one,
+    /// reads `pin_required` and asks the user. Small everyday sends still go
+    /// through untouched.
+    pin: Option<String>,
+    otp: Option<String>,
 }
 
 async fn send(
@@ -881,27 +926,73 @@ async fn send(
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
-    let from_id = acct.account_id;
+    let email_enabled = st.email_enabled();
+    let backoff = st.pin_backoff.clone();
     let value = blocking(st.pool, move |conn| {
-        // Single BEGIN IMMEDIATE: idem check-reserve-execute-record is one atomic
-        // unit, so concurrent retries of the same idem_key serialize and the
-        // second one replays (no TOCTOU double-spend).
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(prev) = db::idem_get(&tx, &req.idem_key, "send")? {
-            return Ok(replay(prev)); // tx drops → rollback (read-only path)
+        // The replay is answered first, and outside the money transaction, so a
+        // retry of a send that already happened costs no PIN attempt.
+        if let Some(prev) = db::idem_get(conn, &req.idem_key, "send")? {
+            return Ok(replay(prev));
         }
-        let to = match auth::lookup_handle(&tx, &req.to_handle)? {
+        let to = match auth::lookup_handle(conn, &req.to_handle)? {
             Some(a) => a,
             None => {
                 return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" }))
             }
         };
-        let label = format!("@{} へ送金", to.handle);
-        let result = wallet::transfer(&tx, &from_id, &to.account_id, req.amount, "send", &label)?;
-        let (v, ok) = tx_result_json(result);
-        if ok {
-            db::idem_put(&tx, &req.idem_key, "send", &v.to_string())?;
+        let caller = riskauth::Caller {
+            account_id: &acct.account_id,
+            phone_id: acct.phone_id.as_deref(),
+            session_key: &acct.session_key,
+            pin: req.pin.as_deref(),
+            otp: req.otp.as_deref(),
+        };
+        let ticket = match riskauth::step_up(
+            conn,
+            &backoff,
+            email_enabled,
+            &caller,
+            req.amount,
+            Requirement::None,
+        )? {
+            riskauth::StepUp::Cleared(t) => t,
+            riskauth::StepUp::Refused(v) => return Ok(v),
+        };
+
+        // Single BEGIN IMMEDIATE: idem check-reserve-execute-record is one atomic
+        // unit, so concurrent retries of the same idem_key serialize and the
+        // second one replays (no TOCTOU double-spend).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(prev) = db::idem_get(&tx, &req.idem_key, "send")? {
+            drop(tx);
+            riskauth::refund_attempt(conn, &acct.account_id, &ticket)?;
+            return Ok(replay(prev));
         }
+        if let Some(refused) = riskauth::settle(&tx, &acct.account_id, &ticket, now_ms())? {
+            // The PIN itself was right — a wrong emailed code has its own attempt
+            // counter and must not also eat into the PIN's. (Epoch-guarded, so
+            // this is a no-op when a concurrent attempt owns the counter.)
+            drop(tx);
+            riskauth::refund_attempt(conn, &acct.account_id, &ticket)?;
+            return Ok(refused);
+        }
+        let label = format!("@{} へ送金", to.handle);
+        let result = wallet::transfer(
+            &tx,
+            &acct.account_id,
+            &to.account_id,
+            req.amount,
+            "send",
+            &label,
+        )?;
+        let (v, ok) = tx_result_json(result);
+        if !ok {
+            // Nothing moved, so the attempt the correct PIN spent goes back.
+            drop(tx);
+            riskauth::refund_attempt(conn, &acct.account_id, &ticket)?;
+            return Ok(v);
+        }
+        db::idem_put(&tx, &req.idem_key, "send", &v.to_string())?;
         tx.commit()?;
         Ok(v)
     })
@@ -909,40 +1000,545 @@ async fn send(
     Ok(Json(value))
 }
 
-#[derive(Deserialize)]
-struct PayReq {
-    idem_key: String,
-    merchant_id: String,
-    amount: i64,
-}
+// ── step-up second factor ────────────────────────────────────────────────────
 
-async fn pay(
+/// Mail a step-up code to this account's verified address.
+///
+/// Its own OTP purpose, so a code the user asked for to confirm a large payment
+/// cannot be replayed as a login, or the other way round.
+async fn stepup_otp(
     State(st): State<AppState>,
     acct: AuthedAccount,
-    Json(req): Json<PayReq>,
 ) -> Result<Json<Value>, ApiError> {
+    if !st.email_enabled() {
+        return Ok(Json(json!({ "ok": false, "error": "otp_unavailable" })));
+    }
+    let id = acct.account_id.clone();
+    let created = blocking(st.pool.clone(), move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let info = auth::account_full(&tx, &id)?
+            .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
+        let out = match info.email_lower.clone().filter(|_| info.email_verified) {
+            Some(el) => match otp::create(&tx, riskauth::PURPOSE_STEPUP, &el, Some(&id), None)? {
+                CreateOtp::Issued(code) => {
+                    Some((info.email.unwrap_or_default(), el, Some(code)))
+                }
+                CreateOtp::TooSoon { retry_after_ms } => {
+                    tx.commit()?;
+                    return Ok::<_, ApiError>(Err(retry_after_ms));
+                }
+            },
+            None => None,
+        };
+        tx.commit()?;
+        Ok(Ok(out))
+    })
+    .await?;
+    let created = match created {
+        Ok(v) => v,
+        Err(retry_after_ms) => {
+            return Ok(Json(
+                json!({ "ok": false, "error": "too_soon", "retry_after_ms": retry_after_ms }),
+            ))
+        }
+    };
+    let Some((email, email_lower, Some(code))) = created else {
+        return Ok(Json(json!({ "ok": false, "error": "otp_unavailable" })));
+    };
+    if let Err(e) = st.mailer.send(&email, &code, riskauth::PURPOSE_STEPUP).await {
+        // Roll the code back so the resend cooldown does not strand a user behind
+        // a code that was never delivered (the register/login discipline).
+        if let Err(re) = blocking(st.pool.clone(), move |conn| {
+            otp::revoke(conn, riskauth::PURPOSE_STEPUP, &email_lower)
+        })
+        .await
+        {
+            tracing::warn!(error = %re, "failed to roll back undelivered step-up OTP");
+        }
+        return Err(e);
+    }
+    Ok(Json(json!({ "ok": true, "sent": true, "email": email })))
+}
+
+// ── EC payment, payer side ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct IntentQuery {
+    intent_id: String,
+}
+
+/// Everything the approval screen may show. Deliberately the only source: what
+/// the launching app passed along is an `intent_id` and nothing else.
+async fn payment_intent(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Query(q): Query<IntentQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let v = blocking(st.pool, move |conn| {
+        let Some(intent) = payments::get(conn, &q.intent_id)? else {
+            return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_intent" }));
+        };
+        // An intent addressed to somebody else is not this account's to look at.
+        if let Some(hint) = &intent.payer_hint_account_id {
+            if hint != &acct.account_id {
+                return Ok(json!({ "ok": false, "error": "payer_mismatch" }));
+            }
+        }
+        Ok(json!({ "ok": true, "intent": payments::payer_view(conn, &intent, now_ms())? }))
+    })
+    .await?;
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+struct ApproveReq {
+    intent_id: String,
+    /// Optional in the wire schema so a client that has not collected one yet
+    /// gets `{ok:false,error:"pin_required"}` — a domain answer it can act on —
+    /// rather than a deserialization rejection.
+    pin: Option<String>,
+    otp: Option<String>,
+}
+
+async fn payment_approve(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<ApproveReq>,
+) -> Result<Json<Value>, ApiError> {
+    let email_enabled = st.email_enabled();
+    let backoff = st.pin_backoff.clone();
+    let value = blocking(st.pool, move |conn| {
+        payments::approve(
+            conn,
+            &backoff,
+            email_enabled,
+            &riskauth::Caller {
+                account_id: &acct.account_id,
+                phone_id: acct.phone_id.as_deref(),
+                session_key: &acct.session_key,
+                pin: req.pin.as_deref(),
+                otp: req.otp.as_deref(),
+            },
+            &req.intent_id,
+        )
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct DeclineReq {
+    intent_id: String,
+}
+
+async fn payment_decline(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<DeclineReq>,
+) -> Result<Json<Value>, ApiError> {
+    let value = blocking(st.pool, move |conn| {
+        payments::decline(conn, &req.intent_id, &acct.account_id).map_err(ApiError::from)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+// ── merchant portal (session + PIN) ──────────────────────────────────────────
+
+/// Re-authenticate the portal caller with their PIN.
+///
+/// Stage 1 and 2 of the [`crate::auth`] split, without the money stage: nothing
+/// under `/merchant/portal/*` moves a balance, so there is no transaction to
+/// settle into and the counter is cleared on the spot.
+async fn portal_pin(
+    st: &AppState,
+    acct: &AuthedAccount,
+    pin: &str,
+    policy: LockoutPolicy,
+) -> Result<Option<Value>, ApiError> {
+    let now = now_ms();
+    if let Err(retry_after_ms) = st.pin_backoff.check(&acct.session_key, now) {
+        return Ok(Some(
+            json!({ "ok": false, "error": "too_many_attempts", "retry_after_ms": retry_after_ms }),
+        ));
+    }
+    let id = acct.account_id.clone();
+    let attempt = blocking(st.pool.clone(), move |conn| {
+        auth::begin_pin_attempt(conn, &id, policy)
+    })
+    .await?;
+    let (pin_hash, epoch) = match attempt {
+        PinAttempt::Ready { pin_hash, epoch } => (pin_hash, epoch),
+        PinAttempt::Locked { retry_after_ms } => {
+            return Ok(Some(
+                json!({ "ok": false, "error": "locked", "retry_after_ms": retry_after_ms }),
+            ))
+        }
+        PinAttempt::NoPin => {
+            return Ok(Some(json!({ "ok": false, "error": "invalid_pin" })));
+        }
+    };
+    let pin = pin.to_string();
+    let ok = tokio::task::spawn_blocking(move || auth::verify_pin_hash(&pin, &pin_hash)).await?;
+    if !ok {
+        let retry_after_ms = st.pin_backoff.record_failure(&acct.session_key, now);
+        return Ok(Some(
+            json!({ "ok": false, "error": "invalid_pin", "retry_after_ms": retry_after_ms }),
+        ));
+    }
+    st.pin_backoff.clear(&acct.session_key);
+    let id = acct.account_id.clone();
+    blocking(st.pool.clone(), move |conn| {
+        auth::clear_pin_failures(conn, &id, epoch).map_err(ApiError::from)
+    })
+    .await?;
+    Ok(None)
+}
+
+#[derive(Deserialize)]
+struct PortalRegisterReq {
+    name: String,
+    sub: Option<String>,
+    glyph: Option<String>,
+    pal: Option<String>,
+    pin: String,
+}
+
+async fn portal_register(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalRegisterReq>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if let Err(retry_after_ms) = st.rate.check(
+        &format!("mreg:{}", acct.account_id),
+        merchant::RL_REGISTER.0,
+        merchant::RL_REGISTER.1,
+        now_ms(),
+    ) {
+        return Ok(rate_limited(retry_after_ms));
+    }
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(ok_json(refused));
+    }
+    let email_enabled = st.email_enabled();
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Where mail works, a shop that can take strangers' money must be
+        // reachable afterwards. Where it does not (no identity token), the wallet
+        // already runs handle+PIN only and this degrades with it rather than
+        // making registration impossible.
+        if email_enabled {
+            let info = auth::account_full(&tx, &acct.account_id)?
+                .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
+            if !info.email_verified {
+                return Ok::<Value, ApiError>(
+                    json!({ "ok": false, "error": "email_verification_required" }),
+                );
+            }
+        }
+        let out = merchant::register(
+            &tx,
+            &acct.account_id,
+            &req.name,
+            req.sub.as_deref(),
+            req.glyph.as_deref(),
+            req.pal.as_deref(),
+        )?;
+        let v = match out {
+            merchant::RegisterOutcome::Ok {
+                merchant_id,
+                name,
+                api_key,
+                api_key_prefix,
+            } => json!({
+                "ok": true, "merchant_id": merchant_id, "name": name,
+                // Shown once. Nothing stores it, so nothing can show it again.
+                "api_key": api_key, "api_key_prefix": api_key_prefix,
+            }),
+            merchant::RegisterOutcome::BadName(e) => {
+                json!({ "ok": false, "error": "bad_name", "reason": e.code() })
+            }
+            merchant::RegisterOutcome::BadSub(e) => {
+                json!({ "ok": false, "error": "bad_sub", "reason": e.code() })
+            }
+            merchant::RegisterOutcome::NameTaken => json!({ "ok": false, "error": "name_taken" }),
+            merchant::RegisterOutcome::TooManyMerchants => {
+                json!({ "ok": false, "error": "too_many_merchants", "limit": merchant::MAX_ACTIVE_MERCHANTS })
+            }
+        };
+        tx.commit()?;
+        Ok(v)
+    })
+    .await?;
+    Ok(ok_json(value))
+}
+
+#[derive(Deserialize)]
+struct PortalKeyReq {
+    merchant_id: String,
+    pin: String,
+}
+
+async fn portal_rotate_key(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalKeyReq>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = match merchant::rotate_key(&tx, &req.merchant_id, &acct.account_id)? {
+            Some((api_key, api_key_prefix)) => {
+                json!({ "ok": true, "api_key": api_key, "api_key_prefix": api_key_prefix })
+            }
+            None => json!({ "ok": false, "error": "unknown_merchant" }),
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct PortalStatusReq {
+    merchant_id: String,
+    status: String,
+    pin: String,
+}
+
+async fn portal_set_status(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalStatusReq>,
+) -> Result<Json<Value>, ApiError> {
+    let status = match req.status.as_str() {
+        merchant::STATUS_ACTIVE => merchant::STATUS_ACTIVE,
+        merchant::STATUS_DISABLED => merchant::STATUS_DISABLED,
+        _ => return Ok(Json(json!({ "ok": false, "error": "bad_status" }))),
+    };
+    // Stopping a shop is the one operation a lockout may not block. Somebody
+    // whose API key is being abused, fumbling their PIN under pressure, must not
+    // find that the switch which stops the bleeding is the thing they locked
+    // themselves out of. The PIN is still required and the failure is still
+    // recorded — and nothing here moves money.
+    let policy = if status == merchant::STATUS_DISABLED {
+        LockoutPolicy::Bypass
+    } else {
+        LockoutPolicy::Enforce
+    };
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, policy).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = if merchant::set_status(&tx, &req.merchant_id, &acct.account_id, status)? {
+            json!({ "ok": true, "merchant_id": req.merchant_id, "status": status })
+        } else {
+            json!({ "ok": false, "error": "unknown_merchant" })
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct PortalLimitsReq {
+    merchant_id: String,
+    pin: String,
+    max_open_intents: Option<i64>,
+    daily_issue_cap: Option<i64>,
+}
+
+async fn portal_set_limits(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalLimitsReq>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = if merchant::set_limits(
+            &tx,
+            &req.merchant_id,
+            &acct.account_id,
+            req.max_open_intents,
+            req.daily_issue_cap,
+        )? {
+            let m = merchant::get(&tx, &req.merchant_id)?;
+            json!({
+                "ok": true,
+                "max_open_intents": m.as_ref().map(|m| m.max_open_intents),
+                "daily_issue_cap": m.map(|m| m.daily_issue_cap),
+            })
+        } else {
+            json!({ "ok": false, "error": "unknown_merchant" })
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+async fn portal_list(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+) -> Result<Json<Value>, ApiError> {
+    let list = blocking(st.pool, move |conn| {
+        merchant::list_for_owner(conn, &acct.account_id).map_err(ApiError::from)
+    })
+    .await?;
+    Ok(Json(json!({ "ok": true, "merchants": list })))
+}
+
+// ── merchant API (Bearer moy_sk_…) ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct IntentCreateReq {
+    idem_key: String,
+    amount: i64,
+    description: String,
+    order_ref: Option<String>,
+    launch_app_id: Option<String>,
+    /// Who the shop expects to pay. A hint, and a restriction: naming somebody
+    /// stops anyone else from approving, but it never makes them pay.
+    payer_hint_handle: Option<String>,
+    expires_in_secs: Option<i64>,
+}
+
+async fn intent_create(
+    State(st): State<AppState>,
+    m: MerchantAuth,
+    Json(req): Json<IntentCreateReq>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
-    let from_id = acct.account_id;
+    if let Err(retry_after_ms) = st.rate.check(
+        &format!("mint:{}", m.merchant.merchant_id),
+        merchant::RL_INTENT_CREATE.0,
+        merchant::RL_INTENT_CREATE.1,
+        now_ms(),
+    ) {
+        return Ok(rate_limited(retry_after_ms));
+    }
     let value = blocking(st.pool, move |conn| {
+        let scope = payments::intent_scope(&m.merchant.merchant_id);
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(prev) = db::idem_get(&tx, &req.idem_key, "pay")? {
+        if let Some(prev) = db::idem_get(&tx, &req.idem_key, &scope)? {
             return Ok(replay(prev));
         }
-        let (to_id, merchant_name) = match wallet::merchant_account(&tx, &req.merchant_id)? {
-            Some(m) => m,
-            None => {
-                return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_target" }))
+        let payer_hint = match req.payer_hint_handle.as_deref().map(str::trim) {
+            Some(h) if !h.is_empty() => match auth::lookup_handle(&tx, h)? {
+                Some(a) => Some(a.account_id),
+                // Refused rather than silently issued to nobody: a shop that
+                // meant to address a customer should learn it got the handle
+                // wrong before the customer is standing at the till.
+                None => {
+                    return Ok::<Value, ApiError>(
+                        json!({ "ok": false, "error": "unknown_payer_hint" }),
+                    )
+                }
+            },
+            _ => None,
+        };
+        let out = payments::create(
+            &tx,
+            &m.merchant,
+            &NewIntent {
+                idem_key: &req.idem_key,
+                amount: req.amount,
+                description: &req.description,
+                order_ref: req.order_ref.as_deref(),
+                launch_app_id: req.launch_app_id.as_deref(),
+                payer_hint_account_id: payer_hint.as_deref(),
+                expires_in_secs: req.expires_in_secs,
+            },
+        )?;
+        let v = match out {
+            CreateOutcome::Ok(i) => {
+                let v = json!({
+                    "ok": true, "intent_id": i.intent_id, "state": i.state,
+                    "amount": i.amount, "expires_unix_ms": i.expires_unix_ms,
+                });
+                db::idem_put(&tx, &req.idem_key, &scope, &v.to_string())?;
+                v
+            }
+            CreateOutcome::BadAmount => json!({ "ok": false, "error": "bad_amount" }),
+            CreateOutcome::BadDescription(e) => {
+                json!({ "ok": false, "error": "bad_description", "reason": e.code() })
+            }
+            CreateOutcome::BadOrderRef(e) => {
+                json!({ "ok": false, "error": "bad_order_ref", "reason": e.code() })
+            }
+            CreateOutcome::BadTtl => json!({
+                "ok": false, "error": "bad_expires_in_secs",
+                "min": payments::MIN_TTL_SECS, "max": payments::MAX_TTL_SECS,
+            }),
+            CreateOutcome::Capped(IssueGuard::TooManyOpen { limit }) => {
+                json!({ "ok": false, "error": "too_many_open_intents", "limit": limit })
+            }
+            CreateOutcome::Capped(IssueGuard::DailyCapExceeded { limit, issued }) => {
+                json!({ "ok": false, "error": "daily_issue_cap", "limit": limit, "issued": issued })
+            }
+            CreateOutcome::Capped(IssueGuard::Ok) => {
+                return Err(ApiError::internal("issuance guard reported Ok as a refusal"))
             }
         };
-        let result = wallet::transfer(&tx, &from_id, &to_id, req.amount, "pay", &merchant_name)?;
-        let (v, ok) = tx_result_json(result);
-        if ok {
-            db::idem_put(&tx, &req.idem_key, "pay", &v.to_string())?;
-        }
         tx.commit()?;
         Ok(v)
+    })
+    .await?;
+    Ok(ok_json(value))
+}
+
+async fn intent_get(
+    State(st): State<AppState>,
+    m: MerchantAuth,
+    Query(q): Query<IntentQuery>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if let Err(retry_after_ms) = st.rate.check(
+        &format!("mget:{}", m.merchant.merchant_id),
+        merchant::RL_INTENT_READ.0,
+        merchant::RL_INTENT_READ.1,
+        now_ms(),
+    ) {
+        return Ok(rate_limited(retry_after_ms));
+    }
+    let value = blocking(st.pool, move |conn| {
+        match payments::get(conn, &q.intent_id)? {
+            // Another merchant's intent reads as a missing one — the same
+            // ownership discipline `op_status` uses, so this cannot be turned
+            // into an oracle for other shops' order flow.
+            Some(i) if i.merchant_id == m.merchant.merchant_id => Ok::<Value, ApiError>(
+                json!({ "ok": true, "intent": payments::merchant_view(&m.merchant, &i, now_ms())? }),
+            ),
+            _ => Ok(json!({ "ok": false, "error": "unknown_intent" })),
+        }
+    })
+    .await?;
+    Ok(ok_json(value))
+}
+
+#[derive(Deserialize)]
+struct IntentCancelReq {
+    intent_id: String,
+}
+
+async fn intent_cancel(
+    State(st): State<AppState>,
+    m: MerchantAuth,
+    Json(req): Json<IntentCancelReq>,
+) -> Result<Json<Value>, ApiError> {
+    let value = blocking(st.pool, move |conn| {
+        payments::cancel(conn, &req.intent_id, &m.merchant.merchant_id).map_err(ApiError::from)
     })
     .await?;
     Ok(Json(value))
@@ -1049,6 +1645,12 @@ struct WithdrawReq {
     /// produces an assertion once the answer is `attestation_required`, so a
     /// retry replays instead of raising a second consent modal.
     assertion: Option<String>,
+    /// Collected after [`riskauth`] asks. Requested AFTER the assertion, so the
+    /// client's second post already carries one and only one Argon2 comparison
+    /// happens; the assertion's challenge is not spent until it verifies, so
+    /// re-posting it alongside the PIN is fine.
+    pin: Option<String>,
+    otp: Option<String>,
 }
 
 /// Pay eme back out as in-world emeralds.
@@ -1098,6 +1700,59 @@ async fn withdraw(
             json!({ "ok": false, "error": "attestation_required" }),
         ));
     };
+    // The shared outflow gate. A withdrawal is the one movement that leaves the
+    // wallet system entirely, so it goes through the same door as a send and a
+    // payment rather than relying on the attestation — which proves which
+    // character receives the emeralds, never that the person at the phone is the
+    // account holder.
+    //
+    // Unlike send and approve, the step-up is settled in a transaction of its
+    // own: the reserve happens inside `charge::begin_withdraw`, and this gate is
+    // deliberately not reaching into that module's transaction. The cost is that
+    // a code is spent even if the reserve then fails — the user asks for another
+    // one. Nothing is authorized twice, because the counter is cleared and the
+    // code consumed exactly once here.
+    {
+        let acct = acct.clone();
+        let email_enabled = st.email_enabled();
+        let backoff = st.pin_backoff.clone();
+        let (pin, otp) = (req.pin.clone(), req.otp.clone());
+        let amount = req.amount;
+        let refused = blocking(st.pool.clone(), move |conn| {
+            let caller = riskauth::Caller {
+                account_id: &acct.account_id,
+                phone_id: acct.phone_id.as_deref(),
+                session_key: &acct.session_key,
+                pin: pin.as_deref(),
+                otp: otp.as_deref(),
+            };
+            let ticket = match riskauth::step_up(
+                conn,
+                &backoff,
+                email_enabled,
+                &caller,
+                amount,
+                Requirement::None,
+            )? {
+                riskauth::StepUp::Cleared(t) => t,
+                riskauth::StepUp::Refused(v) => return Ok(Some(v)),
+            };
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some(v) = riskauth::settle(&tx, &acct.account_id, &ticket, now_ms())? {
+                // Same reasoning as on a send: the PIN was correct, so a wrong
+                // code does not also spend a PIN attempt.
+                drop(tx);
+                riskauth::refund_attempt(conn, &acct.account_id, &ticket)?;
+                return Ok(Some(v));
+            }
+            tx.commit()?;
+            Ok::<Option<Value>, ApiError>(None)
+        })
+        .await?;
+        if let Some(v) = refused {
+            return Ok(Json(v));
+        }
+    }
     // Bound to THIS withdrawal, under a domain of its own: an assertion approved
     // for a charge does not verify here, and one approved for 100 エメ does not
     // authorize paying out 10000.
@@ -1227,6 +1882,21 @@ fn tx_result_json(r: TxResult) -> (Value, bool) {
             false,
         ),
     }
+}
+
+/// Too many calls. A `429` and not a `200 {ok:false}`: the wallet is refusing to
+/// look at the request at all, which is an infrastructure answer — unlike
+/// "insufficient" or "already_paid", which are facts about the request itself.
+fn rate_limited(retry_after_ms: i64) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({ "ok": false, "error": "rate_limited", "retry_after_ms": retry_after_ms })),
+    )
+}
+
+/// The ordinary answer from a handler that can also rate-limit.
+fn ok_json(v: Value) -> (StatusCode, Json<Value>) {
+    (StatusCode::OK, Json(v))
 }
 
 /// Parse a frozen idempotency response back to JSON, tagging it as a replay.

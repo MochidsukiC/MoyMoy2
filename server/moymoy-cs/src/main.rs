@@ -19,7 +19,10 @@ mod db;
 mod error;
 mod identity;
 mod mc;
+mod merchant;
 mod otp;
+mod payments;
+mod riskauth;
 mod tls;
 mod tunnel;
 mod wallet;
@@ -91,11 +94,33 @@ async fn main() -> anyhow::Result<()> {
     // eventually settles (at-least-once + op-idempotent mod), and age out ops too
     // old to keep retrying. Once at startup, then on a timer — unconditionally,
     // since the tunnel may connect (or drop) at any point in this process's life.
+    //
+    // Expiring payment intents rides along on this same pass rather than getting
+    // a timer of its own: it is one indexed UPDATE, it has no deadline of its own
+    // (approve carries `expires_unix_ms > now` in its claim, so a late sweep can
+    // never let a stale intent be paid), and a second scheduler would be a second
+    // thing to get wrong.
     {
         let charge_rec = charge.clone();
+        let pool_rec = pool.clone();
         tokio::spawn(async move {
             loop {
                 charge_rec.reconcile().await;
+                let pool = pool_rec.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let conn = pool.get()?;
+                    let n = payments::expire_pass(&conn, db::now_ms())?;
+                    if n > 0 {
+                        tracing::info!(count = n, "expired unanswered payment intents");
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
+                {
+                    tracing::error!(error = %e, "payment-intent expiry pass failed");
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
         });
@@ -113,6 +138,13 @@ async fn main() -> anyhow::Result<()> {
         attest: attest_verifier,
         challenges,
         char_sessions,
+        // Throttles, not boundaries: the merchant issuance ceilings and the PIN
+        // lockout are what actually bound damage. Both live in this process for
+        // the same reason the attestation challenge store does — there is one
+        // moymoy-cs, and putting a counter in SQLite would mean a write on every
+        // read of every intent.
+        rate: Arc::new(merchant::RateLimiter::new()),
+        pin_backoff: Arc::new(riskauth::PinBackoff::new()),
     };
 
     // --- bind loopback listener ---

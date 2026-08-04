@@ -31,8 +31,11 @@ const SCHEMA_V4: &str = include_str!("schema_v4.sql");
 /// a per-request Hub-signed attestation; `emerald_ops` gains the consented
 /// `attester_id` and charge idempotency becomes account-scoped.
 const SCHEMA_V5: &str = include_str!("schema_v5.sql");
+/// The v6 delta: merchants gain an owner, an API credential, a status and a
+/// confusable-skeleton name claim; `payment_intents` carries EC payments.
+const SCHEMA_V6: &str = include_str!("schema_v6.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -129,9 +132,61 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 5;
         tracing::info!("sqlite migrated to schema v5 (attestation-based character authorization)");
     }
-    // Future: `if version < 6 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V6)?;
-    //          tx.pragma_update(None, "user_version", 6)?; tx.commit()?; version = 6; }`
+    if version < 6 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V6)?;
+        // The skeleton is computed by a Unicode table, not by SQL, so the
+        // backfill of pre-v6 names lives here rather than in the .sql file — and
+        // inside the SAME transaction, so a failure leaves no half-claimed names.
+        backfill_merchant_skeletons(&tx)?;
+        tx.pragma_update(None, "user_version", 6)?;
+        tx.commit()?;
+        version = 6;
+        tracing::info!("sqlite migrated to schema v6 (self-serve merchants + payment intents)");
+    }
+    // Future: `if version < 7 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V7)?;
+    //          tx.pragma_update(None, "user_version", 7)?; tx.commit()?; version = 7; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
+    Ok(())
+}
+
+/// Give every pre-v6 merchant the confusable skeleton its name resolves to, so
+/// the new uniqueness rule covers names that existed before the rule did.
+///
+/// **A collision must not fail the migration.** Two merchants seeded years apart
+/// can perfectly legitimately resolve to the same skeleton, and a migration that
+/// refuses to apply takes the whole wallet offline at startup — a deployment
+/// outage caused by a naming rule. So the loser keeps a NULL skeleton (the index
+/// is partial, so that is allowed) and says so in the log: it simply does not
+/// reserve its name, and an operator can rename it and restart to claim one.
+///
+/// Oldest first, so if this ever runs twice the same row wins both times.
+fn backfill_merchant_skeletons(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT merchant_id, name FROM merchants ORDER BY created_unix_ms ASC")?;
+        let v = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        v
+    };
+    let mut claimed = std::collections::HashSet::new();
+    for (merchant_id, name) in rows {
+        let skeleton = crate::merchant::name_skeleton(&name);
+        if skeleton.is_empty() || !claimed.insert(skeleton.clone()) {
+            tracing::warn!(
+                %merchant_id, %name, %skeleton,
+                "v6 migration: this merchant's name resolves to a skeleton an older merchant \
+                 already claims (or to nothing at all) — leaving name_skeleton NULL so the \
+                 migration still applies; the merchant keeps working but reserves no name"
+            );
+            continue;
+        }
+        tx.execute(
+            "UPDATE merchants SET name_skeleton = ?2 WHERE merchant_id = ?1",
+            rusqlite::params![merchant_id, skeleton],
+        )?;
+    }
     Ok(())
 }
 
@@ -247,12 +302,12 @@ mod tests {
         idem_put(&conn, "k-send", "send", "{\"ok\":true}").unwrap();
         idem_put(&conn, "k-orphan", "charge", "{\"ok\":true}").unwrap();
 
-        migrate(&mut conn).expect("v4 → v5");
+        migrate(&mut conn).expect("v4 → current");
 
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            SCHEMA_VERSION
         );
         // The link table is gone — no residue left to read as an ownership key.
         let links: i64 = conn
@@ -298,6 +353,50 @@ mod tests {
         // …while other scopes and orphans are untouched.
         assert!(idem_get(&conn, "k-send", "send").unwrap().is_some());
         assert!(idem_get(&conn, "k-orphan", "charge").unwrap().is_some());
+    }
+
+    /// The v6 rule that must never take a wallet offline: a pre-existing name
+    /// that resolves to a skeleton an older merchant already claims leaves this
+    /// row unnamed and logs it, rather than failing the migration at startup.
+    #[test]
+    fn a_pre_v6_name_collision_leaves_a_null_skeleton_instead_of_failing_startup() {
+        let mut conn = v4_db();
+        insert_account(&conn, "acct-shop");
+        for (id, name, created) in [
+            ("m-first", "PiggleShop", 1),
+            ("m-clash", "PiggleShoр", 2), // Cyrillic er — the same skeleton
+            ("m-other", "鉱石商会", 3),
+        ] {
+            conn.execute(
+                "INSERT INTO merchants (merchant_id, account_id, name, created_unix_ms) \
+                 VALUES (?1, 'acct-shop', ?2, ?3)",
+                rusqlite::params![id, name, created],
+            )
+            .unwrap();
+        }
+
+        migrate(&mut conn).expect("a name collision must not stop the migration");
+
+        let skeleton = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT name_skeleton FROM merchants WHERE merchant_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Oldest first wins the name; the imitator keeps working but claims none.
+        assert!(skeleton("m-first").is_some());
+        assert_eq!(skeleton("m-clash"), None);
+        assert!(skeleton("m-other").is_some());
+        // And the demo merchants leave the pay tab, which is what `listed = 0`
+        // defaulting is for: money paid to a handle-less account is unreachable.
+        let listed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM merchants WHERE listed = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(listed, 0);
     }
 
     #[test]

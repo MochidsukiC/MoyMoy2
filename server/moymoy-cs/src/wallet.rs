@@ -455,10 +455,16 @@ pub fn friends(conn: &Connection, account_id: &str) -> rusqlite::Result<Vec<Frie
     Ok(rows)
 }
 
-/// Registered shops (the "pay" tab list).
+/// Registered shops the wallet offers in its "pay" tab.
+///
+/// `listed = 1` is the whole filter and it is load-bearing: registration is
+/// self-serve since v6, and `listed` defaults to 0. Without this clause every
+/// shop would appear in every user's wallet the moment it registered, and the
+/// default would prevent nothing.
 pub fn merchants(conn: &Connection) -> rusqlite::Result<Vec<Merchant>> {
     let mut stmt = conn.prepare(
-        "SELECT merchant_id, name, sub, glyph, pal FROM merchants ORDER BY created_unix_ms ASC",
+        "SELECT merchant_id, name, sub, glyph, pal FROM merchants \
+         WHERE listed = 1 AND status = 'active' ORDER BY created_unix_ms ASC",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -474,18 +480,11 @@ pub fn merchants(conn: &Connection) -> rusqlite::Result<Vec<Merchant>> {
     Ok(rows)
 }
 
-/// Resolve a merchant_id to its backing account_id + display name.
-pub fn merchant_account(
-    conn: &Connection,
-    merchant_id: &str,
-) -> rusqlite::Result<Option<(String, String)>> {
-    conn.query_row(
-        "SELECT account_id, name FROM merchants WHERE merchant_id = ?1",
-        [merchant_id],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-    )
-    .optional()
-}
+// `merchant_account()` lived here and resolved a merchant_id to its receiving
+// account WITHOUT looking at its status, which meant a frozen shop kept
+// collecting on anything already in flight. It had exactly one caller,
+// `/wallet/pay`, and both are gone: a payment now resolves its merchant through
+// `merchant::get`, and `payments::approve` refuses a merchant that is not active.
 
 /// Seed the design's demo merchants (and their backing accounts) once, so the
 /// "pay" tab is populated in a fresh dev DB. No-op when any merchant exists.
@@ -523,10 +522,24 @@ pub fn seed_demo_merchants(conn: &mut Connection) -> rusqlite::Result<()> {
                 now
             ],
         )?;
+        // The skeleton is claimed here too, not only by the v6 backfill: without
+        // it a fresh DB would let somebody register a shop under a demo name
+        // while a migrated one refused the same registration.
         tx.execute(
-            "INSERT INTO merchants (merchant_id, account_id, name, sub, glyph, pal, created_unix_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![mid, account_id, name, sub, glyph, pal, now],
+            "INSERT INTO merchants \
+               (merchant_id, account_id, name, name_skeleton, sub, glyph, pal, \
+                created_unix_ms, updated_unix_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                mid,
+                account_id,
+                name,
+                crate::merchant::name_skeleton(name),
+                sub,
+                glyph,
+                pal,
+                now
+            ],
         )?;
     }
     tx.commit()?;
