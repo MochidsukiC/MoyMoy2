@@ -487,7 +487,7 @@ pub fn approve(
         riskauth::StepUp::Refused(v) => return Ok(v),
     };
 
-    let settled = settle(conn, &intent, &m, a.account_id, &ticket, now)?;
+    let settled = settle(conn, &intent, &m, a.account_id, &ticket)?;
     if !settled.committed {
         // The PIN was right; the operation just did not happen (short balance, a
         // lost race, a wrong code). Give the attempt back, or five honest retries
@@ -509,8 +509,16 @@ fn settle(
     m: &MerchantRow,
     payer: &str,
     ticket: &riskauth::StepUpTicket,
-    now: i64,
 ) -> Result<Settled, ApiError> {
+    // Read the clock HERE, not in the caller. Between `approve`'s first look at
+    // the intent and this line sits an Argon2id comparison, a wait for a pooled
+    // connection and a wait for SQLite's single write lock — hundreds of
+    // milliseconds under load. Carrying the arrival time down would evaluate the
+    // deadline against when the request showed up rather than when it is being
+    // acted on, and an intent that expired mid-PIN would still be payable so long
+    // as the sweep had not caught it. The deadline is what stops that; the sweep
+    // is only housekeeping.
+    let now = now_ms();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // The lockout is re-checked here, inside the transaction that moves the
@@ -723,6 +731,13 @@ mod tests {
     /// `acct-m`, plus one open intent.
     fn fixture(amount: i64, balance: i64) -> (Pool, String, MerchantRow) {
         let pool = crate::db::open_memory().expect("in-memory pool");
+        let (intent_id, m) = seed(&pool, amount, balance);
+        (pool, intent_id, m)
+    }
+
+    /// Everything [`fixture`] sets up, against whichever pool it is handed — the
+    /// concurrency test needs the same world on a file-backed database.
+    fn seed(pool: &Pool, amount: i64, balance: i64) -> (String, MerchantRow) {
         let mut conn = pool.get().expect("checkout");
         let hash = auth::hash_pin(PIN).unwrap();
         for (id, handle) in [("acct-a", "payer"), ("acct-m", "shopkeep")] {
@@ -747,7 +762,39 @@ mod tests {
         };
         let intent_id = new_intent(&mut conn, &m, amount, None, DEFAULT_TTL_SECS);
         drop(conn);
-        (pool, intent_id, m)
+        (intent_id, m)
+    }
+
+    /// A file-backed database, deleted when the test ends.
+    ///
+    /// `open_memory()` cannot be used for anything genuinely concurrent: it pins
+    /// `max_size(1)`, and `SqliteConnectionManager::memory()` hands every
+    /// connection a database of its OWN — two threads would not even be looking
+    /// at the same rows. A real file gives the pool several connections onto one
+    /// database, which is what makes threads contend the way they do in the
+    /// server.
+    struct TempDb {
+        path: String,
+        pool: Pool,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("moymoy-test-{}.db", uuid::Uuid::new_v4().simple()))
+                .to_string_lossy()
+                .into_owned();
+            let pool = crate::db::open(&path).expect("file-backed pool");
+            TempDb { path, pool }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.path));
+            }
+        }
     }
 
     fn new_intent(
@@ -832,34 +879,160 @@ mod tests {
         assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
     }
 
-    /// The claim is the whole safety argument: whatever races it, only the
-    /// statement that finds `state='created'` may move money.
+    /// The claim is the whole safety argument, so it is exercised through
+    /// `approve()` on real threads against one real database — not by replaying
+    /// a copy of its SQL on a single connection, which would keep passing if the
+    /// guard were deleted from the code that actually runs.
+    ///
+    /// Four threads, not more: `begin_pin_attempt` records each attempt up front,
+    /// so a fifth concurrent approval would trip the account lockout and return
+    /// `locked` before ever reaching the claim — correct behaviour, but it would
+    /// stop this test from testing what it is here for.
     #[test]
-    fn only_one_claim_of_an_intent_can_ever_succeed() {
-        let (pool, intent_id, _) = fixture(300, 1_000);
-        let conn = pool.get().unwrap();
-        let now = now_ms();
-        let claim = |payer: &str| {
-            conn.execute(
-                "UPDATE payment_intents SET state = ?3, payer_account_id = ?2, \
-                        updated_unix_ms = ?4 \
-                 WHERE intent_id = ?1 AND state = ?5 AND expires_unix_ms > ?4",
-                params![intent_id, payer, STATE_PAID, now, STATE_CREATED],
-            )
-            .unwrap()
-        };
-        assert_eq!(claim("acct-a"), 1);
-        // Every later attempt — a second phone, a retry, a merchant cancel — finds
-        // the row in a state its guard refuses.
-        assert_eq!(claim("acct-b"), 0);
+    fn only_one_of_several_concurrent_approvals_can_pay() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 4;
+        const AMOUNT: i64 = 300;
+        const START: i64 = 10_000;
+
+        let db = TempDb::new();
+        let (intent_id, m) = seed(&db.pool, AMOUNT, START);
+        let barrier = Arc::new(Barrier::new(THREADS));
+        // One shared backoff, as the server has: the threads are one session.
+        let backoff = Arc::new(PinBackoff::new());
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let pool = db.pool.clone();
+            let backoff = backoff.clone();
+            let barrier = barrier.clone();
+            let intent_id = intent_id.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut conn = pool.get().expect("checkout");
+                // Released together, so every thread reads the intent while it is
+                // still `created` and they all arrive at the claim.
+                barrier.wait();
+                approve(&mut conn, &backoff, &approver(Some(PIN)), &intent_id).unwrap()
+            }));
+        }
+        let results: Vec<Value> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Which thread wins is not the property under test — that exactly one
+        // does, and that the others come back as something that moved no money.
+        let winners: Vec<&Value> = results
+            .iter()
+            .filter(|v| v["ok"] == json!(true) && v.get("duplicate").is_none())
+            .collect();
+        assert_eq!(winners.len(), 1, "not exactly one payment: {results:#?}");
+        assert_eq!(winners[0]["amount"], json!(AMOUNT));
+
+        let claim_losers = results
+            .iter()
+            .filter(|v| v["error"] == json!("already_paid"))
+            .count();
+        let replays = results
+            .iter()
+            .filter(|v| v.get("duplicate") == Some(&json!(true)))
+            .count();
         assert_eq!(
-            conn.execute(
-                "UPDATE payment_intents SET state = ?2 WHERE intent_id = ?1 AND state = ?3",
-                params![intent_id, STATE_CANCELED, STATE_CREATED],
-            )
-            .unwrap(),
-            0
+            claim_losers + replays,
+            THREADS - 1,
+            "a loser came back as something other than a replay or a lost claim: {results:#?}"
         );
+        // The branch this test exists for: a thread that got past the replay
+        // check and lost the claim. The barrier plus the ~100 ms Argon2id
+        // comparison makes the window enormous compared to thread start-up, so
+        // every loser should land here.
+        assert!(
+            claim_losers >= 1,
+            "no thread reached the claim guard — the race did not happen: {results:#?}"
+        );
+
+        // The ledger is the final word: the money moved exactly once.
+        assert_eq!(balance_of(&db.pool, "acct-a"), START - AMOUNT);
+        assert_eq!(balance_of(&db.pool, &m.account_id), AMOUNT);
+        assert_eq!(state_of(&db.pool, &intent_id), STATE_PAID);
+        let paid_rows: i64 = db
+            .pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = ?1 AND kind = 'pay'",
+                [&m.account_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(paid_rows, 0, "the merchant was debited by its own sale");
+        let payer_rows: i64 = db
+            .pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = 'acct-a' AND kind = 'pay'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(payer_rows, 1, "the payer was charged more than once");
+    }
+
+    /// An intent whose deadline passes DURING the PIN check must not be paid.
+    ///
+    /// This is the test that pins down *which clock* the claim uses. The deadline
+    /// is set a few milliseconds past the moment the approval starts — so it is
+    /// still live when the request arrives, and lapsed by the time the Argon2id
+    /// comparison finishes. A claim judging the deadline against the arrival time
+    /// pays it; one that reads the clock where the money actually moves does not.
+    #[test]
+    fn an_intent_that_lapses_during_the_pin_check_is_not_paid() {
+        use std::sync::{Arc, Barrier};
+
+        /// Comfortably longer than the gap between two threads leaving a barrier,
+        /// and comfortably shorter than an Argon2id verification.
+        const GRACE_MS: i64 = 20;
+
+        let db = TempDb::new();
+        let (intent_id, _) = seed(&db.pool, 300, 1_000);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let approver_thread = {
+            let pool = db.pool.clone();
+            let barrier = barrier.clone();
+            let intent_id = intent_id.clone();
+            std::thread::spawn(move || {
+                let mut conn = pool.get().unwrap();
+                barrier.wait();
+                approve(
+                    &mut conn,
+                    &PinBackoff::new(),
+                    &approver(Some(PIN)),
+                    &intent_id,
+                )
+                .unwrap()
+            })
+        };
+        barrier.wait();
+        let deadline = now_ms() + GRACE_MS;
+        db.pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE payment_intents SET expires_unix_ms = ?2 WHERE intent_id = ?1",
+                params![intent_id, deadline],
+            )
+            .unwrap();
+
+        let v = approver_thread.join().unwrap();
+        // The PIN check has to have outlived the deadline, or this test proved
+        // nothing about which clock was consulted.
+        assert!(
+            now_ms() > deadline,
+            "the approval finished before the deadline it was supposed to outlive"
+        );
+        assert_eq!(v["ok"], json!(false), "a lapsed intent was paid: {v}");
+        assert_eq!(balance_of(&db.pool, "acct-a"), 1_000);
+        assert_ne!(state_of(&db.pool, &intent_id), STATE_PAID);
     }
 
     #[test]
