@@ -148,8 +148,16 @@
   async function readAnswer(res, what) {
     if (res.status === 401) return { ok: false, error: "unauthorized", status: 401 };
     if (res.status === 429) {
-      const body = await res.json().catch(() => null);
-      return body || { ok: false, error: "rate_limited", status: 429 };
+      try {
+        return await res.json();
+      } catch (e) {
+        // 本文が読めない = `retry_after_ms` が分からない。既定値を置くと
+        // 「あと何分待てばよいか」を推測で言うことになるので、status から確実に
+        // 言える「制限された」だけを返し、待ち時間は名乗らない（errLabelFor は
+        // retry_after_ms が無ければ時間を出さない）。読めなかった事実は残す。
+        console.error("moymoy " + what + " → HTTP 429 but the body did not parse", e);
+        return { ok: false, error: "rate_limited", status: 429 };
+      }
     }
     if (!res.ok) throw new Error("moymoy " + what + " → HTTP " + res.status);
     return res.json();

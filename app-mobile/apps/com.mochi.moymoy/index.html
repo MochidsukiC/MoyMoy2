@@ -34,6 +34,9 @@
     <script type="text/babel" src="wallet/crystal.jsx"></script>
     <script type="text/babel" src="wallet/moymoy.jsx"></script>
     <script type="text/babel" src="wallet/moymoy-screens.jsx"></script>
+    <!-- Merchant portal (settings). Split out of moymoy-screens.jsx; loaded
+         after it because it builds on that file's shared parts. -->
+    <script type="text/babel" src="wallet/moymoy-merchant-portal.jsx"></script>
     <!-- Auth shell + multi-account (independent MoyMoy accounts). Loaded last so
          it can wrap MoyMoyApp. -->
     <script type="text/babel" src="wallet/moymoy-auth.jsx"></script>
