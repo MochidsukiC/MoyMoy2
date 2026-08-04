@@ -32,6 +32,7 @@
 //!   POST /wallet/charge   {idem_key, amount, assertion?}           (auth)
 //!   POST /wallet/withdraw {idem_key, amount, assertion?, pin?}     (auth)
 //!   GET  /wallet/op?op_id=                                         (auth)
+//!   POST /wallet/stepup/otp                                        (auth)
 //!   GET  /wallet/payment/intent?intent_id=                         (auth)
 //!   POST /wallet/payment/approve {intent_id, pin}                  (auth)
 //!   POST /wallet/payment/decline {intent_id}                       (auth)
@@ -140,6 +141,8 @@ pub fn router(state: AppState) -> Router {
         .route("/wallet/charge", post(charge))
         .route("/wallet/withdraw", post(withdraw))
         .route("/wallet/op", get(op_status))
+        // The second factor for the movements riskauth escalates.
+        .route("/wallet/stepup/otp", post(stepup_otp))
         // EC payment, payer side. The approval screen's only source of truth.
         .route("/wallet/payment/intent", get(payments::payment_intent))
         .route("/wallet/payment/approve", post(payments::payment_approve))
@@ -914,6 +917,8 @@ struct SendReq {
     /// reads `pin_required` and asks the user. Small everyday sends still go
     /// through untouched.
     pin: Option<String>,
+    /// Supplied on the retry after `otp_required`.
+    otp: Option<String>,
 }
 
 async fn send(
@@ -924,6 +929,7 @@ async fn send(
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
+    let email_enabled = st.email_enabled();
     let backoff = st.pin_backoff.clone();
     let value = blocking(st.pool, move |conn| {
         // The replay is answered first, and outside the money transaction, so a
@@ -942,9 +948,16 @@ async fn send(
             phone_id: acct.phone_id.as_deref(),
             session_key: &acct.session_key,
             pin: req.pin.as_deref(),
+            otp: req.otp.as_deref(),
         };
-        let ticket =
-            match riskauth::step_up(conn, &backoff, &caller, req.amount, Requirement::None)? {
+        let ticket = match riskauth::step_up(
+            conn,
+            &backoff,
+            email_enabled,
+            &caller,
+            req.amount,
+            Requirement::None,
+        )? {
                 riskauth::StepUp::Cleared(t) => t,
                 riskauth::StepUp::Refused(v) => return Ok(v),
             };
@@ -984,6 +997,67 @@ async fn send(
     })
     .await?;
     Ok(Json(value))
+}
+
+// ── step-up second factor ────────────────────────────────────────────────────
+
+/// Mail a step-up code to this account's verified address.
+///
+/// Its own OTP purpose, so a code the user asked for to confirm a large payment
+/// cannot be replayed as a login, or the other way round. Takes no body: what a
+/// code authorizes is decided by [`riskauth`] when it is presented, not here.
+async fn stepup_otp(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+) -> Result<Json<Value>, ApiError> {
+    if !st.email_enabled() {
+        return Ok(Json(json!({ "ok": false, "error": "otp_unavailable" })));
+    }
+    let id = acct.account_id.clone();
+    let created = blocking(st.pool.clone(), move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let info = auth::account_full(&tx, &id)?
+            .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
+        let out = match info.email_lower.clone().filter(|_| info.email_verified) {
+            Some(el) => match otp::create(&tx, riskauth::PURPOSE_STEPUP, &el, Some(&id), None)? {
+                CreateOtp::Issued(code) => Some((info.email.unwrap_or_default(), el, code)),
+                CreateOtp::TooSoon { retry_after_ms } => {
+                    tx.commit()?;
+                    return Ok::<_, ApiError>(Err(retry_after_ms));
+                }
+            },
+            None => None,
+        };
+        tx.commit()?;
+        Ok(Ok(out))
+    })
+    .await?;
+    let created = match created {
+        Ok(v) => v,
+        Err(retry_after_ms) => {
+            return Ok(Json(
+                json!({ "ok": false, "error": "too_soon", "retry_after_ms": retry_after_ms }),
+            ))
+        }
+    };
+    // An account with no verified address gets the same word riskauth uses, so
+    // the app has one condition to handle rather than two.
+    let Some((email, email_lower, code)) = created else {
+        return Ok(Json(json!({ "ok": false, "error": "otp_unavailable" })));
+    };
+    if let Err(e) = st.mailer.send(&email, &code, riskauth::PURPOSE_STEPUP).await {
+        // Roll the code back so the resend cooldown does not strand a user behind
+        // a code that was never delivered (the register/login discipline).
+        if let Err(re) = blocking(st.pool.clone(), move |conn| {
+            otp::revoke(conn, riskauth::PURPOSE_STEPUP, &email_lower)
+        })
+        .await
+        {
+            tracing::warn!(error = %re, "failed to roll back undelivered step-up OTP");
+        }
+        return Err(e);
+    }
+    Ok(Json(json!({ "ok": true, "sent": true, "email": email })))
 }
 
 #[derive(Deserialize)]
@@ -1092,6 +1166,7 @@ struct WithdrawReq {
     /// happens; the assertion's challenge is not spent until it verifies, so
     /// re-posting it alongside the PIN is fine.
     pin: Option<String>,
+    otp: Option<String>,
 }
 
 /// Pay eme back out as in-world emeralds.
@@ -1139,9 +1214,11 @@ async fn withdraw(
     let assertion = match withdraw_gate(
         st.pool.clone(),
         st.pin_backoff.clone(),
+        st.email_enabled(),
         acct.clone(),
         req.amount,
         req.pin.clone(),
+        req.otp.clone(),
         req.assertion.clone(),
     )
     .await?
@@ -1220,12 +1297,15 @@ async fn withdraw(
 ///
 /// `Ok(Ok(assertion))` = both cleared, here is the assertion to verify.
 /// `Ok(Err(body))` = the app still owes something; `body` says which.
+#[allow(clippy::too_many_arguments)]
 async fn withdraw_gate(
     pool: Pool,
     backoff: Arc<PinBackoff>,
+    email_enabled: bool,
     acct: AuthedAccount,
     amount: i64,
     pin: Option<String>,
+    otp: Option<String>,
     assertion: Option<String>,
 ) -> Result<Result<String, Value>, ApiError> {
     // The shared outflow gate. A withdrawal is the one movement that leaves the
@@ -1245,8 +1325,16 @@ async fn withdraw_gate(
             phone_id: acct.phone_id.as_deref(),
             session_key: &acct.session_key,
             pin: pin.as_deref(),
+            otp: otp.as_deref(),
         };
-        let ticket = match riskauth::step_up(conn, &backoff, &caller, amount, Requirement::None)? {
+        let ticket = match riskauth::step_up(
+            conn,
+            &backoff,
+            email_enabled,
+            &caller,
+            amount,
+            Requirement::None,
+        )? {
             riskauth::StepUp::Cleared(t) => t,
             riskauth::StepUp::Refused(v) => return Ok(Some(v)),
         };
@@ -1402,9 +1490,11 @@ mod tests {
         withdraw_gate(
             pool.clone(),
             Arc::new(PinBackoff::new()),
+            false,
             acct.clone(),
             BIG,
             pin.map(str::to_string),
+            None,
             assertion.map(str::to_string),
         )
         .await
@@ -1466,8 +1556,10 @@ mod tests {
         let v = withdraw_gate(
             pool.clone(),
             Arc::new(PinBackoff::new()),
+            false,
             acct.clone(),
             crate::riskauth::FRICTIONLESS_SINGLE,
+            None,
             None,
             None,
         )

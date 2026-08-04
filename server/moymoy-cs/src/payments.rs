@@ -426,6 +426,7 @@ pub fn decline(conn: &Connection, intent_id: &str, account_id: &str) -> rusqlite
 pub fn approve(
     conn: &mut Connection,
     backoff: &PinBackoff,
+    email_enabled: bool,
     a: &riskauth::Caller<'_>,
     intent_id: &str,
 ) -> Result<Value, ApiError> {
@@ -485,7 +486,7 @@ pub fn approve(
 
     // A payment is a PIN by standing decision (the user's explicit choice); the
     // amount may only raise that, never lower it.
-    let ticket = match riskauth::step_up(conn, backoff, a, intent.amount, Requirement::Pin)? {
+    let ticket = match riskauth::step_up(conn, backoff, email_enabled, a, intent.amount, Requirement::Pin)? {
         riskauth::StepUp::Cleared(t) => t,
         riskauth::StepUp::Refused(v) => return Ok(v),
     };
@@ -759,6 +760,8 @@ pub(crate) struct ApproveReq {
     /// gets `{ok:false,error:"pin_required"}` — a domain answer it can act on —
     /// rather than a deserialization rejection.
     pin: Option<String>,
+    /// Supplied on the retry after `otp_required`.
+    otp: Option<String>,
 }
 
 pub(crate) async fn payment_approve(
@@ -766,16 +769,19 @@ pub(crate) async fn payment_approve(
     acct: AuthedAccount,
     Json(req): Json<ApproveReq>,
 ) -> Result<Json<Value>, ApiError> {
+    let email_enabled = st.email_enabled();
     let backoff = st.pin_backoff.clone();
     let value = blocking(st.pool, move |conn| {
         approve(
             conn,
             &backoff,
+            email_enabled,
             &riskauth::Caller {
                 account_id: &acct.account_id,
                 phone_id: acct.phone_id.as_deref(),
                 session_key: &acct.session_key,
                 pin: req.pin.as_deref(),
+                otp: req.otp.as_deref(),
             },
             &req.intent_id,
         )
@@ -910,12 +916,13 @@ mod tests {
         i.intent_id
     }
 
-    fn approver(pin: Option<&str>) -> riskauth::Caller<'_> {
+    fn approver<'a>(pin: Option<&'a str>, otp: Option<&'a str>) -> riskauth::Caller<'a> {
         riskauth::Caller {
             account_id: "acct-a",
             phone_id: None,
             session_key: "sess-a",
             pin,
+            otp,
         }
     }
 
@@ -925,11 +932,93 @@ mod tests {
 
     fn approve_with(pool: &Pool, intent_id: &str, pin: Option<&str>) -> Value {
         let mut conn = pool.get().unwrap();
-        approve(&mut conn, &PinBackoff::new(), &approver(pin), intent_id).unwrap()
+        approve(
+            &mut conn,
+            &PinBackoff::new(),
+            false,
+            &approver(pin, None),
+            intent_id,
+        )
+        .unwrap()
     }
 
     fn balance_of(pool: &Pool, account_id: &str) -> i64 {
         wallet::balance(&pool.get().unwrap(), account_id).unwrap()
+    }
+
+    /// Give the payer a verified address, which is what makes the top tier
+    /// reachable at all.
+    fn verify_email(pool: &Pool, email: &str) {
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET email = ?1, email_lower = ?1,                  email_verified_unix_ms = 1 WHERE account_id = 'acct-a'",
+                [email],
+            )
+            .unwrap();
+    }
+
+    /// Mail a step-up code the way `/wallet/stepup/otp` does.
+    fn issue_stepup_code(pool: &Pool, email: &str) -> String {
+        let conn = pool.get().unwrap();
+        match crate::otp::create(&conn, riskauth::PURPOSE_STEPUP, email, Some("acct-a"), None)
+            .unwrap()
+        {
+            crate::otp::CreateOtp::Issued(code) => code,
+            crate::otp::CreateOtp::TooSoon { retry_after_ms } => {
+                panic!("unexpected resend cooldown: {retry_after_ms} ms")
+            }
+        }
+    }
+
+    /// Wrong guesses recorded against the live step-up code.
+    fn stepup_code_attempts(pool: &Pool) -> i64 {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(MAX(attempts), 0) FROM moymoy_otps WHERE purpose = ?1",
+                [riskauth::PURPOSE_STEPUP],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn live_stepup_codes(pool: &Pool) -> i64 {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM moymoy_otps WHERE purpose = ?1",
+                [riskauth::PURPOSE_STEPUP],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Approve with mail enabled, as a deploy with an identity token behaves.
+    fn approve_stepup(pool: &Pool, intent_id: &str, pin: &str, code: Option<&str>) -> Value {
+        let mut conn = pool.get().unwrap();
+        approve(
+            &mut conn,
+            &PinBackoff::new(),
+            true,
+            &approver(Some(pin), code),
+            intent_id,
+        )
+        .unwrap()
+    }
+
+    /// An intent past the step-up threshold, on a wallet that can pay for it.
+    fn stepup_fixture(email: Option<&str>) -> (Pool, String, i64) {
+        let (pool, _, m) = fixture(300, 100_000);
+        if let Some(e) = email {
+            verify_email(&pool, e);
+        }
+        let amount = riskauth::STEPUP_SINGLE + 1;
+        let intent_id = {
+            let mut conn = pool.get().unwrap();
+            new_intent(&mut conn, &m, amount, None, 600)
+        };
+        (pool, intent_id, amount)
     }
 
     fn failed_attempts(pool: &Pool) -> i64 {
@@ -995,7 +1084,14 @@ mod tests {
                 // Released together, so every thread reads the intent while it is
                 // still `created` and they all arrive at the claim.
                 barrier.wait();
-                approve(&mut conn, &backoff, &approver(Some(PIN)), &intent_id).unwrap()
+                approve(
+                    &mut conn,
+                    &backoff,
+                    false,
+                    &approver(Some(PIN), None),
+                    &intent_id,
+                )
+                .unwrap()
             }));
         }
         let results: Vec<Value> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -1088,7 +1184,8 @@ mod tests {
                 approve(
                     &mut conn,
                     &PinBackoff::new(),
-                    &approver(Some(PIN)),
+                    false,
+                    &approver(Some(PIN), None),
                     &intent_id,
                 )
                 .unwrap()
@@ -1137,29 +1234,114 @@ mod tests {
         assert_eq!(balance_of(&pool, "acct-a"), 1_000);
     }
 
-    /// What used to be the PIN+OTP tier. The emailed second factor is gone (see
-    /// the note at the top of [`crate::riskauth`] — this backend has no way to
-    /// deliver one), so the property that matters now is that a large payment
-    /// still COMPLETES, on a PIN alone, rather than hitting a factor nobody can
-    /// produce.
+    /// The top tier, end to end. Without this, a mismatch between the purpose
+    /// `/wallet/stepup/otp` issues under and the one `riskauth` verifies under
+    /// would look exactly like a green suite.
     #[test]
-    fn a_large_payment_completes_on_a_pin_alone() {
-        let (pool, _, m) = fixture(300, 100_000);
-        // Comfortably past every old escalation threshold, and past what a single
-        // withdrawal may ever be.
-        let amount = crate::wallet::MAX_WITHDRAW_PER_OP;
-        let intent_id = {
-            let mut conn = pool.get().unwrap();
-            new_intent(&mut conn, &m, amount, None, 600)
-        };
+    fn the_step_up_tier_pays_when_the_emailed_code_is_right() {
+        let (pool, intent_id, amount) = stepup_fixture(Some("stepup-ok@disc.mnn"));
+        // Asked for the code first, before it is supplied.
+        let v = approve_stepup(&pool, &intent_id, PIN, None);
+        assert_eq!(v["error"], json!("otp_required"), "{v}");
+        assert_eq!(v["required"], json!("pin_otp"));
 
-        let v = do_approve(&pool, &intent_id, PIN);
+        let code = issue_stepup_code(&pool, "stepup-ok@disc.mnn");
+        let v = approve_stepup(&pool, &intent_id, PIN, Some(&code));
 
         assert_eq!(v["ok"], json!(true), "{v}");
-        assert_eq!(v["amount"], json!(amount));
         assert_eq!(balance_of(&pool, "acct-a"), 100_000 - amount);
-        assert_eq!(balance_of(&pool, "acct-m"), amount);
         assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
+        // Consumed, so it cannot be spent again.
+        assert_eq!(live_stepup_codes(&pool), 0, "the code survived its use");
+    }
+
+    /// An account with no verified address cannot make a movement in the top
+    /// band at all. Deliberately NOT degraded to a PIN — that would leave the
+    /// threshold deciding nothing.
+    #[test]
+    fn a_step_up_payment_is_refused_when_no_second_factor_can_be_produced() {
+        let (pool, intent_id, _) = stepup_fixture(None);
+        let v = approve_stepup(&pool, &intent_id, PIN, None);
+        assert_eq!(v["error"], json!("otp_unavailable"), "{v}");
+        assert_eq!(v["required"], json!("pin_otp"));
+        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
+        // …and it costs no PIN attempt: the request was never going to be enough
+        // whatever PIN it carried.
+        assert_eq!(failed_attempts(&pool), 0);
+    }
+
+    /// The regression guard for the defect this shape exists to prevent.
+    ///
+    /// A wrong code must leave its attempt behind. It is verified in a
+    /// transaction of its own precisely so the count survives the rollback of
+    /// the payment it failed to authorize — folded into the money transaction,
+    /// every wrong guess was undone and the five-attempt limit never arrived.
+    #[test]
+    fn a_wrong_emailed_code_pays_nothing_and_spends_no_pin_attempt() {
+        let (pool, intent_id, _) = stepup_fixture(Some("stepup-bad@disc.mnn"));
+        let real = issue_stepup_code(&pool, "stepup-bad@disc.mnn");
+        let wrong = if real == "000000" { "111111" } else { "000000" };
+
+        let v = approve_stepup(&pool, &intent_id, PIN, Some(wrong));
+
+        assert_eq!(v["error"], json!("invalid_code"), "{v}");
+        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
+        assert_eq!(state_of(&pool, &intent_id), STATE_CREATED);
+        // The PIN was right; a wrong code has its own counter and must not eat
+        // into the PIN's, or a fumbled code would walk somebody into a lockout.
+        assert_eq!(failed_attempts(&pool), 0);
+        // The count that bounds guessing survived the failed payment.
+        assert_eq!(
+            stepup_code_attempts(&pool),
+            1,
+            "a wrong code left no trace — it could be guessed indefinitely"
+        );
+        // The real code is still live, so the customer can just try again.
+        assert_eq!(live_stepup_codes(&pool), 1);
+        let v = approve_stepup(&pool, &intent_id, PIN, Some(&real));
+        assert_eq!(v["ok"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn guessing_a_code_runs_out_of_attempts_rather_than_out_of_codes() {
+        let (pool, intent_id, _) = stepup_fixture(Some("stepup-brute@disc.mnn"));
+        let real = issue_stepup_code(&pool, "stepup-brute@disc.mnn");
+        let wrong = if real == "000000" { "111111" } else { "000000" };
+        for _ in 0..5 {
+            let v = approve_stepup(&pool, &intent_id, PIN, Some(wrong));
+            assert_eq!(v["error"], json!("invalid_code"), "{v}");
+        }
+        // Five wrong guesses burn the code itself — after which even the right
+        // one is worthless and a fresh one has to be mailed.
+        assert_eq!(live_stepup_codes(&pool), 0);
+        let v = approve_stepup(&pool, &intent_id, PIN, Some(&real));
+        assert_eq!(v["error"], json!("invalid_code"), "{v}");
+        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
+    }
+
+    #[test]
+    fn a_code_issued_for_a_login_is_not_a_code_for_a_payment() {
+        // Separate namespaces on purpose: a code mailed to confirm signing in
+        // must not authorize a 5,001 エメ transfer.
+        let (pool, intent_id, _) = stepup_fixture(Some("stepup-purpose@disc.mnn"));
+        let code = {
+            let conn = pool.get().unwrap();
+            match crate::otp::create(
+                &conn,
+                crate::otp::PURPOSE_LOGIN2FA,
+                "stepup-purpose@disc.mnn",
+                Some("acct-a"),
+                None,
+            )
+            .unwrap()
+            {
+                crate::otp::CreateOtp::Issued(c) => c,
+                crate::otp::CreateOtp::TooSoon { .. } => panic!("cooldown"),
+            }
+        };
+        let v = approve_stepup(&pool, &intent_id, PIN, Some(&code));
+        assert_eq!(v["error"], json!("invalid_code"), "{v}");
+        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
     }
 
     #[test]
