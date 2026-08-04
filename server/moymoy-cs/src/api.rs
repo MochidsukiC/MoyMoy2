@@ -1136,59 +1136,26 @@ async fn withdraw(
             json!({ "ok": false, "error": "insufficient", "balance": balance }),
         ));
     }
-    let Some(assertion) = req.assertion.as_deref().filter(|a| !a.trim().is_empty()) else {
-        return Ok(Json(
-            json!({ "ok": false, "error": "attestation_required" }),
-        ));
-    };
-    // The shared outflow gate. A withdrawal is the one movement that leaves the
-    // wallet system entirely, so it goes through the same door as a send and a
-    // payment rather than relying on the attestation — which proves which
-    // character receives the emeralds, never that the person at the phone is the
-    // account holder.
-    //
-    // Unlike send and approve, the step-up is settled in a transaction of its
-    // own: the reserve happens inside `charge::begin_withdraw`, and this gate is
-    // deliberately not reaching into that module's transaction. All that
-    // transaction carries is the failure-counter clear, so the worst a later
-    // reserve failure costs is a PIN attempt the caller did not owe.
+    let assertion = match withdraw_gate(
+        st.pool.clone(),
+        st.pin_backoff.clone(),
+        acct.clone(),
+        req.amount,
+        req.pin.clone(),
+        req.assertion.clone(),
+    )
+    .await?
     {
-        let acct = acct.clone();
-        let backoff = st.pin_backoff.clone();
-        let pin = req.pin.clone();
-        let amount = req.amount;
-        let refused = blocking(st.pool.clone(), move |conn| {
-            let caller = riskauth::Caller {
-                account_id: &acct.account_id,
-                phone_id: acct.phone_id.as_deref(),
-                session_key: &acct.session_key,
-                pin: pin.as_deref(),
-            };
-            let ticket =
-                match riskauth::step_up(conn, &backoff, &caller, amount, Requirement::None)? {
-                    riskauth::StepUp::Cleared(t) => t,
-                    riskauth::StepUp::Refused(v) => return Ok(Some(v)),
-                };
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if let Some(v) = riskauth::settle(&tx, &acct.account_id, &ticket, now_ms())? {
-                drop(tx);
-                return Ok(Some(v));
-            }
-            tx.commit()?;
-            Ok::<Option<Value>, ApiError>(None)
-        })
-        .await?;
-        if let Some(v) = refused {
-            return Ok(Json(v));
-        }
-    }
+        Ok(a) => a,
+        Err(refused) => return Ok(Json(refused)),
+    };
     // Bound to THIS withdrawal, under a domain of its own: an assertion approved
     // for a charge does not verify here, and one approved for 100 エメ does not
     // authorize paying out 10000.
     let facts = match st
         .attest
         .verify(
-            assertion,
+            &assertion,
             &attest::withdraw_request_hash(&req.idem_key, req.amount),
             attest::now_unix_secs(),
         )
@@ -1232,6 +1199,73 @@ async fn withdraw(
             .put(&acct.account_id, &mc_uuid, facts.attester_id(), now_ms());
     }
     Ok(Json(value))
+}
+
+/// The credentials a withdrawal has to produce, **in the order the app is asked
+/// for them**: the PIN first, the in-world consent second.
+///
+/// That order is the whole point of this function. Both are asked for by
+/// answering the request and having the app come back with more, so whichever is
+/// asked for LAST is the one the app can satisfy without losing what it already
+/// collected. An assertion is bound to `(idem_key, amount)` and the app does not
+/// carry one across a retry, so demanding it first meant: post → consent modal →
+/// post → `pin_required` → post with a PIN but a now-discarded assertion →
+/// **consent modal a second time**. Asking for the PIN first — cheap, resolvable
+/// on the spot, no OS dialog — means the app raises the modal once, when it
+/// already has everything else.
+///
+/// Split out of the handler because the handler cannot be exercised in a test:
+/// `can_charge()` refuses first and needs a live tunnel, so the sequencing would
+/// otherwise only be checkable by reading the code.
+///
+/// `Ok(Ok(assertion))` = both cleared, here is the assertion to verify.
+/// `Ok(Err(body))` = the app still owes something; `body` says which.
+async fn withdraw_gate(
+    pool: Pool,
+    backoff: Arc<PinBackoff>,
+    acct: AuthedAccount,
+    amount: i64,
+    pin: Option<String>,
+    assertion: Option<String>,
+) -> Result<Result<String, Value>, ApiError> {
+    // The shared outflow gate. A withdrawal is the one movement that leaves the
+    // wallet system entirely, so it goes through the same door as a send and a
+    // payment rather than relying on the attestation — which proves which
+    // character receives the emeralds, never that the person at the phone is the
+    // account holder.
+    //
+    // Unlike send and approve, the step-up is settled in a transaction of its
+    // own: the reserve happens inside `charge::begin_withdraw`, and this gate is
+    // deliberately not reaching into that module's transaction. All that
+    // transaction carries is the failure-counter clear, so the worst a later
+    // failure costs is a PIN attempt the caller did not owe.
+    let refused = blocking(pool, move |conn| {
+        let caller = riskauth::Caller {
+            account_id: &acct.account_id,
+            phone_id: acct.phone_id.as_deref(),
+            session_key: &acct.session_key,
+            pin: pin.as_deref(),
+        };
+        let ticket = match riskauth::step_up(conn, &backoff, &caller, amount, Requirement::None)? {
+            riskauth::StepUp::Cleared(t) => t,
+            riskauth::StepUp::Refused(v) => return Ok(Some(v)),
+        };
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(v) = riskauth::settle(&tx, &acct.account_id, &ticket, now_ms())? {
+            drop(tx);
+            return Ok(Some(v));
+        }
+        tx.commit()?;
+        Ok::<Option<Value>, ApiError>(None)
+    })
+    .await?;
+    if let Some(v) = refused {
+        return Ok(Err(v));
+    }
+    match assertion.filter(|a| !a.trim().is_empty()) {
+        Some(a) => Ok(Ok(a)),
+        None => Ok(Err(json!({ "ok": false, "error": "attestation_required" }))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1326,5 +1360,120 @@ pub(crate) fn replay(stored: String) -> Value {
             tracing::error!(error = %e, "replay: corrupt idempotency record; returning internal_error instead of a fabricated success");
             json!({ "ok": false, "error": "internal_error" })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Pool;
+
+    const PIN: &str = "1234";
+    /// Past the frictionless band, so riskauth has something to ask for.
+    const BIG: i64 = crate::riskauth::FRICTIONLESS_SINGLE + 1;
+
+    fn wallet_with_funds() -> (Pool, AuthedAccount) {
+        let pool = crate::db::open_memory().expect("in-memory pool");
+        let conn = pool.get().expect("checkout");
+        let hash = auth::hash_pin(PIN).unwrap();
+        auth::insert_account(&conn, "acct-a", "payer", "payer", "payer", &hash, None).unwrap();
+        conn.execute(
+            "UPDATE accounts SET balance = 100000 WHERE account_id = 'acct-a'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        (
+            pool,
+            AuthedAccount {
+                account_id: "acct-a".to_string(),
+                phone_id: None,
+                session_key: "sess-a".to_string(),
+            },
+        )
+    }
+
+    async fn gate(
+        pool: &Pool,
+        acct: &AuthedAccount,
+        pin: Option<&str>,
+        assertion: Option<&str>,
+    ) -> Result<String, Value> {
+        withdraw_gate(
+            pool.clone(),
+            Arc::new(PinBackoff::new()),
+            acct.clone(),
+            BIG,
+            pin.map(str::to_string),
+            assertion.map(str::to_string),
+        )
+        .await
+        .expect("the gate answers")
+    }
+
+    /// A withdrawal asks for the PIN BEFORE the in-world consent.
+    ///
+    /// Getting this backwards costs the user a second OS consent dialog: the
+    /// assertion is bound to one `(idem_key, amount)` and the app does not carry
+    /// it across the retry that supplies the PIN, so a modal raised before the
+    /// PIN is asked for is a modal that has to be raised again. Measured on the
+    /// app side as 4 posts / 2 modals before, 3 posts / 1 modal after.
+    #[tokio::test]
+    async fn a_withdrawal_asks_for_the_pin_before_the_consent_modal() {
+        let (pool, acct) = wallet_with_funds();
+
+        // Nothing supplied: the answer must be the cheap one the user can settle
+        // on the spot, NOT the one that opens a dialog.
+        let v = gate(&pool, &acct, None, None).await.unwrap_err();
+        assert_eq!(v["error"], json!("pin_required"), "{v}");
+
+        // With the PIN settled — and only then — the consent is asked for.
+        let v = gate(&pool, &acct, Some(PIN), None).await.unwrap_err();
+        assert_eq!(v["error"], json!("attestation_required"), "{v}");
+
+        // Both in hand: the gate hands the assertion on to be verified.
+        let a = gate(&pool, &acct, Some(PIN), Some("assertion-blob"))
+            .await
+            .expect("both credentials clear the gate");
+        assert_eq!(a, "assertion-blob");
+    }
+
+    /// A wrong PIN is refused as a wrong PIN, and never mistaken for a missing
+    /// assertion — the app has to be able to tell "try again" from "ask the OS".
+    #[tokio::test]
+    async fn a_wrong_pin_is_reported_as_such_even_with_no_assertion() {
+        let (pool, acct) = wallet_with_funds();
+        let v = gate(&pool, &acct, Some("9999"), None).await.unwrap_err();
+        assert_eq!(v["error"], json!("invalid_pin"), "{v}");
+        // …and it was recorded, exactly as it is on the other outflow paths.
+        let attempts: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT failed_pin_attempts FROM accounts WHERE account_id = 'acct-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+    }
+
+    /// A withdrawal small enough for the frictionless band asks for nothing but
+    /// the consent — the reorder must not start demanding a PIN for pocket money.
+    #[tokio::test]
+    async fn a_small_withdrawal_still_asks_only_for_the_consent() {
+        let (pool, acct) = wallet_with_funds();
+        let v = withdraw_gate(
+            pool.clone(),
+            Arc::new(PinBackoff::new()),
+            acct.clone(),
+            crate::riskauth::FRICTIONLESS_SINGLE,
+            None,
+            None,
+        )
+        .await
+        .expect("the gate answers")
+        .unwrap_err();
+        assert_eq!(v["error"], json!("attestation_required"), "{v}");
     }
 }
