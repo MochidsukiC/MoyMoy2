@@ -84,7 +84,7 @@ MochiOS 内の EC サイトが MoyMoy で決済する仕組み。VISA 3D Secure 
 
 フロー: EC バックエンドが API キーで PaymentIntent を作成 → EC アプリが `os.apps.launch("com.mochi.moymoy", {intent_id})` で MoyMoy を起動（渡すのは `intent_id` のみ）→ MoyMoy が自バックエンドから intent 詳細を取得（`GET /wallet/payment/intent`）して承認画面を表示 → PIN → `POST /wallet/payment/approve` が同一トランザクションで intent claim + 送金 → EC へ戻る → **EC バックエンドが moymoy-cs へ照会して `paid` を確認してから履行**（クライアントの「払った」申告は信用しない）。
 
-不変条件（出金で確立したものを移植）: ①資金移動は必ずセッション本人の操作で、**API キーではいかなる残高も動かせない**（intent の作成・照会・取消のみ） ②承認画面が表示する金額・加盟店名は `payments::payer_view` が返す moymoy-cs の記録が唯一の真実で、クライアント渡しで信用するのは `intent_id` のみ ③第三者は「宛先」を名乗れるだけで「誰の財布が払うか」は名乗れない ④資金移動は `state='created' AND expires_unix_ms > now` を条件とした確定的 UPDATE 一文（変更行数==1のときのみ transfer へ進む）。この `now` は **`settle` 内部で読む**（`approve` から受け取らない） — 到着時刻を使うと Argon2id 比較やロック待ちで数百ms 空くため、PIN 検証中に期限が切れても送金が成立してしまう。
+不変条件（出金で確立したものを移植）: ①資金移動は必ずセッション本人の操作で、**API キーではいかなる残高も動かせない**（intent の作成・照会・取消のみ） ②承認画面が表示する金額・加盟店名は moymoy-cs の記録が唯一の真実で、クライアント渡しで信用するのは `intent_id` のみ ③第三者は「宛先」を名乗れるだけで「誰の財布が払うか」は名乗れない ④資金移動は `state='created' AND expires_unix_ms > now` を条件とした確定的 UPDATE 一文（変更行数==1のときのみ transfer へ進む）。この `now` は**確定処理の内部で読む**（承認ハンドラの入口から受け取らない） — 到着時刻を使うと Argon2id 比較やロック待ちで数百ms 空くため、PIN 検証中に期限が切れても送金が成立してしまう。
 
 intent の状態機械: `created → paid / declined / canceled / expired`。全終端は最終（`paid` はリファンドでも巻き戻らず、逆方向の別トランザクションになる）。二重承認・期限切れ直前承認・加盟店キャンセルとの競合は上記 UPDATE 一文で排他される。承認前チェックとして `merchants.status='active'` を必須、`payer_hint_account_id` 指定時は他口座からの承認/拒否を `payer_mismatch` で拒否、リプレイ（`paid` かつ同一 payer）は PIN 検証より前に応答して試行回数を消費しない。
 
@@ -107,7 +107,7 @@ OS 依存（決定、未照合）: MochiOS の `os.apps.launch` / `os.apps.takeL
 
 PIN 検証は「短いトランザクションで失敗カウンタを先に書いて commit → トランザクション外で Argon2id → 短いトランザクションでロックアウト再検証しカウンタをクリア」の3段構え。単一トランザクション内で Argon2id を回すと SQLite の単一ライタロックを数百ミリ秒保持し、ウォレット全体が停止するため。PIN が正しかったが操作自体が成立しなかった場合（残高不足等）は `refund_attempt` で消費した試行を返却する（さもないと残高不足への正しい PIN リトライ5回で自分の口座をロックする）。
 
-`/wallet/pay`（デモ加盟店ハードコードの直接送金経路）は PaymentIntent が置き換えたため**削除済み**（`api.rs` にコメントで明記）。デモ加盟店(m1..m5)は全件 `listed=0` に降格し、`wallet::merchants()` は `listed=1 AND status='active'` のみを返す。
+`/wallet/pay`（デモ加盟店ハードコードの直接送金経路）は PaymentIntent が置き換えたため**削除済み**。デモ加盟店(m1..m5)は全件 `listed=0` に降格し、`GET /wallet/merchants` は `listed=1 AND status='active'` のみを返す。
 
 ---
 
