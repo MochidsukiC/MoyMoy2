@@ -1,24 +1,24 @@
 {
   "id": "com.mochi.moymoy",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "schema_version": 1,
   "name": { "default": "MoyMoy", "ja": "モイモイ" },
   "description": {
-    "default": "In-Minecraft emerald wallet for MochiOS — check your balance, send エメ to friends, pay merchants, and charge from the emeralds in your inventory.",
-    "ja": "MochiOS のゲーム内エメラルド決済ウォレット。残高確認、フレンドへの送金、加盟店での支払い、インベントリのエメラルドからのチャージができます。"
+    "default": "In-Minecraft emerald wallet for MochiOS — check your balance, send エメ to friends, pay merchants, charge from the emeralds in your inventory, and withdraw エメ back out as emeralds.",
+    "ja": "MochiOS のゲーム内エメラルド決済ウォレット。残高確認、フレンドへの送金、加盟店での支払い、インベントリのエメラルドからのチャージ、エメラルドでの出金ができます。"
   },
   "author": { "name": "Mochidsuki", "url": "https://houlab.jp", "support_email": "dev@houlab.jp" },
   "license": "Proprietary",
   "categories": ["finance", "utilities"],
   "bundle": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.3.0/com.mochi.moymoy-0.3.0.tar",
-    "sha256": "48125c99fb2559ac0ea29abddfab77d3f26c484c22e404c6c9da3009c0744129",
-    "size": 146944,
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.4.0/com.mochi.moymoy-0.4.0.tar",
+    "sha256": "08b6c662d33d2da2693cc97e5abdc30ae210525930de5744409e481c156bb0fa",
+    "size": 160256,
     "format": "tar"
   },
   "runtime": { "kind": "js", "foreground": { "entry": "index.html" } },
   "icon": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.3.0/com.mochi.moymoy-0.3.0.png",
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.4.0/com.mochi.moymoy-0.4.0.png",
     "sha256": "cfd2d10d05f14df3ef79adbbc68c3447670b150634746d7076ea5090f409e988",
     "size_px": 512,
     "format": "png"
