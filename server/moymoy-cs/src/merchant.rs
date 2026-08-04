@@ -22,22 +22,25 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
-use axum::extract::FromRequestParts;
-use axum::http::header;
+use axum::extract::{FromRequestParts, Query, State};
 use axum::http::request::Parts;
+use axum::http::{header, StatusCode};
+use axum::Json;
 use base64::Engine as _;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use unicode_general_category::{get_general_category, GeneralCategory};
 use unicode_normalization::UnicodeNormalization;
 use unicode_security::{RestrictionLevel, RestrictionLevelDetection};
 use uuid::Uuid;
 
-use crate::api::AppState;
-use crate::auth;
-use crate::db::now_ms;
+use crate::api::{blocking, replay, AppState};
+use crate::auth::{self, AuthedAccount, LockoutPolicy, PinAttempt};
+use crate::db::{self, now_ms};
 use crate::error::ApiError;
+use crate::payments::{self, CreateOutcome, IntentQuery, NewIntent};
 
 /// A merchant that may trade.
 pub const STATUS_ACTIVE: &str = "active";
@@ -831,6 +834,459 @@ impl FromRequestParts<AppState> for MerchantAuth {
             None => Err(ApiError::unauthorized("invalid merchant API key")),
         }
     }
+}
+
+// ── merchant portal (session + PIN) ──────────────────────────────────────────
+
+/// Re-authenticate the portal caller with their PIN.
+///
+/// Stage 1 and 2 of the [`crate::auth`] split, without the money stage: nothing
+/// under `/merchant/portal/*` moves a balance, so there is no transaction to
+/// settle into and the counter is cleared on the spot.
+async fn portal_pin(
+    st: &AppState,
+    acct: &AuthedAccount,
+    pin: &str,
+    policy: LockoutPolicy,
+) -> Result<Option<Value>, ApiError> {
+    let now = now_ms();
+    if let Err(retry_after_ms) = st.pin_backoff.check(&acct.session_key, now) {
+        return Ok(Some(
+            json!({ "ok": false, "error": "too_many_attempts", "retry_after_ms": retry_after_ms }),
+        ));
+    }
+    let id = acct.account_id.clone();
+    let attempt = blocking(st.pool.clone(), move |conn| {
+        auth::begin_pin_attempt(conn, &id, policy)
+    })
+    .await?;
+    let (pin_hash, epoch) = match attempt {
+        PinAttempt::Ready { pin_hash, epoch } => (pin_hash, epoch),
+        PinAttempt::Locked { retry_after_ms } => {
+            return Ok(Some(
+                json!({ "ok": false, "error": "locked", "retry_after_ms": retry_after_ms }),
+            ))
+        }
+        PinAttempt::NoPin => {
+            return Ok(Some(json!({ "ok": false, "error": "invalid_pin" })));
+        }
+    };
+    let pin = pin.to_string();
+    let ok = tokio::task::spawn_blocking(move || auth::verify_pin_hash(&pin, &pin_hash)).await?;
+    if !ok {
+        let retry_after_ms = st.pin_backoff.record_failure(&acct.session_key, now);
+        return Ok(Some(
+            json!({ "ok": false, "error": "invalid_pin", "retry_after_ms": retry_after_ms }),
+        ));
+    }
+    st.pin_backoff.clear(&acct.session_key);
+    let id = acct.account_id.clone();
+    blocking(st.pool.clone(), move |conn| {
+        auth::clear_pin_failures(conn, &id, epoch).map_err(ApiError::from)
+    })
+    .await?;
+    Ok(None)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PortalRegisterReq {
+    name: String,
+    sub: Option<String>,
+    glyph: Option<String>,
+    pal: Option<String>,
+    pin: String,
+}
+
+pub(crate) async fn portal_register(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalRegisterReq>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if let Err(retry_after_ms) = st.rate.check(
+        &format!("mreg:{}", acct.account_id),
+        RL_REGISTER.0,
+        RL_REGISTER.1,
+        now_ms(),
+    ) {
+        return Ok(rate_limited(retry_after_ms));
+    }
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(ok_json(refused));
+    }
+    let email_enabled = st.email_enabled();
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Where mail works, a shop that can take strangers' money must be
+        // reachable afterwards. Where it does not (no identity token), the wallet
+        // already runs handle+PIN only and this degrades with it rather than
+        // making registration impossible.
+        if email_enabled {
+            let info = auth::account_full(&tx, &acct.account_id)?
+                .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
+            if !info.email_verified {
+                return Ok::<Value, ApiError>(
+                    json!({ "ok": false, "error": "email_verification_required" }),
+                );
+            }
+        }
+        let out = register(
+            &tx,
+            &acct.account_id,
+            &req.name,
+            req.sub.as_deref(),
+            req.glyph.as_deref(),
+            req.pal.as_deref(),
+        )?;
+        let v = match out {
+            RegisterOutcome::Ok {
+                merchant_id,
+                name,
+                api_key,
+                api_key_prefix,
+            } => json!({
+                "ok": true, "merchant_id": merchant_id, "name": name,
+                // Shown once. Nothing stores it, so nothing can show it again.
+                "api_key": api_key, "api_key_prefix": api_key_prefix,
+            }),
+            RegisterOutcome::BadName(e) => {
+                json!({ "ok": false, "error": "bad_name", "reason": e.code() })
+            }
+            RegisterOutcome::BadSub(e) => {
+                json!({ "ok": false, "error": "bad_sub", "reason": e.code() })
+            }
+            RegisterOutcome::NameTaken => json!({ "ok": false, "error": "name_taken" }),
+            RegisterOutcome::TooManyMerchants => {
+                json!({ "ok": false, "error": "too_many_merchants", "limit": MAX_MERCHANTS_PER_ACCOUNT })
+            }
+        };
+        tx.commit()?;
+        Ok(v)
+    })
+    .await?;
+    Ok(ok_json(value))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PortalKeyReq {
+    merchant_id: String,
+    pin: String,
+}
+
+pub(crate) async fn portal_rotate_key(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalKeyReq>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = match rotate_key(&tx, &req.merchant_id, &acct.account_id)? {
+            Some((api_key, api_key_prefix)) => {
+                json!({ "ok": true, "api_key": api_key, "api_key_prefix": api_key_prefix })
+            }
+            None => json!({ "ok": false, "error": "unknown_merchant" }),
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PortalStatusReq {
+    merchant_id: String,
+    status: String,
+    pin: String,
+}
+
+pub(crate) async fn portal_set_status(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalStatusReq>,
+) -> Result<Json<Value>, ApiError> {
+    let status = match req.status.as_str() {
+        STATUS_ACTIVE => STATUS_ACTIVE,
+        STATUS_DISABLED => STATUS_DISABLED,
+        _ => return Ok(Json(json!({ "ok": false, "error": "bad_status" }))),
+    };
+    // Stopping a shop is the one operation a lockout may not block. Somebody
+    // whose API key is being abused, fumbling their PIN under pressure, must not
+    // find that the switch which stops the bleeding is the thing they locked
+    // themselves out of. The PIN is still required and the failure is still
+    // recorded — and nothing here moves money.
+    let policy = if status == STATUS_DISABLED {
+        LockoutPolicy::Bypass
+    } else {
+        LockoutPolicy::Enforce
+    };
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, policy).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = if set_status(&tx, &req.merchant_id, &acct.account_id, status)? {
+            json!({ "ok": true, "merchant_id": req.merchant_id, "status": status })
+        } else {
+            json!({ "ok": false, "error": "unknown_merchant" })
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PortalLimitsReq {
+    merchant_id: String,
+    pin: String,
+    max_open_intents: Option<i64>,
+    daily_issue_cap: Option<i64>,
+}
+
+pub(crate) async fn portal_set_limits(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalLimitsReq>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = if set_limits(
+            &tx,
+            &req.merchant_id,
+            &acct.account_id,
+            req.max_open_intents,
+            req.daily_issue_cap,
+        )? {
+            let m = get(&tx, &req.merchant_id)?;
+            json!({
+                "ok": true,
+                "max_open_intents": m.as_ref().map(|m| m.max_open_intents),
+                "daily_issue_cap": m.map(|m| m.daily_issue_cap),
+            })
+        } else {
+            json!({ "ok": false, "error": "unknown_merchant" })
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PortalCloseReq {
+    merchant_id: String,
+    pin: String,
+}
+
+/// Close a shop for good, giving its name and its owner's slot back.
+///
+/// Session + PIN like every other portal mutation. It cannot be reached with an
+/// API key: a leaked key must not be able to retire the shop it belongs to.
+pub(crate) async fn portal_close(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalCloseReq>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = match close(&tx, &req.merchant_id, &acct.account_id)? {
+            CloseOutcome::Ok => {
+                json!({ "ok": true, "merchant_id": req.merchant_id, "status": STATUS_DELETED })
+            }
+            CloseOutcome::NotFound => json!({ "ok": false, "error": "unknown_merchant" }),
+            CloseOutcome::HasOpenIntents { count } => {
+                json!({ "ok": false, "error": "open_intents", "count": count })
+            }
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+pub(crate) async fn portal_list(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+) -> Result<Json<Value>, ApiError> {
+    let list = blocking(st.pool, move |conn| {
+        list_for_owner(conn, &acct.account_id).map_err(ApiError::from)
+    })
+    .await?;
+    Ok(Json(json!({ "ok": true, "merchants": list })))
+}
+
+// ── merchant API (Bearer moy_sk_…) ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub(crate) struct IntentCreateReq {
+    idem_key: String,
+    amount: i64,
+    description: String,
+    order_ref: Option<String>,
+    launch_app_id: Option<String>,
+    /// Who the shop expects to pay. A hint, and a restriction: naming somebody
+    /// stops anyone else from approving, but it never makes them pay.
+    payer_hint_handle: Option<String>,
+    expires_in_secs: Option<i64>,
+}
+
+pub(crate) async fn intent_create(
+    State(st): State<AppState>,
+    m: MerchantAuth,
+    Json(req): Json<IntentCreateReq>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if req.idem_key.trim().is_empty() {
+        return Err(ApiError::bad_request("idem_key required"));
+    }
+    if let Err(retry_after_ms) = st.rate.check(
+        &format!("mint:{}", m.merchant.merchant_id),
+        RL_INTENT_CREATE.0,
+        RL_INTENT_CREATE.1,
+        now_ms(),
+    ) {
+        return Ok(rate_limited(retry_after_ms));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let scope = payments::intent_scope(&m.merchant.merchant_id);
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(prev) = db::idem_get(&tx, &req.idem_key, &scope)? {
+            return Ok(replay(prev));
+        }
+        let payer_hint = match req.payer_hint_handle.as_deref().map(str::trim) {
+            Some(h) if !h.is_empty() => match auth::lookup_handle(&tx, h)? {
+                Some(a) => Some(a.account_id),
+                // Refused rather than silently issued to nobody: a shop that
+                // meant to address a customer should learn it got the handle
+                // wrong before the customer is standing at the till.
+                None => {
+                    return Ok::<Value, ApiError>(
+                        json!({ "ok": false, "error": "unknown_payer_hint" }),
+                    )
+                }
+            },
+            _ => None,
+        };
+        let out = payments::create(
+            &tx,
+            &m.merchant,
+            &NewIntent {
+                idem_key: &req.idem_key,
+                amount: req.amount,
+                description: &req.description,
+                order_ref: req.order_ref.as_deref(),
+                launch_app_id: req.launch_app_id.as_deref(),
+                payer_hint_account_id: payer_hint.as_deref(),
+                expires_in_secs: req.expires_in_secs,
+            },
+        )?;
+        let v = match out {
+            CreateOutcome::Ok(i) => {
+                let v = json!({
+                    "ok": true, "intent_id": i.intent_id, "state": i.state,
+                    "amount": i.amount, "expires_unix_ms": i.expires_unix_ms,
+                });
+                db::idem_put(&tx, &req.idem_key, &scope, &v.to_string())?;
+                v
+            }
+            CreateOutcome::BadAmount => json!({ "ok": false, "error": "bad_amount" }),
+            CreateOutcome::BadDescription(e) => {
+                json!({ "ok": false, "error": "bad_description", "reason": e.code() })
+            }
+            CreateOutcome::BadOrderRef(e) => {
+                json!({ "ok": false, "error": "bad_order_ref", "reason": e.code() })
+            }
+            CreateOutcome::BadTtl => json!({
+                "ok": false, "error": "bad_expires_in_secs",
+                "min": payments::MIN_TTL_SECS, "max": payments::MAX_TTL_SECS,
+            }),
+            CreateOutcome::Capped(IssueGuard::TooManyOpen { limit }) => {
+                json!({ "ok": false, "error": "too_many_open_intents", "limit": limit })
+            }
+            CreateOutcome::Capped(IssueGuard::DailyCapExceeded { limit, issued }) => {
+                json!({ "ok": false, "error": "daily_issue_cap", "limit": limit, "issued": issued })
+            }
+            CreateOutcome::Capped(IssueGuard::Ok) => {
+                return Err(ApiError::internal("issuance guard reported Ok as a refusal"))
+            }
+        };
+        tx.commit()?;
+        Ok(v)
+    })
+    .await?;
+    Ok(ok_json(value))
+}
+
+pub(crate) async fn intent_get(
+    State(st): State<AppState>,
+    m: MerchantAuth,
+    Query(q): Query<IntentQuery>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if let Err(retry_after_ms) = st.rate.check(
+        &format!("mget:{}", m.merchant.merchant_id),
+        RL_INTENT_READ.0,
+        RL_INTENT_READ.1,
+        now_ms(),
+    ) {
+        return Ok(rate_limited(retry_after_ms));
+    }
+    let value = blocking(st.pool, move |conn| {
+        match payments::get(conn, &q.intent_id)? {
+            // Another merchant's intent reads as a missing one — the same
+            // ownership discipline `op_status` uses, so this cannot be turned
+            // into an oracle for other shops' order flow.
+            Some(i) if i.merchant_id == m.merchant.merchant_id => Ok::<Value, ApiError>(
+                json!({ "ok": true, "intent": payments::merchant_view(&m.merchant, &i, now_ms())? }),
+            ),
+            _ => Ok(json!({ "ok": false, "error": "unknown_intent" })),
+        }
+    })
+    .await?;
+    Ok(ok_json(value))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct IntentCancelReq {
+    intent_id: String,
+}
+
+pub(crate) async fn intent_cancel(
+    State(st): State<AppState>,
+    m: MerchantAuth,
+    Json(req): Json<IntentCancelReq>,
+) -> Result<Json<Value>, ApiError> {
+    let value = blocking(st.pool, move |conn| {
+        payments::cancel(conn, &req.intent_id, &m.merchant.merchant_id).map_err(ApiError::from)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+
+/// Too many calls. A `429` and not a `200 {ok:false}`: the wallet is refusing to
+/// look at the request at all, which is an infrastructure answer — unlike
+/// "insufficient" or "already_paid", which are facts about the request itself.
+fn rate_limited(retry_after_ms: i64) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({ "ok": false, "error": "rate_limited", "retry_after_ms": retry_after_ms })),
+    )
+}
+
+/// The ordinary answer from a handler that can also rate-limit.
+fn ok_json(v: Value) -> (StatusCode, Json<Value>) {
+    (StatusCode::OK, Json(v))
 }
 
 #[cfg(test)]

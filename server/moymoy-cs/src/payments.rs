@@ -31,12 +31,15 @@
 //! is believed, so there is no field it could tamper with.
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
+use axum::extract::{Query, State};
+use axum::Json;
 use base64::Engine as _;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::auth;
+use crate::api::{blocking, AppState};
+use crate::auth::{self, AuthedAccount};
 use crate::db::now_ms;
 use crate::error::ApiError;
 use crate::merchant::{self, IssueGuard, MerchantRow, TextReject};
@@ -717,6 +720,85 @@ pub fn force_refund(
             "forced refund of {intent_id} could not be paid: {other:?}"
         ))),
     }
+}
+
+// ── EC payment, payer side ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub(crate) struct IntentQuery {
+    pub(crate) intent_id: String,
+}
+
+/// Everything the approval screen may show. Deliberately the only source: what
+/// the launching app passed along is an `intent_id` and nothing else.
+pub(crate) async fn payment_intent(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Query(q): Query<IntentQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let v = blocking(st.pool, move |conn| {
+        let Some(intent) = get(conn, &q.intent_id)? else {
+            return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_intent" }));
+        };
+        // An intent addressed to somebody else is not this account's to look at.
+        if let Some(hint) = &intent.payer_hint_account_id {
+            if hint != &acct.account_id {
+                return Ok(json!({ "ok": false, "error": "payer_mismatch" }));
+            }
+        }
+        Ok(json!({ "ok": true, "intent": payer_view(conn, &intent, now_ms())? }))
+    })
+    .await?;
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ApproveReq {
+    intent_id: String,
+    /// Optional in the wire schema so a client that has not collected one yet
+    /// gets `{ok:false,error:"pin_required"}` — a domain answer it can act on —
+    /// rather than a deserialization rejection.
+    pin: Option<String>,
+}
+
+pub(crate) async fn payment_approve(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<ApproveReq>,
+) -> Result<Json<Value>, ApiError> {
+    let backoff = st.pin_backoff.clone();
+    let value = blocking(st.pool, move |conn| {
+        approve(
+            conn,
+            &backoff,
+            &riskauth::Caller {
+                account_id: &acct.account_id,
+                phone_id: acct.phone_id.as_deref(),
+                session_key: &acct.session_key,
+                pin: req.pin.as_deref(),
+            },
+            &req.intent_id,
+        )
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DeclineReq {
+    intent_id: String,
+}
+
+pub(crate) async fn payment_decline(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<DeclineReq>,
+) -> Result<Json<Value>, ApiError> {
+    let value = blocking(st.pool, move |conn| {
+        decline(conn, &req.intent_id, &acct.account_id).map_err(ApiError::from)
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 #[cfg(test)]
