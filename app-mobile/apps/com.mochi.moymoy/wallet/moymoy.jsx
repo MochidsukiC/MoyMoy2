@@ -361,11 +361,12 @@ function MoyHome({ balance, txns, profile, onTab }) {
       </div>
 
       {/* quick actions */}
-      <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+      <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
         {[
           { id: "pay", label: "支払う", glyph: "◈" },
           { id: "send", label: "送る", glyph: "⇄" },
           { id: "charge", label: "チャージ", glyph: "＋" },
+          { id: "withdraw", label: "出金", glyph: "↑" },
         ].map(a => (
           <button key={a.id} onClick={() => onTab(a.id)} style={{
             border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)",

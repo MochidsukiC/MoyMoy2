@@ -741,6 +741,19 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
     if (account && onLogoutAccount) onLogoutAccount(account.account_id);
   }
 
+  // MoyHome's quick actions pass tab ids, but "withdraw" isn't a tab — it's a
+  // segment inside "charge". MoyHome doesn't need to know that: it just asks to
+  // go somewhere, and this is the one place that interprets what "somewhere"
+  // means, keeping that mapping out of the presentational component.
+  function goFromHome(id) {
+    if (id === "withdraw") { setEmeMode("withdraw"); setTab("charge"); return; }
+    // Any other quick action (charge included) lands on its own tab in charge
+    // mode — otherwise a "チャージ" tap right after a withdraw would silently
+    // reopen the withdraw segment instead.
+    setEmeMode("charge");
+    setTab(id);
+  }
+
   const rootStyle = {
     "--moy": "#16A35A",
     "--moy-deep": "#0B7A41",
@@ -937,7 +950,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       <MoyHeader onClose={onClose} account={account} onMenu={() => setMenuOpen(true)} />
 
       <div style={{ flex: 1, overflow: "auto", position: "relative" }}>
-        {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={setTab} />}
+        {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={goFromHome} />}
         {tab === "pay" && <MoyPay merchants={merchants} onPick={t => setFlow({ kind: "pay", target: t })} />}
         {tab === "send" && <MoySend friends={friends} onPick={t => setFlow({ kind: "send", target: t })} />}
         {tab === "charge" && (
@@ -955,7 +968,12 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
         {tab === "history" && <MoyHistory txns={txns} />}
       </div>
 
-      <MoyBottomNav tab={tab} onTab={t => { setTab(t); setFlow(null); }} />
+      <MoyBottomNav tab={tab} onTab={t => {
+        // The bottom nav's charge button is labeled "チャージ" too — same promise
+        // as the home quick action, so it gets the same reset (see goFromHome).
+        if (t === "charge") setEmeMode("charge");
+        setTab(t); setFlow(null);
+      }} />
 
       {/* amount entry */}
       {flow && (
