@@ -37,10 +37,15 @@
   const trim = (u) => String(u).replace(/\/+$/, "");
 
   function base() {
+    // In-world the endpoint is ours to know, not the caller's to choose. Any
+    // app can navigate us with `mochi-internal://com.mochi.moymoy/index.html?
+    // moymoy_http=<theirs>` and the query survives a cold start, so reading the
+    // dev override first would hand them the handle, the PIN and the session
+    // token. The override stays available where it is meant to be used.
+    if (inWorld) return "https://moymoy.cs.mnn";
     if (window.__MOYMOY_ENDPOINT__) return trim(window.__MOYMOY_ENDPOINT__);
     const o = qs.get("moymoy_http");
     if (o) return trim(o);
-    if (inWorld) return "https://moymoy.cs.mnn";
     return "http://127.0.0.1:7433"; // cs.mnn dev listen
   }
 
