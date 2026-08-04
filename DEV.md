@@ -60,10 +60,10 @@ UIフロー:
 - `GET /wallet/op?op_id=` → チャージ/出金 共通の進捗ポーリング（所有権検証付き）
 - `POST /wallet/_dev/credit {handle, amount}` → dev 専用クレジット（`MOYMOY_DEV_CREDIT=1` ゲート）
 - **EC決済（MoyMoy Pay、v6）**: `GET /wallet/payment/intent?intent_id=`（承認画面が表示する唯一の情報源）／ `POST /wallet/payment/approve {intent_id, pin}`（常に PIN 必須）／ `POST /wallet/payment/decline {intent_id}`（PIN不要）。`POST /wallet/pay` は廃止（下記§EC決済）
-- **加盟店 API（v6）**: `/merchant/v1/*`（`Authorization: Bearer moy_sk_…`、intent の作成・照会・取消）／ `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・上限変更・一覧）。詳細は§EC決済
+- **加盟店 API（v6）**: `/merchant/v1/*`（`Authorization: Bearer moy_sk_…`、intent の作成・照会・取消）／ `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・閉店・上限変更・一覧）。詳細は§EC決済
 
 ### SQLite スキーマ
-`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until, **email, email_lower(UNIQUE), email_verified**) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires) / `moymoy_otps`(otp_id, purpose=signup|login2fa|recovery, email_lower, account_id, code_hash, payload_json, attempts, expires) / `transactions`(kind に `withdraw` 追加、引落は負・返金は正) / `merchants`（**v6拡張**: owner_account_id, name_skeleton(UTS#39 confusable skeleton の部分UNIQUE), status=active|disabled, api_key_hash/prefix/created/last_used, listed(既定0), payer_ref_salt, max_open_intents, daily_issue_cap） / `payment_intents`（**v6新規**: intent_id='pi_'+128bit CSPRNG, merchant_id, amount, description, order_ref, state=created|paid|declined|canceled|expired, payer_account_id, payer_hint_account_id, launch_app_id, tx_id, refunded_unix_ms, refund_tx_id, idem_key, expires_unix_ms） / `idempotency`(PK=idem_key,scope。出金は scope=`withdraw:<account_id>`、決済は scope=`mi:<merchant_id>` で加盟店ごとに分離) / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, attester_id=同意されたサーバー(再送先を固定するルーティング情報。所有の証明ではない), direction=charge|withdraw, state=pending|sent|settled|failed|stuck, …)。出金は既存カラムに新しい値が増えるのみで**マイグレーション不要**（`kind`/`direction` に CHECK 制約なし）。マイグレーションは user_version ステッパ（v1 baseline `schema.sql` → v2 独立アカウント → v3 1キャラ1口座 → v4 メール/OTP → v5 `account_mc_links` を DROP しキャラクター所有の証明をリクエスト毎の Hub 署名 attestation へ移行 → v6 merchants 拡張 + payment_intents 新設 + デモ加盟店(m1..m5)を listed=0 に降格、各 `db/schema_vN.sql`）。詳細は `server/moymoy-cs/src/db/`。
+`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until, **email, email_lower(UNIQUE), email_verified**) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires) / `moymoy_otps`(otp_id, purpose=signup|login2fa|recovery, email_lower, account_id, code_hash, payload_json, attempts, expires) / `transactions`(kind に `withdraw` 追加、引落は負・返金は正) / `merchants`（**v6拡張**: owner_account_id, name_skeleton(UTS#39 confusable skeleton の部分UNIQUE), status=active|disabled|deleted, api_key_hash/prefix/created/last_used, listed(既定0), payer_ref_salt, max_open_intents, daily_issue_cap） / `payment_intents`（**v6新規**: intent_id='pi_'+128bit CSPRNG, merchant_id, amount, description, order_ref, state=created|paid|declined|canceled|expired, payer_account_id, payer_hint_account_id, launch_app_id, tx_id, refunded_unix_ms, refund_tx_id, idem_key, expires_unix_ms） / `idempotency`(PK=idem_key,scope。出金は scope=`withdraw:<account_id>`、決済は scope=`mi:<merchant_id>` で加盟店ごとに分離) / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, attester_id=同意されたサーバー(再送先を固定するルーティング情報。所有の証明ではない), direction=charge|withdraw, state=pending|sent|settled|failed|stuck, …)。出金は既存カラムに新しい値が増えるのみで**マイグレーション不要**（`kind`/`direction` に CHECK 制約なし）。マイグレーションは user_version ステッパ（v1 baseline `schema.sql` → v2 独立アカウント → v3 1キャラ1口座 → v4 メール/OTP → v5 `account_mc_links` を DROP しキャラクター所有の証明をリクエスト毎の Hub 署名 attestation へ移行 → v6 merchants 拡張 + payment_intents 新設 + デモ加盟店(m1..m5)を listed=0 に降格、各 `db/schema_vN.sql`）。詳細は `server/moymoy-cs/src/db/`。
 
 ### コマンドバス verb（backend→mod / mod→backend ack）
 - `emerald.charge {op_id, idem_key, target_uuid, amount}` → mod 消費(インベントリのエメラルド+ブロック) → ack `{op_id, status, settled:consumed}`
@@ -80,17 +80,21 @@ UIフロー:
 - **不変条件の変更**: 従来「ウォレットから価値が外へ出る経路は無い」が成立していたが、出金ではこれは成立しない。代わりに ①出金は必ずセッション本人の操作、②金額と `idem_key` に束縛されたユーザー同意付き assertion を要する、③`AttestedFacts::account_id` は依然として認可に読まれない、④attester（サーバー運営者）は他人の残高を動かす手段を持たず宛先キャラを名乗れるのみ、が担保される。新たな信頼境界は「ユーザーが出金先 MC サーバーを信用する」こと。
 
 ### EC決済（MoyMoy Pay、v6）
-MochiOS 内の EC サイトが MoyMoy で決済する仕組み。VISA 3D Secure と同型のリダイレクトフロー。**第三者開発者も使う公開 API**（第一号加盟店 PiggleShop2）。
+MochiOS 内の EC サイトが MoyMoy で決済する仕組み。VISA 3D Secure と同型のリダイレクトフロー。**第三者開発者も使う公開 API**（第一号加盟店 PiggleShop2）。**第三者開発者向けの入口は `docs/merchant-quickstart.md`**（登録→キー→intent作成→起動→照会確定の最短ルート）。
 
 フロー: EC バックエンドが API キーで PaymentIntent を作成 → EC アプリが `os.apps.launch("com.mochi.moymoy", {intent_id})` で MoyMoy を起動（渡すのは `intent_id` のみ）→ MoyMoy が自バックエンドから intent 詳細を取得（`GET /wallet/payment/intent`）して承認画面を表示 → PIN → `POST /wallet/payment/approve` が同一トランザクションで intent claim + 送金 → EC へ戻る → **EC バックエンドが moymoy-cs へ照会して `paid` を確認してから履行**（クライアントの「払った」申告は信用しない）。
 
-不変条件（出金で確立したものを移植）: ①資金移動は必ずセッション本人の操作で、**API キーではいかなる残高も動かせない**（intent の作成・照会・取消のみ） ②承認画面が表示する金額・加盟店名は `payments::payer_view` が返す moymoy-cs の記録が唯一の真実で、クライアント渡しで信用するのは `intent_id` のみ ③第三者は「宛先」を名乗れるだけで「誰の財布が払うか」は名乗れない ④資金移動は `state='created' AND expires_unix_ms > now` を条件とした確定的 UPDATE 一文（変更行数==1のときのみ transfer へ進む）。
+不変条件（出金で確立したものを移植）: ①資金移動は必ずセッション本人の操作で、**API キーではいかなる残高も動かせない**（intent の作成・照会・取消のみ） ②承認画面が表示する金額・加盟店名は `payments::payer_view` が返す moymoy-cs の記録が唯一の真実で、クライアント渡しで信用するのは `intent_id` のみ ③第三者は「宛先」を名乗れるだけで「誰の財布が払うか」は名乗れない ④資金移動は `state='created' AND expires_unix_ms > now` を条件とした確定的 UPDATE 一文（変更行数==1のときのみ transfer へ進む）。この `now` は **`settle` 内部で読む**（`approve` から受け取らない） — 到着時刻を使うと Argon2id 比較やロック待ちで数百ms 空くため、PIN 検証中に期限が切れても送金が成立してしまう。
 
 intent の状態機械: `created → paid / declined / canceled / expired`。全終端は最終（`paid` はリファンドでも巻き戻らず、逆方向の別トランザクションになる）。二重承認・期限切れ直前承認・加盟店キャンセルとの競合は上記 UPDATE 一文で排他される。承認前チェックとして `merchants.status='active'` を必須、`payer_hint_account_id` 指定時は他口座からの承認/拒否を `payer_mismatch` で拒否、リプレイ（`paid` かつ同一 payer）は PIN 検証より前に応答して試行回数を消費しない。
 
-加盟店: セルフサーブ登録（1口座あたり最大3件アクティブ）。API キーは `moy_sk_` + 256bit CSPRNG、DB には SHA-256 ハッシュのみ保存、平文は登録/rotate 応答で一度だけ返す。`/merchant/v1/*`（API キー認証、intent の作成・照会・取消。移動可能な金額はゼロ）と `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・上限変更）の2系統分離。加盟店名は UTS #39 confusable skeleton で一意化（`lower`+NFKC だけでは別スクリプトの同形異字 `PiggleShoр2`(Cyrillic er) が素通りする）し、スクリプト混在を拒否、運営語彙（`moymoy`/`公式`等）を予約語として禁止。**リネーム API は存在しない**（登録時固定）。`description`/`sub`/`name` は NFKC 後 Cc+Cf（bidi制御・ZWJ含む）+未割当+私用領域を拒否し結合文字を基底1文字あたり3個までに制限（`U+202E` 等での承認画面偽装を防ぐ）。
+加盟店: セルフサーブ登録。1口座あたり保有できる加盟店は `MAX_MERCHANTS_PER_ACCOUNT`（3件、`status != 'deleted'` を数える。停止(disabled)中も枠を占有し続ける — 名前とスロットは同じ予算で、`close` 以外に返す手段が無いため）。API キーは `moy_sk_` + 256bit CSPRNG、DB には SHA-256 ハッシュのみ保存、平文は登録/rotate 応答で一度だけ返す。`/merchant/v1/*`（API キー認証、intent の作成・照会・取消。移動可能な金額はゼロ）と `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・閉店・上限変更）の2系統分離。加盟店名は UTS #39 confusable skeleton で一意化（`lower`+NFKC だけでは別スクリプトの同形異字 `PiggleShoр2`(Cyrillic er) が素通りする）し、スクリプト混在を拒否、運営語彙（`moymoy`/`公式`等）を予約語として禁止。**リネーム API は存在しない**（登録時固定）。`description`/`sub`/`name` は NFKC 後 Cc+Cf（bidi制御・ZWJ含む）+未割当+私用領域を拒否し結合文字を基底1文字あたり3個までに制限（`U+202E` 等での承認画面偽装を防ぐ）。
+
+**閉店（`POST /merchant/portal/close`、セッション+PIN）**: `status='deleted'` の soft delete（`name_skeleton`/`api_key_hash`/`api_key_prefix` を NULL・`listed=0`）で、名前・資格情報・枠を解放しつつ台帳（`payment_intents.merchant_id` の参照先）は残す。行ごと削除すると「一度でも取引した店は閉じられない」か「注文履歴を道連れにする」のどちらかになるため。**未決済 intent が1件でもあれば拒否される**（`open_intents`、count 付き）。閉じた加盟店は再オープン不可（登録し直す）。
 
 **加盟店の発行上限**（下記「加盟店売上を拘束しない」ことの代償措置）: 未決済 intent 件数上限（既定20、上限500）と 24h 発行合計金額上限（既定50,000エメ、上限2,000,000エメ）。引き上げは `/merchant/portal/limits`（セッション+PIN）のみ、API キー単体では不可。
+
+**運営の強制返金**: `moymoy-cs admin refund <intent_id> [reason...]`（CLI サブコマンド）で実装済み。`paid` は巻き戻さず、逆方向の別トランザクションとして記録する。**HTTP エンドポイントには出さない** — 他人の口座から同意なく金を動かす最も強い権限操作なので、盗まれたセッション・漏れた API キー・ルーティングのバグから守る手段は、そもそもネットワーク面を作らないことにした。
 
 **シェルの attestation モーダルは決済承認に使わない**（決定）。MochiOS の `docs/developers/host-attestation.md` §3 が明示的に禁止しており、`reason`（ユーザーに見える文言）は署名クレームに入らず `request_hash`（署名される値）はユーザーに見えないため、見たものと署名したものが構造的に一致しない。承認は MoyMoy アプリ内の PIN が担う。※MochiOS 側ソースは未照合（moymoy-cs リポジトリからは検証不能）。
 
@@ -164,10 +168,7 @@ PIN 検証は「短いトランザクションで失敗カウンタを先に書�
 - [x] 出金のフル E2E 実機検証（本番・online-mode サーバーで成功）。出金3件が `granted` = 要求額・返金0で `settled`（192 / 2,414 / 64 エメ、予約から決着まで 30〜50ms）。assertion の拒否は0件
 - [ ] 出金の UX 再評価: 認証モーダルの成功表示は `ph-done` 700ms 固定（MochiOS `apps/com.mochi.ui/os-chrome.js`）。承認直後に閉じる不具合（エンベロープ読み違い）は MochiOS `eafd935d` で解消したので、本来の振り付けが出る状態で短すぎないかを実機で判断する
 - [x] EC決済 Phase 1: backend 決済ドメイン（riskauth / merchant / payments、schema v6）
-- [ ] EC決済 Phase 2: MoyMoy アプリの承認オーバーレイ（`@owner_handle` 主表示・description の引用枠づけ・`from`/`launch_app_id` 不一致警告・新規加盟店バッジ・個人化シール）＋ 加盟店管理画面（登録・キー表示/rotate・停止・上限引き上げ・利用状況）
+- [ ] EC決済 Phase 2: MoyMoy アプリの承認オーバーレイ（`@owner_handle` 主表示・description の引用枠づけ・`from`/`launch_app_id` 不一致警告・新規加盟店バッジ・個人化シール）＋ 加盟店管理画面（登録・キー表示/rotate・停止・閉店・上限引き上げ・利用状況）
 - [ ] EC決済 Phase 3: PiggleShop2 側の注文事前永続化（`state=awaiting_payment`、`order_id` サーバー発行化）＋ intent 作成 → launch → サーバー照会確定への作り替え、既存 `MoyMoyRedirect` モック削除、実機 E2E
-- [ ] 運営の強制返金（`payments::force_refund`）は関数のみ実装済みで呼び出し元（CLI/HTTP）が無い。CLI サブコマンドとして配線する（環境変数と HTTP エンドポイントを増やさないため）
-- [ ] 加盟店の上限カウント（`MAX_ACTIVE_MERCHANTS`）に停止済みを含める（現状は `status='active'` のみ数えるため、登録→停止→登録で名前を無制限に占有できる）
 - [ ] リスクベース閾値（200 / 1,000 エメ）の実運用調整
-- [ ] 第三者開発者向けドキュメント `docs/merchant-quickstart.md`。公式 SDK にはサーバー照会を内包した関数だけを出し、クライアントに決済結果を返す API は用意しない
 - [ ] **将来実装**（着手前に承認要）: Web 決済（`return_url` 追加・MoyMoy ホスト型承認ページ、現行スキーマ/状態機械は無変更で使える）／ 返金 API（加盟店主導、加盟店口座から金が出る唯一の経路になるため着手時に別途承認）／ 署名レシート（moymoy-cs は `mochi-proto-attest` の `issue` feature を OFF にしており署名鍵を持たないため webhook 導入時に別途判断）／ 猶予付き二重 API キー（無停止ローテーション）／ webhook 通知
