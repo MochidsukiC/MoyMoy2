@@ -1319,6 +1319,8 @@ async fn withdraw_gate(
     // deliberately not reaching into that module's transaction. All that
     // transaction carries is the failure-counter clear, so the worst a later
     // failure costs is a PIN attempt the caller did not owe.
+    let assertion = assertion.filter(|a| !a.trim().is_empty());
+    let has_assertion = assertion.is_some();
     let refused = blocking(pool, move |conn| {
         let caller = riskauth::Caller {
             account_id: &acct.account_id,
@@ -1327,6 +1329,26 @@ async fn withdraw_gate(
             pin: pin.as_deref(),
             otp: otp.as_deref(),
         };
+        // Ask first, spend second. `peek` reports what is still missing without
+        // verifying anything, so the two answers below can be given while the
+        // emailed code — which is single-use and destroyed by verification — is
+        // still intact. Checking it here instead would consume the code and then
+        // send the caller away for an assertion, and the retry carrying that same
+        // code would be told `invalid_code` by the wallet that destroyed it.
+        if let Some(missing) = riskauth::peek(
+            conn,
+            &backoff,
+            email_enabled,
+            &caller,
+            amount,
+            Requirement::None,
+        )? {
+            return Ok(Some(missing));
+        }
+        if !has_assertion {
+            return Ok(Some(json!({ "ok": false, "error": "attestation_required" })));
+        }
+        // Everything is in hand. Now it costs something.
         let ticket = match riskauth::step_up(
             conn,
             &backoff,
@@ -1347,12 +1369,13 @@ async fn withdraw_gate(
         Ok::<Option<Value>, ApiError>(None)
     })
     .await?;
-    if let Some(v) = refused {
-        return Ok(Err(v));
-    }
-    match assertion.filter(|a| !a.trim().is_empty()) {
-        Some(a) => Ok(Ok(a)),
-        None => Ok(Err(json!({ "ok": false, "error": "attestation_required" }))),
+    match (refused, assertion) {
+        (Some(v), _) => Ok(Err(v)),
+        (None, Some(a)) => Ok(Ok(a)),
+        // Unreachable: `has_assertion` was false, so the closure refused above.
+        (None, None) => Err(ApiError::internal(
+            "withdraw gate cleared without an assertion",
+        )),
     }
 }
 
@@ -1528,24 +1551,112 @@ mod tests {
         assert_eq!(a, "assertion-blob");
     }
 
-    /// A wrong PIN is refused as a wrong PIN, and never mistaken for a missing
-    /// assertion — the app has to be able to tell "try again" from "ask the OS".
-    #[tokio::test]
-    async fn a_wrong_pin_is_reported_as_such_even_with_no_assertion() {
-        let (pool, acct) = wallet_with_funds();
-        let v = gate(&pool, &acct, Some("9999"), None).await.unwrap_err();
-        assert_eq!(v["error"], json!("invalid_pin"), "{v}");
-        // …and it was recorded, exactly as it is on the other outflow paths.
-        let attempts: i64 = pool
-            .get()
+    fn failed_attempts(pool: &Pool) -> i64 {
+        pool.get()
             .unwrap()
             .query_row(
                 "SELECT failed_pin_attempts FROM accounts WHERE account_id = 'acct-a'",
                 [],
                 |r| r.get(0),
             )
+            .unwrap()
+    }
+
+    /// Nothing is CHECKED until everything is PRESENT.
+    ///
+    /// A wrong PIN offered without an assertion is not reported as wrong — the
+    /// request was never going to succeed anyway, and verifying it there would
+    /// spend an attempt on a round trip the caller has to make again. The PIN is
+    /// judged once the assertion is in hand, and only then does it cost anything.
+    /// The same rule is what protects the single-use emailed code.
+    #[tokio::test]
+    async fn nothing_is_verified_until_every_credential_is_present() {
+        let (pool, acct) = wallet_with_funds();
+
+        let v = gate(&pool, &acct, Some("9999"), None).await.unwrap_err();
+        assert_eq!(v["error"], json!("attestation_required"), "{v}");
+        assert_eq!(failed_attempts(&pool), 0, "an attempt was spent too early");
+
+        // With the assertion in hand the PIN is judged, and now it is recorded.
+        let v = gate(&pool, &acct, Some("9999"), Some("assertion-blob"))
+            .await
+            .unwrap_err();
+        assert_eq!(v["error"], json!("invalid_pin"), "{v}");
+        assert_eq!(failed_attempts(&pool), 1);
+    }
+
+    /// A withdrawal above the step-up threshold completes.
+    ///
+    /// It did not, once: the code was verified — and DESTROYED, it is single-use
+    /// — before the assertion was asked for, so the retry that finally carried
+    /// everything presented a code the wallet had already consumed and was told
+    /// `invalid_code`. Withdrawals over 5,000 エメ could not be made at all.
+    #[tokio::test]
+    async fn a_step_up_withdrawal_completes_without_burning_its_code() {
+        let (pool, acct) = wallet_with_funds();
+        let email = "stepup-withdraw@disc.mnn";
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET email = ?1, email_lower = ?1, email_verified_unix_ms = 1 \
+                 WHERE account_id = 'acct-a'",
+                [email],
+            )
             .unwrap();
-        assert_eq!(attempts, 1);
+        let big = crate::riskauth::STEPUP_SINGLE + 1;
+        let code = {
+            let conn = pool.get().unwrap();
+            match otp::create(&conn, riskauth::PURPOSE_STEPUP, email, Some("acct-a"), None).unwrap()
+            {
+                CreateOtp::Issued(c) => c,
+                CreateOtp::TooSoon { .. } => panic!("cooldown"),
+            }
+        };
+        let live = |pool: &Pool| -> i64 {
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM moymoy_otps WHERE purpose = ?1",
+                    [riskauth::PURPOSE_STEPUP],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let post = |pin: Option<&'static str>, otp: Option<String>, a: Option<&'static str>| {
+            let (pool, acct) = (pool.clone(), acct.clone());
+            async move {
+                withdraw_gate(
+                    pool,
+                    Arc::new(PinBackoff::new()),
+                    true,
+                    acct,
+                    big,
+                    pin.map(str::to_string),
+                    otp,
+                    a.map(str::to_string),
+                )
+                .await
+                .expect("the gate answers")
+            }
+        };
+
+        // 1. Nothing supplied.
+        let v = post(None, None, None).await.unwrap_err();
+        assert_eq!(v["error"], json!("pin_required"), "{v}");
+        assert_eq!(v["required"], json!("pin_otp"));
+
+        // 2. PIN and code, but no consent yet. The code MUST survive this.
+        let v = post(Some(PIN), Some(code.clone()), None).await.unwrap_err();
+        assert_eq!(v["error"], json!("attestation_required"), "{v}");
+        assert_eq!(live(&pool), 1, "the code was consumed by a refusal");
+        assert_eq!(failed_attempts(&pool), 0);
+
+        // 3. Everything in hand — the same code still works.
+        let a = post(Some(PIN), Some(code), Some("assertion-blob"))
+            .await
+            .expect("the step-up withdrawal clears its gate");
+        assert_eq!(a, "assertion-blob");
+        assert_eq!(live(&pool), 0, "the code was not consumed on success");
     }
 
     /// A withdrawal small enough for the frictionless band asks for nothing but

@@ -243,34 +243,51 @@ pub struct Caller<'a> {
 /// Takes `&mut Connection` and no transaction, and that is the point: stage 1
 /// commits on its own and the Argon2id comparison happens with no write lock
 /// held. See the notes in [`crate::auth`].
-pub fn step_up(
-    conn: &mut Connection,
+/// What this movement still needs from the caller, worked out **without
+/// verifying or spending anything**.
+enum Demand {
+    /// Nothing is required at all.
+    Nothing,
+    /// Everything required is present and can now be checked.
+    Ready {
+        pin: String,
+        /// The address the code was issued to, when one is required.
+        otp_email_lower: Option<String>,
+    },
+    /// Something is missing; this is the body that says what. Nothing was spent.
+    Missing(Value),
+}
+
+/// The one implementation of "what does this movement need", shared by
+/// [`peek`] and [`step_up`] so the two can never drift apart — a `peek` that
+/// answered a different question from the call that follows it would be worse
+/// than no `peek` at all.
+fn demand(
+    conn: &Connection,
     backoff: &PinBackoff,
     email_enabled: bool,
     caller: &Caller<'_>,
     amount: i64,
     floor: Requirement,
-) -> Result<StepUp, ApiError> {
-    let now = now_ms();
+    now: i64,
+) -> Result<Demand, ApiError> {
     let account_id = caller.account_id;
     let requirement = floor.max(assess_for(conn, account_id, caller.phone_id, amount, now)?);
     if !requirement.needs_pin() {
-        return Ok(StepUp::Cleared(StepUpTicket::default()));
+        return Ok(Demand::Nothing);
     }
     if let Err(retry_after_ms) = backoff.check(caller.session_key, now) {
-        return Ok(StepUp::Refused(
+        return Ok(Demand::Missing(
             json!({ "ok": false, "error": "too_many_attempts", "retry_after_ms": retry_after_ms }),
         ));
     }
     let Some(pin) = caller.pin.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(StepUp::Refused(
+        return Ok(Demand::Missing(
             json!({ "ok": false, "error": "pin_required", "required": requirement.code() }),
         ));
     };
 
-    // Resolve the second factor before spending a PIN attempt on a request that
-    // was never going to be enough.
-    let mut otp_check: Option<(String, String)> = None;
+    let mut otp_email_lower = None;
     if requirement.needs_otp() {
         let info = auth::account_full(conn, account_id)?
             .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
@@ -284,17 +301,89 @@ pub fn step_up(
             tracing::warn!(account = %account_id, amount,
                 "step-up refused: this movement requires an email code and the account has no \
                  verified address (or mail is disabled in this deploy)");
-            return Ok(StepUp::Refused(json!({
+            return Ok(Demand::Missing(json!({
                 "ok": false, "error": "otp_unavailable", "required": requirement.code(),
             })));
         };
-        let Some(code) = caller.otp.map(str::trim).filter(|s| !s.is_empty()) else {
-            return Ok(StepUp::Refused(
+        if caller.otp.map(str::trim).filter(|s| !s.is_empty()).is_none() {
+            return Ok(Demand::Missing(
                 json!({ "ok": false, "error": "otp_required", "required": requirement.code() }),
             ));
-        };
-        otp_check = Some((email_lower, code.to_string()));
+        }
+        otp_email_lower = Some(email_lower);
     }
+    Ok(Demand::Ready {
+        pin: pin.to_string(),
+        otp_email_lower,
+    })
+}
+
+/// Ask what this movement still needs, **spending nothing**.
+///
+/// `None` means everything required is in hand; `Some(body)` is the answer to
+/// return. The emailed code is single-use, so a caller that has a SECOND gate of
+/// its own — `/wallet/withdraw`, which also wants an in-world consent — has to be
+/// able to find out it is not ready yet without burning the code on the way.
+/// Without this, the sequence was: code verified and consumed, then
+/// `attestation_required` returned, then the retry rejected with `invalid_code`
+/// for a code the wallet itself had just destroyed. Withdrawals above the
+/// step-up threshold could not complete at all.
+///
+/// This is [`crate::merchant::RateLimiter::peek`] again, and deliberately so:
+/// **a single-use thing is not spent until everything else has agreed.** Ask
+/// with `peek`, spend with [`step_up`].
+pub fn peek(
+    conn: &Connection,
+    backoff: &PinBackoff,
+    email_enabled: bool,
+    caller: &Caller<'_>,
+    amount: i64,
+    floor: Requirement,
+) -> Result<Option<Value>, ApiError> {
+    match demand(
+        conn,
+        backoff,
+        email_enabled,
+        caller,
+        amount,
+        floor,
+        now_ms(),
+    )? {
+        Demand::Missing(body) => Ok(Some(body)),
+        Demand::Nothing | Demand::Ready { .. } => Ok(None),
+    }
+}
+
+pub fn step_up(
+    conn: &mut Connection,
+    backoff: &PinBackoff,
+    email_enabled: bool,
+    caller: &Caller<'_>,
+    amount: i64,
+    floor: Requirement,
+) -> Result<StepUp, ApiError> {
+    let now = now_ms();
+    let account_id = caller.account_id;
+    let (pin, otp_check) = match demand(
+        conn,
+        backoff,
+        email_enabled,
+        caller,
+        amount,
+        floor,
+        now,
+    )? {
+        Demand::Nothing => return Ok(StepUp::Cleared(StepUpTicket::default())),
+        Demand::Missing(body) => return Ok(StepUp::Refused(body)),
+        Demand::Ready {
+            pin,
+            otp_email_lower,
+        } => {
+            let code = caller.otp.map(str::trim).unwrap_or_default().to_string();
+            (pin, otp_email_lower.map(|email| (email, code)))
+        }
+    };
+    let pin = pin.as_str();
 
     let (pin_hash, epoch) = match auth::begin_pin_attempt(conn, account_id, LockoutPolicy::Enforce)?
     {
