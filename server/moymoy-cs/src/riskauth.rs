@@ -16,13 +16,26 @@
 //!
 //! | | requirement |
 //! |---|---|
-//! | ≤ 200 エメ, ≤ 1,000 エメ in 24h, known device | none |
-//! | anything above that | PIN |
-//! | > 5,000 エメ once, > 10,000 エメ in 24h, or an unfamiliar device | PIN + email OTP |
+//! | ≤ 200 エメ, ≤ 1,000 エメ in 24h, familiar device | none |
+//! | anything above that, or an unfamiliar device | PIN |
 //!
 //! Constants, not configuration: a wallet whose spending limits can be moved by
 //! an environment variable has limits set by whoever can edit the launcher.
 //! DEV.md records the numbers for operational review.
+//!
+//! ## Why there is no second factor
+//!
+//! **A PIN is as far as MoyMoy authenticates, and that is a stated position
+//! rather than an omission.** An earlier revision escalated large movements to an
+//! emailed code. The deployed backend has no mail configuration at all, so that
+//! code could never be delivered — and since a withdrawal is capped at 20,736 エメ
+//! ([`crate::wallet::MAX_WITHDRAW_PER_OP`]), the tier would have blocked most of
+//! the withdrawal range outright. The choice was between a factor that silently
+//! degraded to a PIN (a threshold that decides nothing, which is worse than no
+//! threshold) and saying plainly that there is one factor. This is the second.
+//!
+//! Reintroducing a second factor means reintroducing it here, in `assess`, and
+//! nowhere else.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -33,25 +46,13 @@ use serde_json::{json, Value};
 use crate::auth::{self, LockoutPolicy, PinAttempt, PinSettle};
 use crate::db::now_ms;
 use crate::error::ApiError;
-use crate::otp::{self, VerifyOtp};
 
 /// Single-movement ceiling below which nothing is asked.
 pub const FRICTIONLESS_SINGLE: i64 = 200;
 /// Rolling 24h outflow below which nothing is asked.
 pub const FRICTIONLESS_DAILY: i64 = 1_000;
-/// Single movement above which a second factor is required.
-pub const STEPUP_SINGLE: i64 = 5_000;
-/// Rolling 24h outflow above which a second factor is required.
-pub const STEPUP_DAILY: i64 = 10_000;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// The OTP purpose a step-up code is issued and verified under.
-///
-/// Its own namespace, next to signup / login2fa / recovery: a code mailed to
-/// confirm a login must not also authorize a 9,000 エメ payment, and
-/// `crate::otp` keys every code by `(purpose, email)`.
-pub const PURPOSE_STEPUP: &str = "stepup";
 
 /// Consecutive wrong PINs on one session before the backoff bites.
 const BACKOFF_FREE_ATTEMPTS: u32 = 2;
@@ -67,30 +68,19 @@ pub enum Requirement {
     /// Small, routine, from the usual device.
     None,
     Pin,
-    PinAndOtp,
 }
 
 impl Requirement {
     pub fn needs_pin(self) -> bool {
-        !matches!(self, Requirement::None)
+        matches!(self, Requirement::Pin)
     }
-    pub fn needs_otp(self) -> bool {
-        matches!(self, Requirement::PinAndOtp)
-    }
-    /// The strictest of the two. Payments start at [`Requirement::Pin`] by
-    /// standing decision and are raised from there by the amount.
+    /// The stricter of the two. Payments start at [`Requirement::Pin`] by
+    /// standing decision, and the amount may only hold that, never lower it.
     pub fn max(self, other: Requirement) -> Requirement {
-        if self.rank() >= other.rank() {
-            self
+        if self.needs_pin() || other.needs_pin() {
+            Requirement::Pin
         } else {
-            other
-        }
-    }
-    fn rank(self) -> u8 {
-        match self {
-            Requirement::None => 0,
-            Requirement::Pin => 1,
-            Requirement::PinAndOtp => 2,
+            Requirement::None
         }
     }
     /// What the client is told it must collect. Distinct from `invalid_pin`: one
@@ -99,7 +89,6 @@ impl Requirement {
         match self {
             Requirement::None => "none",
             Requirement::Pin => "pin",
-            Requirement::PinAndOtp => "pin_otp",
         }
     }
 }
@@ -162,11 +151,16 @@ pub fn outflow_24h(conn: &Connection, account_id: &str, now: i64) -> rusqlite::R
 }
 
 /// Decide what this movement has to be authenticated with.
+///
+/// The device check is not folded into the amount test on purpose: a session that
+/// has moved to another handset is worth a PIN even for a movement small enough
+/// to be waved through, because the thing in doubt is who is holding it rather
+/// than how much they are asking for.
 pub fn assess(amount: i64, outflow_24h: i64, device: DeviceTrust) -> Requirement {
-    let after = outflow_24h.saturating_add(amount);
-    if amount > STEPUP_SINGLE || after > STEPUP_DAILY || device == DeviceTrust::Unfamiliar {
-        return Requirement::PinAndOtp;
+    if device == DeviceTrust::Unfamiliar {
+        return Requirement::Pin;
     }
+    let after = outflow_24h.saturating_add(amount);
     if amount <= FRICTIONLESS_SINGLE && after <= FRICTIONLESS_DAILY {
         return Requirement::None;
     }
@@ -217,15 +211,13 @@ pub struct Caller<'a> {
     pub phone_id: Option<&'a str>,
     pub session_key: &'a str,
     pub pin: Option<&'a str>,
-    pub otp: Option<&'a str>,
 }
 
 /// Decide what this outflow needs and prove it — stages 1 and 2.
 ///
 /// `floor` is the minimum the calling operation insists on regardless of size:
 /// [`Requirement::None`] for a send or a withdrawal, [`Requirement::Pin`] for a
-/// payment, which is a PIN by standing decision and may only be raised from
-/// there.
+/// payment, which is a PIN by standing decision.
 ///
 /// Takes `&mut Connection` and no transaction, and that is the point: stage 1
 /// commits on its own and the Argon2id comparison happens with no write lock
@@ -233,7 +225,6 @@ pub struct Caller<'a> {
 pub fn step_up(
     conn: &mut Connection,
     backoff: &PinBackoff,
-    email_enabled: bool,
     caller: &Caller<'_>,
     amount: i64,
     floor: Requirement,
@@ -254,34 +245,6 @@ pub fn step_up(
             json!({ "ok": false, "error": "pin_required", "required": requirement.code() }),
         ));
     };
-
-    // Resolve the second factor before spending a PIN attempt on a request that
-    // was never going to be enough.
-    let mut otp_check: Option<(String, String)> = None;
-    if requirement.needs_otp() {
-        let info = auth::account_full(conn, account_id)?
-            .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
-        let verified_email = info
-            .email_lower
-            .filter(|_| email_enabled && info.email_verified);
-        let Some(email_lower) = verified_email else {
-            // Fail closed. This account (or this deploy) cannot produce the
-            // factor a movement of this size requires, and settling for the PIN
-            // instead would make the threshold decide nothing at all.
-            tracing::warn!(account = %account_id, amount,
-                "step-up refused: this movement requires an email code and the account has no \
-                 verified address (or mail is disabled in this deploy)");
-            return Ok(StepUp::Refused(json!({
-                "ok": false, "error": "otp_unavailable", "required": requirement.code(),
-            })));
-        };
-        let Some(code) = caller.otp.map(str::trim).filter(|s| !s.is_empty()) else {
-            return Ok(StepUp::Refused(
-                json!({ "ok": false, "error": "otp_required", "required": requirement.code() }),
-            ));
-        };
-        otp_check = Some((email_lower, code.to_string()));
-    }
 
     let (pin_hash, epoch) = match auth::begin_pin_attempt(conn, account_id, LockoutPolicy::Enforce)?
     {
@@ -305,40 +268,6 @@ pub fn step_up(
         ));
     }
     backoff.clear(caller.session_key);
-
-    // The code is checked and consumed HERE, in a transaction that commits on its
-    // own — not carried into the money transaction.
-    //
-    // `otp::verify` records a wrong code by incrementing that code's attempt
-    // counter, and that counter is the only thing bounding guesses at a six-digit
-    // number. Verifying inside the money transaction meant every wrong guess was
-    // rolled back along with the failed payment, so the five-attempt limit never
-    // arrived and the second factor could be guessed indefinitely. The cost of
-    // committing here is that a valid code is spent even if the transfer then
-    // fails for want of funds — the customer asks for another one, which is the
-    // cheaper of the two prices by a wide margin.
-    if let Some((email_lower, code)) = otp_check {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let verdict = otp::verify(&tx, PURPOSE_STEPUP, &email_lower, &code)?;
-        // Committed on BOTH paths: a refusal has to leave its attempt behind.
-        tx.commit()?;
-        match verdict {
-            // A code issued to a different account is not a code for this one,
-            // however valid it is in its own right.
-            VerifyOtp::Ok { account_id: a, .. } if a.as_deref() == Some(account_id) => {}
-            _ => {
-                // The PIN was right — only the code was wrong, and the code now
-                // carries that failure on its own counter. Give the PIN attempt
-                // back, or five mistyped codes would lock somebody out of their
-                // account rather than just out of that code.
-                auth::clear_pin_failures(conn, account_id, epoch)?;
-                return Ok(StepUp::Refused(
-                    json!({ "ok": false, "error": "invalid_code" }),
-                ));
-            }
-        }
-    }
-
     Ok(StepUp::Cleared(StepUpTicket { epoch: Some(epoch) }))
 }
 
@@ -474,22 +403,41 @@ mod tests {
         );
     }
 
+    /// A PIN is the ceiling. Above the frictionless band every size asks for the
+    /// same thing, right up to the largest movement the wallet permits — there is
+    /// deliberately no second tier for a backend that has no way to deliver one.
     #[test]
-    fn the_step_up_band_starts_one_eme_past_each_threshold() {
+    fn a_pin_is_as_far_as_the_requirement_ever_goes() {
         let f = DeviceTrust::Familiar;
-        assert_eq!(assess(STEPUP_SINGLE, 0, f), Requirement::Pin);
-        assert_eq!(assess(STEPUP_SINGLE + 1, 0, f), Requirement::PinAndOtp);
-        // The daily ceiling counts this movement too: 10,000 already spent plus
-        // one more eme is over it, even though the movement itself is trivial.
-        assert_eq!(assess(1, STEPUP_DAILY - 1, f), Requirement::Pin);
-        assert_eq!(assess(1, STEPUP_DAILY, f), Requirement::PinAndOtp);
+        for amount in [
+            FRICTIONLESS_SINGLE + 1,
+            5_000,
+            5_001,
+            crate::wallet::MAX_WITHDRAW_PER_OP,
+            crate::wallet::MAX_AMOUNT,
+        ] {
+            assert_eq!(assess(amount, 0, f), Requirement::Pin, "amount {amount}");
+        }
+        // …and a huge running total does not invent a stricter answer either.
+        assert_eq!(assess(1, 10_000_000, f), Requirement::Pin);
     }
 
     #[test]
-    fn an_unfamiliar_device_steps_up_however_small_the_amount() {
+    fn an_unfamiliar_device_asks_for_a_pin_however_small_the_amount() {
         // The signal is worth nothing if it only applies to amounts that were
-        // already going to ask for something.
-        assert_eq!(assess(1, 0, DeviceTrust::Unfamiliar), Requirement::PinAndOtp);
+        // already going to ask for something: the thing in doubt is who holds the
+        // session, not how much they want.
+        assert_eq!(assess(1, 0, DeviceTrust::Unfamiliar), Requirement::Pin);
+        assert_eq!(
+            assess(FRICTIONLESS_SINGLE, 0, DeviceTrust::Unfamiliar),
+            Requirement::Pin
+        );
+        // The same movement from the familiar handset is waved through, so it is
+        // the device that made the difference and nothing else.
+        assert_eq!(
+            assess(FRICTIONLESS_SINGLE, 0, DeviceTrust::Familiar),
+            Requirement::None
+        );
     }
 
     #[test]
@@ -507,15 +455,15 @@ mod tests {
 
     #[test]
     fn a_payment_never_drops_below_a_pin() {
-        // Payments are PIN-by-standing-decision; the amount may only raise that.
-        assert_eq!(
-            Requirement::Pin.max(assess(1, 0, DeviceTrust::Familiar)),
-            Requirement::Pin
-        );
-        assert_eq!(
-            Requirement::Pin.max(assess(9_000, 0, DeviceTrust::Familiar)),
-            Requirement::PinAndOtp
-        );
+        // Payments are PIN-by-standing-decision, so the floor holds even for the
+        // amounts the assessment would otherwise wave through.
+        for (amount, spent) in [(1, 0), (FRICTIONLESS_SINGLE, 0), (9_000, 0), (1, 500_000)] {
+            assert_eq!(
+                Requirement::Pin.max(assess(amount, spent, DeviceTrust::Familiar)),
+                Requirement::Pin,
+                "amount {amount} after {spent}"
+            );
+        }
     }
 
     #[test]
@@ -590,6 +538,69 @@ mod tests {
             device_trust(&conn, "acct-a", None).unwrap(),
             DeviceTrust::Unfamiliar
         );
+    }
+
+    /// The device rule, through the real gate rather than through `assess`
+    /// alone: an amount small enough to be waved through still has to produce a
+    /// PIN once the session is coming from a handset the account has not used.
+    #[test]
+    fn the_gate_asks_for_a_pin_from_an_unfamiliar_handset_even_for_pocket_change() {
+        let pool = crate::db::open_memory().unwrap();
+        let mut conn = pool.get().unwrap();
+        let hash = auth::hash_pin("1234").unwrap();
+        auth::insert_account(&conn, "acct-a", "payer", "payer", "payer", &hash, None).unwrap();
+        conn.execute(
+            "INSERT INTO moymoy_sessions \
+               (session_id, account_id, token_hash, phone_id, created_unix_ms, \
+                last_seen_unix_ms, expires_unix_ms) \
+             VALUES ('s1', 'acct-a', 's1', 'phone-1', 10, 10, 99999999999999)",
+            [],
+        )
+        .unwrap();
+        let backoff = PinBackoff::new();
+        let caller = |phone, pin| Caller {
+            account_id: "acct-a",
+            phone_id: Some(phone),
+            session_key: "sess",
+            pin,
+        };
+        // The established handset, well inside the frictionless band: nothing.
+        let cleared = step_up(
+            &mut conn,
+            &backoff,
+            &caller("phone-1", None),
+            1,
+            Requirement::None,
+        )
+        .unwrap();
+        assert!(matches!(cleared, StepUp::Cleared(_)));
+
+        // Same eme, different handset: the gate asks.
+        let refused = step_up(
+            &mut conn,
+            &backoff,
+            &caller("phone-2", None),
+            1,
+            Requirement::None,
+        )
+        .unwrap();
+        let StepUp::Refused(body) = refused else {
+            panic!("an unfamiliar handset was waved through");
+        };
+        assert_eq!(body["error"], json!("pin_required"), "{body}");
+        assert_eq!(body["required"], json!("pin"));
+
+        // …and a correct PIN from that handset is enough — there is no further
+        // factor to produce.
+        let cleared = step_up(
+            &mut conn,
+            &backoff,
+            &caller("phone-2", Some("1234")),
+            1,
+            Requirement::None,
+        )
+        .unwrap();
+        assert!(matches!(cleared, StepUp::Cleared(_)), "a PIN was not enough");
     }
 
     #[test]

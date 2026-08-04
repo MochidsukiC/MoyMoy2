@@ -86,6 +86,7 @@ pub struct Intent {
     pub launch_app_id: Option<String>,
     pub tx_id: Option<String>,
     pub refunded_unix_ms: Option<i64>,
+    pub refund_tx_id: Option<String>,
     pub created_unix_ms: i64,
     pub expires_unix_ms: i64,
 }
@@ -106,7 +107,7 @@ impl Intent {
 
 const INTENT_COLS: &str = "intent_id, merchant_id, amount, description, order_ref, state, \
      payer_account_id, payer_hint_account_id, launch_app_id, tx_id, refunded_unix_ms, \
-     created_unix_ms, expires_unix_ms";
+     refund_tx_id, created_unix_ms, expires_unix_ms";
 
 fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
     Ok(Intent {
@@ -121,8 +122,9 @@ fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
         launch_app_id: r.get(8)?,
         tx_id: r.get(9)?,
         refunded_unix_ms: r.get(10)?,
-        created_unix_ms: r.get(11)?,
-        expires_unix_ms: r.get(12)?,
+        refund_tx_id: r.get(11)?,
+        created_unix_ms: r.get(12)?,
+        expires_unix_ms: r.get(13)?,
     })
 }
 
@@ -219,6 +221,7 @@ pub fn create(
         launch_app_id: req.launch_app_id.map(str::to_string),
         tx_id: None,
         refunded_unix_ms: None,
+        refund_tx_id: None,
         created_unix_ms: now,
         expires_unix_ms: now + ttl * 1_000,
     };
@@ -420,7 +423,6 @@ pub fn decline(conn: &Connection, intent_id: &str, account_id: &str) -> rusqlite
 pub fn approve(
     conn: &mut Connection,
     backoff: &PinBackoff,
-    email_enabled: bool,
     a: &riskauth::Caller<'_>,
     intent_id: &str,
 ) -> Result<Value, ApiError> {
@@ -480,8 +482,7 @@ pub fn approve(
 
     // A payment is a PIN by standing decision (the user's explicit choice); the
     // amount may only raise that, never lower it.
-    let ticket = match riskauth::step_up(conn, backoff, email_enabled, a, intent.amount, Requirement::Pin)?
-    {
+    let ticket = match riskauth::step_up(conn, backoff, a, intent.amount, Requirement::Pin)? {
         riskauth::StepUp::Cleared(t) => t,
         riskauth::StepUp::Refused(v) => return Ok(v),
     };
@@ -780,13 +781,12 @@ mod tests {
         i.intent_id
     }
 
-    fn approver<'a>(pin: Option<&'a str>, otp: Option<&'a str>) -> riskauth::Caller<'a> {
+    fn approver(pin: Option<&str>) -> riskauth::Caller<'_> {
         riskauth::Caller {
             account_id: "acct-a",
             phone_id: None,
             session_key: "sess-a",
             pin,
-            otp,
         }
     }
 
@@ -796,94 +796,11 @@ mod tests {
 
     fn approve_with(pool: &Pool, intent_id: &str, pin: Option<&str>) -> Value {
         let mut conn = pool.get().unwrap();
-        approve(
-            &mut conn,
-            &PinBackoff::new(),
-            false,
-            &approver(pin, None),
-            intent_id,
-        )
-        .unwrap()
+        approve(&mut conn, &PinBackoff::new(), &approver(pin), intent_id).unwrap()
     }
 
     fn balance_of(pool: &Pool, account_id: &str) -> i64 {
         wallet::balance(&pool.get().unwrap(), account_id).unwrap()
-    }
-
-    /// Give the payer a verified address, which is what makes the PIN+OTP tier
-    /// reachable at all.
-    fn verify_email(pool: &Pool, email: &str) {
-        pool.get()
-            .unwrap()
-            .execute(
-                "UPDATE accounts SET email = ?1, email_lower = ?1, email_verified_unix_ms = 1 \
-                 WHERE account_id = 'acct-a'",
-                [email],
-            )
-            .unwrap();
-    }
-
-    /// Mail a step-up code the way `/wallet/stepup/otp` does.
-    fn issue_stepup_code(pool: &Pool, email: &str) -> String {
-        let conn = pool.get().unwrap();
-        match crate::otp::create(&conn, riskauth::PURPOSE_STEPUP, email, Some("acct-a"), None)
-            .unwrap()
-        {
-            crate::otp::CreateOtp::Issued(code) => code,
-            crate::otp::CreateOtp::TooSoon { retry_after_ms } => {
-                panic!("unexpected resend cooldown: {retry_after_ms} ms")
-            }
-        }
-    }
-
-    /// Wrong guesses recorded against the live step-up code.
-    fn stepup_code_attempts(pool: &Pool) -> i64 {
-        pool.get()
-            .unwrap()
-            .query_row(
-                "SELECT COALESCE(MAX(attempts), 0) FROM moymoy_otps WHERE purpose = ?1",
-                [riskauth::PURPOSE_STEPUP],
-                |r| r.get(0),
-            )
-            .unwrap()
-    }
-
-    fn live_stepup_codes(pool: &Pool) -> i64 {
-        pool.get()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM moymoy_otps WHERE purpose = ?1",
-                [riskauth::PURPOSE_STEPUP],
-                |r| r.get(0),
-            )
-            .unwrap()
-    }
-
-    /// Approve with mail enabled, so the step-up tier behaves as it does in a
-    /// deploy that has an identity token.
-    fn approve_stepup(pool: &Pool, intent_id: &str, pin: &str, code: Option<&str>) -> Value {
-        let mut conn = pool.get().unwrap();
-        approve(
-            &mut conn,
-            &PinBackoff::new(),
-            true,
-            &approver(Some(pin), code),
-            intent_id,
-        )
-        .unwrap()
-    }
-
-    /// An intent large enough to need the second factor, on a wallet that can pay
-    /// for it, addressed to a payer with a verified email.
-    fn stepup_fixture(email: &str) -> (Pool, String, i64) {
-        let (pool, _, m) = fixture(300, 100_000);
-        verify_email(&pool, email);
-        let amount = riskauth::STEPUP_SINGLE + 1;
-        let intent_id = {
-            let mut conn = pool.get().unwrap();
-            new_intent(&mut conn, &m, amount, None, 600)
-        };
-        (pool, intent_id, amount)
     }
 
     fn failed_attempts(pool: &Pool) -> i64 {
@@ -965,117 +882,29 @@ mod tests {
         assert_eq!(balance_of(&pool, "acct-a"), 1_000);
     }
 
-    /// The consequence of failing closed, written down as a test so the decision
-    /// is visible rather than discovered in production: a payment past the
-    /// step-up threshold cannot be made at all by an account with no verified
-    /// email (or in a deploy with mail switched off). Deliberately NOT degraded
-    /// to a PIN — that would make the threshold decide nothing.
+    /// What used to be the PIN+OTP tier. The emailed second factor is gone (see
+    /// the note at the top of [`crate::riskauth`] — this backend has no way to
+    /// deliver one), so the property that matters now is that a large payment
+    /// still COMPLETES, on a PIN alone, rather than hitting a factor nobody can
+    /// produce.
     #[test]
-    fn a_step_up_payment_is_refused_when_no_second_factor_can_be_produced() {
+    fn a_large_payment_completes_on_a_pin_alone() {
         let (pool, _, m) = fixture(300, 100_000);
+        // Comfortably past every old escalation threshold, and past what a single
+        // withdrawal may ever be.
+        let amount = crate::wallet::MAX_WITHDRAW_PER_OP;
         let intent_id = {
             let mut conn = pool.get().unwrap();
-            new_intent(&mut conn, &m, riskauth::STEPUP_SINGLE + 1, None, 600)
+            new_intent(&mut conn, &m, amount, None, 600)
         };
+
         let v = do_approve(&pool, &intent_id, PIN);
-        assert_eq!(v["error"], json!("otp_unavailable"), "{v}");
-        assert_eq!(v["required"], json!("pin_otp"));
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
-        // …and it costs no PIN attempt, because the request was never going to
-        // be enough whatever PIN it carried.
-        assert_eq!(failed_attempts(&pool), 0);
-    }
-
-    /// The top tier, end to end. Every other OTP test here is a refusal, so
-    /// without this one a mismatch between the purpose `/wallet/stepup/otp`
-    /// issues under and the one `riskauth::settle` verifies under would look
-    /// exactly like a green suite.
-    #[test]
-    fn the_step_up_tier_pays_when_the_emailed_code_is_right() {
-        let (pool, intent_id, amount) = stepup_fixture("stepup-ok@disc.mnn");
-        let code = issue_stepup_code(&pool, "stepup-ok@disc.mnn");
-        assert_eq!(live_stepup_codes(&pool), 1);
-
-        let v = approve_stepup(&pool, &intent_id, PIN, Some(&code));
 
         assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["amount"], json!(amount));
         assert_eq!(balance_of(&pool, "acct-a"), 100_000 - amount);
+        assert_eq!(balance_of(&pool, "acct-m"), amount);
         assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
-        // Consumed inside the money transaction, so it cannot be spent again.
-        assert_eq!(live_stepup_codes(&pool), 0, "the code survived its use");
-    }
-
-    #[test]
-    fn a_wrong_emailed_code_pays_nothing_and_spends_no_pin_attempt() {
-        let (pool, intent_id, _) = stepup_fixture("stepup-bad@disc.mnn");
-        let real = issue_stepup_code(&pool, "stepup-bad@disc.mnn");
-        let wrong = if real == "000000" { "111111" } else { "000000" };
-
-        let v = approve_stepup(&pool, &intent_id, PIN, Some(wrong));
-
-        assert_eq!(v["error"], json!("invalid_code"), "{v}");
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
-        assert_eq!(state_of(&pool, &intent_id), STATE_CREATED);
-        // The PIN was right. A wrong code has its own five-attempt counter and
-        // must not also eat into the PIN's, or a fumbled code would walk somebody
-        // into an account lockout.
-        assert_eq!(failed_attempts(&pool), 0);
-        // …and that counter is the ONLY thing bounding guesses at a six-digit
-        // number, so the wrong guess has to have been recorded. It was verified
-        // in a transaction of its own for exactly this reason: checking it inside
-        // the payment's transaction meant every wrong guess rolled back with the
-        // unpaid payment, and the limit never arrived.
-        assert_eq!(
-            stepup_code_attempts(&pool),
-            1,
-            "a wrong code left no trace — it could be guessed indefinitely"
-        );
-        // The real code is still live, so the customer can just try again.
-        assert_eq!(live_stepup_codes(&pool), 1);
-        let v = approve_stepup(&pool, &intent_id, PIN, Some(&real));
-        assert_eq!(v["ok"], json!(true), "{v}");
-    }
-
-    #[test]
-    fn guessing_a_code_runs_out_of_attempts_rather_than_out_of_codes() {
-        let (pool, intent_id, _) = stepup_fixture("stepup-brute@disc.mnn");
-        let real = issue_stepup_code(&pool, "stepup-brute@disc.mnn");
-        let wrong = if real == "000000" { "111111" } else { "000000" };
-        for _ in 0..5 {
-            let v = approve_stepup(&pool, &intent_id, PIN, Some(wrong));
-            assert_eq!(v["error"], json!("invalid_code"), "{v}");
-        }
-        // Five wrong guesses burn the code itself — after which even the right
-        // one is worthless and a fresh one has to be mailed.
-        assert_eq!(live_stepup_codes(&pool), 0);
-        let v = approve_stepup(&pool, &intent_id, PIN, Some(&real));
-        assert_eq!(v["error"], json!("invalid_code"), "{v}");
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
-    }
-
-    #[test]
-    fn a_code_issued_for_a_login_is_not_a_code_for_a_payment() {
-        // The purposes are separate namespaces on purpose: a code the user was
-        // mailed to confirm signing in must not authorize a 5,001 エメ transfer.
-        let (pool, intent_id, _) = stepup_fixture("stepup-purpose@disc.mnn");
-        let code = {
-            let conn = pool.get().unwrap();
-            match crate::otp::create(
-                &conn,
-                crate::otp::PURPOSE_LOGIN2FA,
-                "stepup-purpose@disc.mnn",
-                Some("acct-a"),
-                None,
-            )
-            .unwrap()
-            {
-                crate::otp::CreateOtp::Issued(c) => c,
-                crate::otp::CreateOtp::TooSoon { .. } => panic!("cooldown"),
-            }
-        };
-        let v = approve_stepup(&pool, &intent_id, PIN, Some(&code));
-        assert_eq!(v["error"], json!("invalid_code"), "{v}");
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
     }
 
     #[test]
@@ -1300,6 +1129,141 @@ mod tests {
             IssueGuard::TooManyOpen { limit: 1 }
         ));
         tx.commit().unwrap();
+    }
+
+    /// Register a shop owned by `acct-m`, reporting the outcome.
+    fn register_shop(pool: &Pool, name: &str) -> merchant::RegisterOutcome {
+        register_shop_as(pool, "acct-m", name)
+    }
+
+    fn register_shop_as(pool: &Pool, owner: &str, name: &str) -> merchant::RegisterOutcome {
+        let mut conn = pool.get().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let out = merchant::register(&tx, owner, name, None, None, None).unwrap();
+        tx.commit().unwrap();
+        out
+    }
+
+    /// Withdraw the unanswered bill the fixture leaves outstanding, so a shop can
+    /// be closed.
+    fn clear_open_intent(pool: &Pool, intent_id: &str, merchant_id: &str) {
+        assert_eq!(
+            cancel(&pool.get().unwrap(), intent_id, merchant_id).unwrap()["ok"],
+            json!(true)
+        );
+    }
+
+    fn set_shop_status(pool: &Pool, merchant_id: &str, status: &str) {
+        let mut conn = pool.get().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(merchant::set_status(&tx, merchant_id, "acct-m", status).unwrap());
+        tx.commit().unwrap();
+    }
+
+    fn close_shop(pool: &Pool, merchant_id: &str) -> merchant::CloseOutcome {
+        let mut conn = pool.get().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let out = merchant::close(&tx, merchant_id, "acct-m").unwrap();
+        tx.commit().unwrap();
+        out
+    }
+
+    /// The squatting hole, closed: stopping a shop does NOT hand the slot back,
+    /// because stopping does not hand the NAME back either. Counting only active
+    /// rows would have let register → disable → register run forever.
+    #[test]
+    fn a_stopped_shop_keeps_occupying_its_owners_slot() {
+        // The fixture already registered "Piggle Shop", so one slot is spent.
+        let (pool, _, m) = fixture(300, 1_000);
+        assert!(matches!(
+            register_shop(&pool, "Second Shop"),
+            merchant::RegisterOutcome::Ok { .. }
+        ));
+        assert!(matches!(
+            register_shop(&pool, "Third Shop"),
+            merchant::RegisterOutcome::Ok { .. }
+        ));
+        assert!(matches!(
+            register_shop(&pool, "Fourth Shop"),
+            merchant::RegisterOutcome::TooManyMerchants
+        ));
+        // Stopping the first one frees nothing.
+        set_shop_status(&pool, &m.merchant_id, merchant::STATUS_DISABLED);
+        assert!(matches!(
+            register_shop(&pool, "Fourth Shop"),
+            merchant::RegisterOutcome::TooManyMerchants
+        ));
+        // …and it still holds its name against everyone else, which is why the
+        // slot must not come back either: otherwise this pair of moves would
+        // accumulate names without bound.
+        assert!(matches!(
+            register_shop_as(&pool, "acct-a", "PiggleShop"),
+            merchant::RegisterOutcome::NameTaken
+        ));
+    }
+
+    #[test]
+    fn closing_a_shop_gives_back_both_the_slot_and_the_name() {
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        clear_open_intent(&pool, &intent_id, &m.merchant_id);
+        assert_eq!(close_shop(&pool, &m.merchant_id), merchant::CloseOutcome::Ok);
+        // The name is claimable again — by anyone, including a different account.
+        assert!(matches!(
+            register_shop(&pool, "Piggle Shop"),
+            merchant::RegisterOutcome::Ok { .. }
+        ));
+        // Closing twice is not a second slot.
+        assert_eq!(
+            close_shop(&pool, &m.merchant_id),
+            merchant::CloseOutcome::NotFound
+        );
+        // The closed row survives, so the ledger can still say who was paid…
+        let closed = merchant::get(&pool.get().unwrap(), &m.merchant_id)
+            .unwrap()
+            .expect("the row is kept for history");
+        assert_eq!(closed.status, merchant::STATUS_DELETED);
+        assert!(!closed.is_active());
+        // …and its credential is gone, so the old key authenticates nothing.
+        let key_hash: Option<String> = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT api_key_hash FROM merchants WHERE merchant_id = ?1",
+                [&m.merchant_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_hash, None);
+    }
+
+    #[test]
+    fn a_shop_with_customers_still_holding_bills_cannot_be_closed() {
+        // The fixture leaves one unanswered intent outstanding.
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(
+            close_shop(&pool, &m.merchant_id),
+            merchant::CloseOutcome::HasOpenIntents { count: 1 }
+        );
+        // Withdrawing the bill clears the way.
+        clear_open_intent(&pool, &intent_id, &m.merchant_id);
+        assert_eq!(close_shop(&pool, &m.merchant_id), merchant::CloseOutcome::Ok);
+    }
+
+    #[test]
+    fn a_settled_history_does_not_block_closing() {
+        // Paid, declined and expired bills are nobody's outstanding claim — and
+        // the `payment_intents` foreign key is exactly why closing is a status
+        // change rather than a DELETE.
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        assert_eq!(close_shop(&pool, &m.merchant_id), merchant::CloseOutcome::Ok);
+        assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
     }
 
     #[test]

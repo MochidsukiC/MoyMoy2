@@ -45,6 +45,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Operator commands run against the database and exit — they never bind a
+    // port or claim the cs host. See [`admin`].
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("admin") {
+        return admin::run(&argv[1..]);
+    }
+
     // The launcher injects MOCHI_APP_LISTEN=127.0.0.1:<port>; fall back to a dev
     // default for a standalone smoke (tools/run-cs.ps1).
     let listen = env_or(
@@ -219,6 +226,116 @@ async fn serve_tls(
                 tracing::debug!(error = %e, "connection ended");
             }
         });
+    }
+}
+
+// ── operator commands ────────────────────────────────────────────────────────
+
+/// Things only the operator does, reachable only from a shell on the host.
+///
+/// **Deliberately not an HTTP endpoint.** Forcing a refund is the strongest
+/// authority in this system — it moves another account's money without that
+/// account's consent — and the way to keep it from being reached by a stolen
+/// session, a leaked API key or a bug in a route table is not to give it a
+/// network surface at all. Whoever can run this binary against the wallet's
+/// database can already do anything; nobody else can reach it.
+///
+/// It also takes no new configuration: the database is `MOYMOY_DB_PATH`, exactly
+/// as the server reads it, and SQLite's WAL mode means this can be run while the
+/// backend is serving.
+mod admin {
+    use crate::db;
+    use crate::payments::{self, RefundOutcome};
+    use crate::{env_or, merchant, wallet};
+
+    const USAGE: &str = "\
+usage: moymoy-cs admin <command>
+
+  refund <intent_id> [reason...]   Return a paid intent's money to the payer.
+                                   The intent stays `paid` — a refund is a second,
+                                   opposite movement, not a rewind.
+";
+
+    pub fn run(args: &[String]) -> anyhow::Result<()> {
+        match args.first().map(String::as_str) {
+            Some("refund") => refund(&args[1..]),
+            Some("help") | Some("--help") | Some("-h") | None => {
+                print!("{USAGE}");
+                Ok(())
+            }
+            Some(other) => {
+                eprint!("{USAGE}");
+                anyhow::bail!("unknown admin command `{other}`")
+            }
+        }
+    }
+
+    fn refund(args: &[String]) -> anyhow::Result<()> {
+        let Some(intent_id) = args.first() else {
+            eprint!("{USAGE}");
+            anyhow::bail!("refund needs an intent_id");
+        };
+        let reason = match args[1..].join(" ") {
+            s if s.trim().is_empty() => "運営措置".to_string(),
+            s => s,
+        };
+
+        let db_path = env_or("MOYMOY_DB_PATH", "moymoy.db");
+        let pool = db::open(&db_path)?;
+        let mut conn = pool.get()?;
+
+        // Read the whole picture BEFORE moving anything, so the report can name
+        // the accounts even for the outcomes that change nothing.
+        let Some(before) = payments::get(&conn, intent_id)? else {
+            anyhow::bail!("no intent `{intent_id}` in {db_path}");
+        };
+        let shop = merchant::get(&conn, &before.merchant_id)?;
+        let payer = before.payer_account_id.clone();
+
+        let outcome = payments::force_refund(&mut conn, intent_id, &reason)?;
+        match outcome {
+            RefundOutcome::Ok { tx_id, amount } => {
+                let payer = payer.unwrap_or_default();
+                let shop_account = shop.as_ref().map(|m| m.account_id.as_str()).unwrap_or("?");
+                println!("refunded {amount} エメ");
+                println!("  intent      {intent_id}");
+                println!(
+                    "  merchant    {} {} (account {shop_account})",
+                    before.merchant_id,
+                    shop.as_ref().map(|m| m.name.as_str()).unwrap_or("?"),
+                );
+                println!("  payer       {payer}");
+                println!("  reason      {reason}");
+                println!("  refund tx   {tx_id}");
+                // `paid` is terminal by design; the refund is recorded alongside
+                // it rather than instead of it.
+                println!("  intent state {} -> {} (refunded)", before.state, before.state);
+                println!(
+                    "  balances    merchant {} エメ / payer {} エメ",
+                    wallet::balance(&conn, shop_account)?,
+                    wallet::balance(&conn, &payer)?,
+                );
+                Ok(())
+            }
+            // Everything below leaves the wallet exactly as it was, and says so
+            // rather than exiting 0 on a refund that did not happen.
+            RefundOutcome::UnknownIntent => anyhow::bail!("no intent `{intent_id}`"),
+            RefundOutcome::NotPaid { state } => anyhow::bail!(
+                "intent `{intent_id}` is `{state}`, not `paid` — there is nothing to return"
+            ),
+            RefundOutcome::AlreadyRefunded => anyhow::bail!(
+                "intent `{intent_id}` was already refunded at {} (refund tx {})",
+                before.refunded_unix_ms.unwrap_or_default(),
+                before.refund_tx_id.as_deref().unwrap_or("?")
+            ),
+            RefundOutcome::MerchantShort { balance } => anyhow::bail!(
+                "merchant `{}` holds {balance} エメ but owes {} — merchant revenue is NOT escrowed \
+                 (DEV.md: accepted risk), so a shop that withdrew its takings to the MC world \
+                 leaves nothing to reverse. Nothing was moved; retry if it is funded again.",
+                before.merchant_id,
+                before.amount
+            ),
+        }
     }
 }
 

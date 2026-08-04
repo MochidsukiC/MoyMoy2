@@ -28,18 +28,18 @@
 //!   POST /wallet/attest/challenge {purpose}   (auth)
 //!   POST /wallet/attest/session   {assertion} (auth — confirm the character)
 //!   GET  /wallet/inventory (auth; mod-backed, no query args)
-//!   POST /wallet/send     {idem_key, to_handle, amount, pin?, otp?}  (auth)
+//!   POST /wallet/send     {idem_key, to_handle, amount, pin?}      (auth)
 //!   POST /wallet/charge   {idem_key, amount, assertion?}           (auth)
-//!   POST /wallet/withdraw {idem_key, amount, assertion?, pin?, otp?} (auth)
+//!   POST /wallet/withdraw {idem_key, amount, assertion?, pin?}     (auth)
 //!   GET  /wallet/op?op_id=                                         (auth)
-//!   POST /wallet/stepup/otp                                        (auth)
 //!   GET  /wallet/payment/intent?intent_id=                         (auth)
-//!   POST /wallet/payment/approve {intent_id, pin, otp?}            (auth)
+//!   POST /wallet/payment/approve {intent_id, pin}                  (auth)
 //!   POST /wallet/payment/decline {intent_id}                       (auth)
 //!   POST /merchant/portal/register {name, sub?, pin, glyph?, pal?} (auth + PIN)
 //!   POST /merchant/portal/key      {merchant_id, pin}              (auth + PIN)
 //!   POST /merchant/portal/status   {merchant_id, status, pin}      (auth + PIN)
 //!   POST /merchant/portal/limits   {merchant_id, pin, …}           (auth + PIN)
+//!   POST /merchant/portal/close    {merchant_id, pin}              (auth + PIN)
 //!   GET  /merchant/portal/list                                     (auth)
 //!   POST /merchant/v1/intent/create {…}                            (API key)
 //!   GET  /merchant/v1/intent?intent_id=                            (API key)
@@ -140,8 +140,6 @@ pub fn router(state: AppState) -> Router {
         .route("/wallet/charge", post(charge))
         .route("/wallet/withdraw", post(withdraw))
         .route("/wallet/op", get(op_status))
-        // Step-up second factor for the movements riskauth escalates.
-        .route("/wallet/stepup/otp", post(stepup_otp))
         // EC payment, payer side. The approval screen's only source of truth.
         .route("/wallet/payment/intent", get(payment_intent))
         .route("/wallet/payment/approve", post(payment_approve))
@@ -151,6 +149,7 @@ pub fn router(state: AppState) -> Router {
         .route("/merchant/portal/key", post(portal_rotate_key))
         .route("/merchant/portal/status", post(portal_set_status))
         .route("/merchant/portal/limits", post(portal_set_limits))
+        .route("/merchant/portal/close", post(portal_close))
         .route("/merchant/portal/list", get(portal_list))
         // Merchant API (Bearer moy_sk_…): intents only, never a balance.
         .route("/merchant/v1/intent/create", post(intent_create))
@@ -915,7 +914,6 @@ struct SendReq {
     /// reads `pin_required` and asks the user. Small everyday sends still go
     /// through untouched.
     pin: Option<String>,
-    otp: Option<String>,
 }
 
 async fn send(
@@ -926,7 +924,6 @@ async fn send(
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
-    let email_enabled = st.email_enabled();
     let backoff = st.pin_backoff.clone();
     let value = blocking(st.pool, move |conn| {
         // The replay is answered first, and outside the money transaction, so a
@@ -945,19 +942,12 @@ async fn send(
             phone_id: acct.phone_id.as_deref(),
             session_key: &acct.session_key,
             pin: req.pin.as_deref(),
-            otp: req.otp.as_deref(),
         };
-        let ticket = match riskauth::step_up(
-            conn,
-            &backoff,
-            email_enabled,
-            &caller,
-            req.amount,
-            Requirement::None,
-        )? {
-            riskauth::StepUp::Cleared(t) => t,
-            riskauth::StepUp::Refused(v) => return Ok(v),
-        };
+        let ticket =
+            match riskauth::step_up(conn, &backoff, &caller, req.amount, Requirement::None)? {
+                riskauth::StepUp::Cleared(t) => t,
+                riskauth::StepUp::Refused(v) => return Ok(v),
+            };
 
         // Single BEGIN IMMEDIATE: idem check-reserve-execute-record is one atomic
         // unit, so concurrent retries of the same idem_key serialize and the
@@ -969,11 +959,7 @@ async fn send(
             return Ok(replay(prev));
         }
         if let Some(refused) = riskauth::settle(&tx, &acct.account_id, &ticket, now_ms())? {
-            // The PIN itself was right — a wrong emailed code has its own attempt
-            // counter and must not also eat into the PIN's. (Epoch-guarded, so
-            // this is a no-op when a concurrent attempt owns the counter.)
             drop(tx);
-            riskauth::refund_attempt(conn, &acct.account_id, &ticket)?;
             return Ok(refused);
         }
         let label = format!("@{} へ送金", to.handle);
@@ -998,66 +984,6 @@ async fn send(
     })
     .await?;
     Ok(Json(value))
-}
-
-// ── step-up second factor ────────────────────────────────────────────────────
-
-/// Mail a step-up code to this account's verified address.
-///
-/// Its own OTP purpose, so a code the user asked for to confirm a large payment
-/// cannot be replayed as a login, or the other way round.
-async fn stepup_otp(
-    State(st): State<AppState>,
-    acct: AuthedAccount,
-) -> Result<Json<Value>, ApiError> {
-    if !st.email_enabled() {
-        return Ok(Json(json!({ "ok": false, "error": "otp_unavailable" })));
-    }
-    let id = acct.account_id.clone();
-    let created = blocking(st.pool.clone(), move |conn| {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let info = auth::account_full(&tx, &id)?
-            .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
-        let out = match info.email_lower.clone().filter(|_| info.email_verified) {
-            Some(el) => match otp::create(&tx, riskauth::PURPOSE_STEPUP, &el, Some(&id), None)? {
-                CreateOtp::Issued(code) => {
-                    Some((info.email.unwrap_or_default(), el, Some(code)))
-                }
-                CreateOtp::TooSoon { retry_after_ms } => {
-                    tx.commit()?;
-                    return Ok::<_, ApiError>(Err(retry_after_ms));
-                }
-            },
-            None => None,
-        };
-        tx.commit()?;
-        Ok(Ok(out))
-    })
-    .await?;
-    let created = match created {
-        Ok(v) => v,
-        Err(retry_after_ms) => {
-            return Ok(Json(
-                json!({ "ok": false, "error": "too_soon", "retry_after_ms": retry_after_ms }),
-            ))
-        }
-    };
-    let Some((email, email_lower, Some(code))) = created else {
-        return Ok(Json(json!({ "ok": false, "error": "otp_unavailable" })));
-    };
-    if let Err(e) = st.mailer.send(&email, &code, riskauth::PURPOSE_STEPUP).await {
-        // Roll the code back so the resend cooldown does not strand a user behind
-        // a code that was never delivered (the register/login discipline).
-        if let Err(re) = blocking(st.pool.clone(), move |conn| {
-            otp::revoke(conn, riskauth::PURPOSE_STEPUP, &email_lower)
-        })
-        .await
-        {
-            tracing::warn!(error = %re, "failed to roll back undelivered step-up OTP");
-        }
-        return Err(e);
-    }
-    Ok(Json(json!({ "ok": true, "sent": true, "email": email })))
 }
 
 // ── EC payment, payer side ───────────────────────────────────────────────────
@@ -1097,7 +1023,6 @@ struct ApproveReq {
     /// gets `{ok:false,error:"pin_required"}` — a domain answer it can act on —
     /// rather than a deserialization rejection.
     pin: Option<String>,
-    otp: Option<String>,
 }
 
 async fn payment_approve(
@@ -1105,19 +1030,16 @@ async fn payment_approve(
     acct: AuthedAccount,
     Json(req): Json<ApproveReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let email_enabled = st.email_enabled();
     let backoff = st.pin_backoff.clone();
     let value = blocking(st.pool, move |conn| {
         payments::approve(
             conn,
             &backoff,
-            email_enabled,
             &riskauth::Caller {
                 account_id: &acct.account_id,
                 phone_id: acct.phone_id.as_deref(),
                 session_key: &acct.session_key,
                 pin: req.pin.as_deref(),
-                otp: req.otp.as_deref(),
             },
             &req.intent_id,
         )
@@ -1263,7 +1185,7 @@ async fn portal_register(
             }
             merchant::RegisterOutcome::NameTaken => json!({ "ok": false, "error": "name_taken" }),
             merchant::RegisterOutcome::TooManyMerchants => {
-                json!({ "ok": false, "error": "too_many_merchants", "limit": merchant::MAX_ACTIVE_MERCHANTS })
+                json!({ "ok": false, "error": "too_many_merchants", "limit": merchant::MAX_MERCHANTS_PER_ACCOUNT })
             }
         };
         tx.commit()?;
@@ -1379,6 +1301,42 @@ async fn portal_set_limits(
             })
         } else {
             json!({ "ok": false, "error": "unknown_merchant" })
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct PortalCloseReq {
+    merchant_id: String,
+    pin: String,
+}
+
+/// Close a shop for good, giving its name and its owner's slot back.
+///
+/// Session + PIN like every other portal mutation. It cannot be reached with an
+/// API key: a leaked key must not be able to retire the shop it belongs to.
+async fn portal_close(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalCloseReq>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = match merchant::close(&tx, &req.merchant_id, &acct.account_id)? {
+            merchant::CloseOutcome::Ok => {
+                json!({ "ok": true, "merchant_id": req.merchant_id, "status": merchant::STATUS_DELETED })
+            }
+            merchant::CloseOutcome::NotFound => json!({ "ok": false, "error": "unknown_merchant" }),
+            merchant::CloseOutcome::HasOpenIntents { count } => {
+                json!({ "ok": false, "error": "open_intents", "count": count })
+            }
         };
         tx.commit()?;
         Ok::<Value, ApiError>(v)
@@ -1650,7 +1608,6 @@ struct WithdrawReq {
     /// happens; the assertion's challenge is not spent until it verifies, so
     /// re-posting it alongside the PIN is fine.
     pin: Option<String>,
-    otp: Option<String>,
 }
 
 /// Pay eme back out as in-world emeralds.
@@ -1708,15 +1665,13 @@ async fn withdraw(
     //
     // Unlike send and approve, the step-up is settled in a transaction of its
     // own: the reserve happens inside `charge::begin_withdraw`, and this gate is
-    // deliberately not reaching into that module's transaction. The cost is that
-    // a code is spent even if the reserve then fails — the user asks for another
-    // one. Nothing is authorized twice, because the counter is cleared and the
-    // code consumed exactly once here.
+    // deliberately not reaching into that module's transaction. All that
+    // transaction carries is the failure-counter clear, so the worst a later
+    // reserve failure costs is a PIN attempt the caller did not owe.
     {
         let acct = acct.clone();
-        let email_enabled = st.email_enabled();
         let backoff = st.pin_backoff.clone();
-        let (pin, otp) = (req.pin.clone(), req.otp.clone());
+        let pin = req.pin.clone();
         let amount = req.amount;
         let refused = blocking(st.pool.clone(), move |conn| {
             let caller = riskauth::Caller {
@@ -1724,25 +1679,15 @@ async fn withdraw(
                 phone_id: acct.phone_id.as_deref(),
                 session_key: &acct.session_key,
                 pin: pin.as_deref(),
-                otp: otp.as_deref(),
             };
-            let ticket = match riskauth::step_up(
-                conn,
-                &backoff,
-                email_enabled,
-                &caller,
-                amount,
-                Requirement::None,
-            )? {
-                riskauth::StepUp::Cleared(t) => t,
-                riskauth::StepUp::Refused(v) => return Ok(Some(v)),
-            };
+            let ticket =
+                match riskauth::step_up(conn, &backoff, &caller, amount, Requirement::None)? {
+                    riskauth::StepUp::Cleared(t) => t,
+                    riskauth::StepUp::Refused(v) => return Ok(Some(v)),
+                };
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if let Some(v) = riskauth::settle(&tx, &acct.account_id, &ticket, now_ms())? {
-                // Same reasoning as on a send: the PIN was correct, so a wrong
-                // code does not also spend a PIN attempt.
                 drop(tx);
-                riskauth::refund_attempt(conn, &acct.account_id, &ticket)?;
                 return Ok(Some(v));
             }
             tx.commit()?;

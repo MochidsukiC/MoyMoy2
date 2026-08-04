@@ -42,8 +42,17 @@ use crate::error::ApiError;
 /// A merchant that may trade.
 pub const STATUS_ACTIVE: &str = "active";
 /// A merchant that has been stopped — by its owner or by an operator. Its key
-/// stops working and its outstanding intents stop being payable.
+/// stops working and its outstanding intents stop being payable. It keeps its
+/// name: a shop that is stopped for an afternoon has not given the name up.
 pub const STATUS_DISABLED: &str = "disabled";
+/// A merchant its owner has closed for good.
+///
+/// A soft state and not a `DELETE`, because `payment_intents.merchant_id` is a
+/// foreign key: removing the row would either fail for any shop that ever traded
+/// or take its order history with it. Closing releases what closing is *for* —
+/// the name (`name_skeleton` → NULL), the credential, and the owner's slot — and
+/// leaves the ledger able to say who was paid.
+pub const STATUS_DELETED: &str = "deleted";
 
 /// Length ceilings, in characters (not bytes). The approval screen cannot be the
 /// thing that stops a 4 KB description: by the time it is rendering, the string
@@ -56,9 +65,16 @@ pub const MAX_ORDER_REF_CHARS: usize = 64;
 /// far below what it takes to push a glyph out of its own line.
 const MAX_COMBINING_PER_BASE: usize = 3;
 
-/// Live merchants one login account may own. Registration is self-serve, so this
-/// is what stops one account from farming names.
-pub const MAX_ACTIVE_MERCHANTS: i64 = 3;
+/// Merchants one login account may hold at once — **whatever their status**,
+/// closed ones excepted.
+///
+/// Counting only `active` rows was a hole, not a shortcut: a disabled merchant
+/// keeps its `name_skeleton`, so register → disable → register would have let one
+/// account accumulate names without bound (throttled only by the registration
+/// rate limit, ≈144 a day). Since the only way to give a slot back is
+/// [`close`], which also releases the name, names and slots are now the same
+/// budget and this number is the real ceiling on how many a person can hold.
+pub const MAX_MERCHANTS_PER_ACCOUNT: i64 = 3;
 
 /// Issuance ceilings for a merchant that has never had them raised.
 ///
@@ -463,12 +479,15 @@ pub fn register(
         None => None,
     };
 
+    // Every row the account still holds, disabled ones included — see
+    // [`MAX_MERCHANTS_PER_ACCOUNT`] for why the `active` filter that used to be
+    // here was a name-squatting hole.
     let owned: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM merchants WHERE owner_account_id = ?1 AND status = ?2",
-        params![owner_account_id, STATUS_ACTIVE],
+        "SELECT COUNT(*) FROM merchants WHERE owner_account_id = ?1 AND status != ?2",
+        params![owner_account_id, STATUS_DELETED],
         |r| r.get(0),
     )?;
-    if owned >= MAX_ACTIVE_MERCHANTS {
+    if owned >= MAX_MERCHANTS_PER_ACCOUNT {
         return Ok(RegisterOutcome::TooManyMerchants);
     }
     let taken = tx
@@ -532,13 +551,24 @@ pub fn rotate_key(
         "UPDATE merchants SET api_key_hash = ?3, api_key_prefix = ?4, \
                 api_key_created_unix_ms = ?5, api_key_last_used_unix_ms = NULL, \
                 updated_unix_ms = ?5 \
-         WHERE merchant_id = ?1 AND owner_account_id = ?2",
-        params![merchant_id, owner_account_id, api_key_hash(&api_key), prefix, now],
+         WHERE merchant_id = ?1 AND owner_account_id = ?2 AND status != ?6",
+        params![
+            merchant_id,
+            owner_account_id,
+            api_key_hash(&api_key),
+            prefix,
+            now,
+            STATUS_DELETED
+        ],
     )?;
     Ok((changed == 1).then_some((api_key, prefix)))
 }
 
 /// Set a merchant's status. `false` when the merchant is not this account's.
+///
+/// A closed merchant is not reachable from here: it has already given its name
+/// and its slot back, so re-opening it would produce a nameless shop holding a
+/// slot nothing counted. Re-opening is registering again.
 pub fn set_status(
     tx: &rusqlite::Transaction<'_>,
     merchant_id: &str,
@@ -547,10 +577,71 @@ pub fn set_status(
 ) -> rusqlite::Result<bool> {
     let changed = tx.execute(
         "UPDATE merchants SET status = ?3, updated_unix_ms = ?4 \
-         WHERE merchant_id = ?1 AND owner_account_id = ?2",
-        params![merchant_id, owner_account_id, status, now_ms()],
+         WHERE merchant_id = ?1 AND owner_account_id = ?2 AND status != ?5",
+        params![
+            merchant_id,
+            owner_account_id,
+            status,
+            now_ms(),
+            STATUS_DELETED
+        ],
     )?;
     Ok(changed == 1)
+}
+
+/// Outcome of closing a merchant for good.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseOutcome {
+    Ok,
+    /// Not this account's, or already closed.
+    NotFound,
+    /// Customers are still holding bills from this shop.
+    HasOpenIntents { count: i64 },
+}
+
+/// Close a merchant permanently, releasing its name and its owner's slot.
+///
+/// Refused while unanswered intents are outstanding. Somebody may be looking at
+/// an approval screen for this shop right now, and closing it under them would
+/// turn a payment they are part-way through into `merchant_disabled` with no shop
+/// left to ask about it. Cancel the bills first, or let them expire.
+pub fn close(
+    tx: &rusqlite::Transaction<'_>,
+    merchant_id: &str,
+    owner_account_id: &str,
+) -> rusqlite::Result<CloseOutcome> {
+    let now = now_ms();
+    let owned = tx
+        .query_row(
+            "SELECT 1 FROM merchants \
+             WHERE merchant_id = ?1 AND owner_account_id = ?2 AND status != ?3",
+            params![merchant_id, owner_account_id, STATUS_DELETED],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !owned {
+        return Ok(CloseOutcome::NotFound);
+    }
+    let open: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM payment_intents \
+         WHERE merchant_id = ?1 AND state = ?2 AND expires_unix_ms > ?3",
+        params![merchant_id, crate::payments::STATE_CREATED, now],
+        |r| r.get(0),
+    )?;
+    if open > 0 {
+        return Ok(CloseOutcome::HasOpenIntents { count: open });
+    }
+    // The name and the credential go at the same moment as the status: a closed
+    // shop that kept its skeleton would hold a name nothing can trade under, and
+    // one that kept its key hash would still authenticate.
+    tx.execute(
+        "UPDATE merchants SET status = ?3, name_skeleton = NULL, api_key_hash = NULL, \
+                api_key_prefix = NULL, listed = 0, updated_unix_ms = ?4 \
+         WHERE merchant_id = ?1 AND owner_account_id = ?2",
+        params![merchant_id, owner_account_id, STATUS_DELETED, now],
+    )?;
+    Ok(CloseOutcome::Ok)
 }
 
 /// Raise (or lower) a merchant's issuance ceilings, clamped to the hard maxima.
@@ -567,8 +658,15 @@ pub fn set_limits(
     let changed = tx.execute(
         "UPDATE merchants SET max_open_intents = COALESCE(?3, max_open_intents), \
                 daily_issue_cap = COALESCE(?4, daily_issue_cap), updated_unix_ms = ?5 \
-         WHERE merchant_id = ?1 AND owner_account_id = ?2",
-        params![merchant_id, owner_account_id, open, cap, now_ms()],
+         WHERE merchant_id = ?1 AND owner_account_id = ?2 AND status != ?6",
+        params![
+            merchant_id,
+            owner_account_id,
+            open,
+            cap,
+            now_ms(),
+            STATUS_DELETED
+        ],
     )?;
     Ok(changed == 1)
 }
