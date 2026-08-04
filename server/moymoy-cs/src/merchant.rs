@@ -99,7 +99,32 @@ pub const MAX_DAILY_ISSUE_CEILING: i64 = 2_000_000;
 /// stop a loop.
 pub const RL_INTENT_CREATE: (usize, i64) = (30, 60_000);
 pub const RL_INTENT_READ: (usize, i64) = (120, 60_000);
+
+/// How often an account may actually REGISTER a shop.
+///
+/// **Spent only when a merchant row is created** — see `portal_register`. A
+/// registration has several ways to fail (name taken, name refused, wrong PIN,
+/// three shops already, email not verified), and charging ten minutes for a
+/// mistyped name would punish nobody but the honest user: an attempt that
+/// creates no shop has not used up any of what this protects.
+///
+/// This is the opposite of the call the OS makes for `os.apps.launch`, where a
+/// REFUSED launch is counted too. There, the refusal reason is itself the leak
+/// (it tells the caller which apps are installed), so the asking has to cost
+/// something. Here the only thing an attempt discloses is whether a shop name is
+/// taken, and [`MAX_MERCHANTS_PER_ACCOUNT`] already bounds creation. Different
+/// thing being protected, opposite answer.
 pub const RL_REGISTER: (usize, i64) = (1, 10 * 60_000);
+
+/// A short burst guard on registration ATTEMPTS, spent whether or not a shop is
+/// created.
+///
+/// Needed precisely because [`RL_REGISTER`] is no longer spent on failure: every
+/// attempt costs this process an Argon2id verification, so without a ceiling on
+/// attempts a caller holding a valid session could loop deliberately-invalid
+/// names and spend the wallet's CPU on PIN hashes. Loose enough that a human
+/// correcting a typo never meets it.
+pub const RL_REGISTER_BURST: (usize, i64) = (5, 10_000);
 
 /// API-key prefix. Greppable on purpose: a key pasted into a public repo should
 /// be findable by the same scan that finds every other `*_sk_` credential.
@@ -745,7 +770,40 @@ impl RateLimiter {
     /// A refused call is NOT recorded, so a client hammering a closed door cannot
     /// keep extending its own penalty past the window it already earned.
     pub fn check(&self, key: &str, limit: usize, window_ms: i64, now: i64) -> Result<(), i64> {
+        self.peek(key, limit, window_ms, now)?;
+        self.record(key, window_ms, now);
+        Ok(())
+    }
+
+    /// Ask whether a call would be allowed **without counting it**.
+    ///
+    /// Paired with [`RateLimiter::record`] by operations whose failures must not
+    /// spend the allowance — see `portal_register`, where the limit is on
+    /// creating shops and a mistyped name creates none.
+    pub fn peek(&self, key: &str, limit: usize, window_ms: i64, now: i64) -> Result<(), i64> {
         let mut map = self.lock();
+        Self::prune(&mut map, key, window_ms, now);
+        let hits = map.entry(key.to_string()).or_default();
+        if hits.len() >= limit {
+            let oldest = hits.front().copied().unwrap_or(now);
+            return Err((oldest + window_ms - now).max(1));
+        }
+        Ok(())
+    }
+
+    /// Count one call against `key`.
+    pub fn record(&self, key: &str, window_ms: i64, now: i64) {
+        let mut map = self.lock();
+        Self::prune(&mut map, key, window_ms, now);
+        map.entry(key.to_string()).or_default().push_back(now);
+    }
+
+    fn prune(
+        map: &mut HashMap<String, VecDeque<i64>>,
+        key: &str,
+        window_ms: i64,
+        now: i64,
+    ) {
         if map.len() > 1024 {
             map.retain(|_, hits| hits.back().is_some_and(|t| *t > now - window_ms));
         }
@@ -753,12 +811,6 @@ impl RateLimiter {
         while hits.front().is_some_and(|t| *t <= now - window_ms) {
             hits.pop_front();
         }
-        if hits.len() >= limit {
-            let oldest = hits.front().copied().unwrap_or(now);
-            return Err((oldest + window_ms - now).max(1));
-        }
-        hits.push_back(now);
-        Ok(())
     }
 
     /// Same recovery posture as `attest::CharSessionStore`: the map is held only
@@ -902,19 +954,28 @@ pub(crate) async fn portal_register(
     acct: AuthedAccount,
     Json(req): Json<PortalRegisterReq>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let key = format!("mreg:{}", acct.account_id);
+    // Attempts are counted here; the ten-minute allowance is not touched until a
+    // shop actually exists (see the note on RL_REGISTER).
     if let Err(retry_after_ms) = st.rate.check(
-        &format!("mreg:{}", acct.account_id),
-        RL_REGISTER.0,
-        RL_REGISTER.1,
+        &format!("burst:{key}"),
+        RL_REGISTER_BURST.0,
+        RL_REGISTER_BURST.1,
         now_ms(),
     ) {
+        return Ok(rate_limited(retry_after_ms));
+    }
+    if let Err(retry_after_ms) = st
+        .rate
+        .peek(&key, RL_REGISTER.0, RL_REGISTER.1, now_ms())
+    {
         return Ok(rate_limited(retry_after_ms));
     }
     if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
         return Ok(ok_json(refused));
     }
     let email_enabled = st.email_enabled();
-    let value = blocking(st.pool, move |conn| {
+    let (value, created) = blocking(st.pool, move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Where mail works, a shop that can take strangers' money must be
         // reachable afterwards. Where it does not (no identity token), the wallet
@@ -924,9 +985,10 @@ pub(crate) async fn portal_register(
             let info = auth::account_full(&tx, &acct.account_id)?
                 .ok_or_else(|| ApiError::unauthorized("account no longer exists"))?;
             if !info.email_verified {
-                return Ok::<Value, ApiError>(
+                return Ok::<(Value, bool), ApiError>((
                     json!({ "ok": false, "error": "email_verification_required" }),
-                );
+                    false,
+                ));
             }
         }
         let out = register(
@@ -937,6 +999,7 @@ pub(crate) async fn portal_register(
             req.glyph.as_deref(),
             req.pal.as_deref(),
         )?;
+        let created = matches!(out, RegisterOutcome::Ok { .. });
         let v = match out {
             RegisterOutcome::Ok {
                 merchant_id,
@@ -960,9 +1023,13 @@ pub(crate) async fn portal_register(
             }
         };
         tx.commit()?;
-        Ok(v)
+        Ok((v, created))
     })
     .await?;
+    // Only now, with a shop committed, is the allowance spent.
+    if created {
+        st.rate.record(&key, RL_REGISTER.1, now_ms());
+    }
     Ok(ok_json(value))
 }
 
@@ -1421,6 +1488,128 @@ mod tests {
         // The prefix identifies a key without being enough to use one.
         assert!(k.starts_with(&key_prefix_of(&k)));
         assert!(key_prefix_of(&k).len() < k.len());
+    }
+
+    /// A real [`AppState`], so the registration handler can be driven exactly as
+    /// axum drives it. Nothing here needs a tunnel: `portal_register` never asks
+    /// `can_charge()`, and with no identity token the mailer reports disabled,
+    /// which is the deployment shape that skips the email-verified requirement.
+    fn app_state() -> (crate::api::AppState, AuthedAccount) {
+        let pool = crate::db::open_memory().expect("in-memory pool");
+        let conn = pool.get().unwrap();
+        let hash = auth::hash_pin("1234").unwrap();
+        auth::insert_account(&conn, "acct-m", "shopkeep", "shopkeep", "Shop", &hash, None).unwrap();
+        drop(conn);
+        let mc = crate::mc::McLink::new(mochi_hub_cs_sdk::CsHttpSender::default());
+        let st = crate::api::AppState {
+            pool: pool.clone(),
+            charge: std::sync::Arc::new(crate::charge::ChargeCoordinator::new(
+                pool.clone(),
+                mc.clone(),
+            )),
+            mailer: crate::otp::Mailer::from_env(),
+            attest: std::sync::Arc::new(crate::attest::AttestVerifier::new(mc)),
+            challenges: std::sync::Arc::new(crate::attest::ChallengeStore::new()),
+            char_sessions: std::sync::Arc::new(crate::attest::CharSessionStore::new()),
+            rate: std::sync::Arc::new(RateLimiter::new()),
+            pin_backoff: std::sync::Arc::new(crate::riskauth::PinBackoff::new()),
+        };
+        let acct = AuthedAccount {
+            account_id: "acct-m".to_string(),
+            phone_id: None,
+            session_key: "sess-m".to_string(),
+        };
+        (st, acct)
+    }
+
+    async fn try_register(
+        st: &crate::api::AppState,
+        acct: &AuthedAccount,
+        name: &str,
+        pin: &str,
+    ) -> Value {
+        let (_, Json(v)) = portal_register(
+            State(st.clone()),
+            acct.clone(),
+            Json(PortalRegisterReq {
+                name: name.to_string(),
+                sub: None,
+                glyph: None,
+                pal: None,
+                pin: pin.to_string(),
+            }),
+        )
+        .await
+        .expect("the handler answers");
+        v
+    }
+
+    /// A registration that creates no shop must not spend the shop-creation
+    /// allowance. One mistyped name used to cost ten minutes.
+    #[tokio::test]
+    async fn a_failed_registration_does_not_block_the_next_attempt() {
+        let (st, acct) = app_state();
+
+        // Three ways to fail short of creating a row: a refused name, a name
+        // that imitates another alphabet, and a wrong PIN.
+        let v = try_register(&st, &acct, "MoyMoy 公式", "1234").await;
+        assert_eq!(v["error"], json!("bad_name"), "{v}");
+        assert_eq!(v["reason"], json!("reserved_name"), "{v}");
+        let v = try_register(&st, &acct, "PiggleShoр", "1234").await; // Cyrillic er
+        assert_eq!(v["reason"], json!("mixed_script"), "{v}");
+        let v = try_register(&st, &acct, "Good Shop", "9999").await;
+        assert_eq!(v["error"], json!("invalid_pin"), "{v}");
+
+        // …and the honest attempt right afterwards still goes through.
+        let v = try_register(&st, &acct, "Good Shop", "1234").await;
+        assert_eq!(v["ok"], json!(true), "the allowance was spent on a failure: {v}");
+        assert!(v["api_key"].as_str().unwrap().starts_with(API_KEY_PREFIX));
+    }
+
+    /// …but a registration that DID create a shop holds the allowance.
+    #[tokio::test]
+    async fn a_successful_registration_blocks_the_next_one() {
+        let (st, acct) = app_state();
+        let v = try_register(&st, &acct, "First Shop", "1234").await;
+        assert_eq!(v["ok"], json!(true), "{v}");
+
+        let (status, Json(v)) = portal_register(
+            State(st.clone()),
+            acct.clone(),
+            Json(PortalRegisterReq {
+                name: "Second Shop".to_string(),
+                sub: None,
+                glyph: None,
+                pal: None,
+                pin: "1234".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(v["error"], json!("rate_limited"), "{v}");
+        assert!(v["retry_after_ms"].as_i64().unwrap() > 0);
+        // Exactly one shop exists — the refusal created nothing.
+        let n: i64 = st
+            .pool
+            .get()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM merchants", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_peek_asks_without_spending_and_record_spends() {
+        let rl = RateLimiter::new();
+        // Peeking never consumes, however often it is asked.
+        for _ in 0..10 {
+            assert!(rl.peek("k", 1, 1_000, 100).is_ok());
+        }
+        rl.record("k", 1_000, 100);
+        assert!(rl.peek("k", 1, 1_000, 100).is_err());
+        // …and the window still ages out on its own.
+        assert!(rl.peek("k", 1, 1_000, 1_101).is_ok());
     }
 
     #[test]
