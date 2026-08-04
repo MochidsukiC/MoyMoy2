@@ -13,7 +13,7 @@
   A bearer SESSION TOKEN from a logged-in dev session. With in-world OTP off you
   can mint one (open registration):
     $body = @{ email='you@example.com'; password='...' } | ConvertTo-Json
-    Invoke-RestMethod -Method Post -Uri http://127.0.0.1:7404/accounts -ContentType application/json -Body $body
+    Invoke-RestMethod -Method Post -Uri http://127.0.0.1:7403/accounts -ContentType application/json -Body $body
     $tok = (Invoke-RestMethod -Method Post -Uri http://127.0.0.1:7402/auth/login `
               -ContentType application/json `
               -Body (@{email='you@example.com';password='...';device_id='dev'}|ConvertTo-Json)).access_token
