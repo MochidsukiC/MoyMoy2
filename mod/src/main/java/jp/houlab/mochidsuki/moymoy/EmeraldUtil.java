@@ -67,6 +67,22 @@ public final class EmeraldUtil {
         return consumed;
     }
 
+    /**
+     * Grant {@code amount} エメ worth of emeralds to a player: {@code amount/9}
+     * emerald blocks + {@code amount%9} loose emeralds (mirrors {@link
+     * #consume}'s repacking and the design's 9-エメ-per-block conversion). Must
+     * run on the server thread.
+     *
+     * <p>Caller MUST bound {@code amount} (see {@code MoyMoyExtension
+     * .MAX_WITHDRAW}) — {@link #give} loops once per stack, so an unbounded
+     * amount can spin the server thread minting millions of stacks.
+     */
+    public static void grant(ServerPlayer p, int amount) {
+        give(p, Items.EMERALD_BLOCK, amount / 9);
+        give(p, Items.EMERALD, amount % 9);
+        p.getInventory().setChanged();
+    }
+
     private static void give(ServerPlayer p, Item item, int total) {
         if (total <= 0) {
             return;

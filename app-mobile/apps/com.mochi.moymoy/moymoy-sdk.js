@@ -194,12 +194,16 @@
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
   }
-  // The two bindings, spelled exactly as the backend spells them
+  // The bindings, spelled exactly as the backend spells them
   // (server/moymoy-cs/src/attest.rs). The distinct DOMAINS are why an assertion
   // approved for a character check can never be spent as one that authorizes a
-  // charge — the two hash spaces cannot collide.
+  // charge, and why a charge assertion can never be replayed as a withdrawal (or
+  // vice versa) — each hash space is disjoint from the others, so consent given
+  // for one direction of money movement cannot be spent on the other.
   const chargeRequestHash = (idemKey, amount) =>
     requestHash("moymoy.charge.v1", [idemKey, String(amount)]);
+  const withdrawRequestHash = (idemKey, amount) =>
+    requestHash("moymoy.withdraw.v1", [idemKey, String(amount)]);
   // No parts: a confirmation binds nothing but its purpose. The challenge is what
   // makes it unreplayable, and it is inside the signed claims.
   const sessionRequestHash = () => requestHash("moymoy.session.v1", []);
@@ -357,6 +361,35 @@
       );
       if (!a.ok) return { ok: false, error: a.error };
       return postJson("/wallet/charge", { idem_key: idem, amount, assertion: a.assertion });
+    },
+
+    // Withdraw into the confirmed character's inventory (mod-backed): the
+    // reverse of charge, moving balance out and minting emeralds/blocks
+    // in-world. Returns a pending op; poll op(). Pass a stable `idemKey` so a
+    // retry of the SAME withdrawal attempt replays the same op instead of
+    // paying out twice.
+    //
+    // Posts WITHOUT an assertion first, for the same reason as charge: a retry
+    // of an already-created op replays server-side and comes back immediately,
+    // so the user is not asked to approve a withdrawal they already approved.
+    // Only a genuinely new withdrawal gets `attestation_required` back.
+    //
+    // Uses its OWN assertion domain (purpose "withdraw", requestHash domain
+    // "moymoy.withdraw.v1") — never the charge one. A charge assertion says
+    // "I consent to spend my in-world emeralds"; it must not also be usable to
+    // authorize the opposite operation, paying emeralds back OUT to the world.
+    withdraw: async (amount, idemKey) => {
+      const idem = idemKey || newIdem();
+      const first = await postJson("/wallet/withdraw", { idem_key: idem, amount });
+      if (first.ok || first.error !== "attestation_required") return first;
+
+      const a = await attest(
+        "withdraw",
+        () => withdrawRequestHash(idem, amount),
+        amount + " エメの出金"
+      );
+      if (!a.ok) return { ok: false, error: a.error };
+      return postJson("/wallet/withdraw", { idem_key: idem, amount, assertion: a.assertion });
     },
 
     op: (opId) => getJson("/wallet/op", { op_id: opId }),

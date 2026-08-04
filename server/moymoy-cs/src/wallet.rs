@@ -13,6 +13,22 @@ use crate::identity::{self, Account};
 /// Largest single transfer/charge accepted (defensive bound).
 pub const MAX_AMOUNT: i64 = 1_000_000_000;
 
+/// Largest single withdrawal accepted: 20,736 エメ = 2,304 emerald blocks = one
+/// full inventory of blocks (36 slots × 64).
+///
+/// Far below [`MAX_AMOUNT`] on purpose, and it is not a wallet concern but an
+/// in-world one: a withdrawal ends with the mod materialising items for a player,
+/// so an unbounded one would ask it to generate millions of stacks and stall the
+/// Minecraft server (and leave the drop on the ground). Bounding it here means a
+/// large payout is several ops the player pulls at their own pace, each of which
+/// settles independently.
+pub const MAX_WITHDRAW_PER_OP: i64 = 20_736;
+
+/// Label on the credit that gives a withdrawal's reserve back. Deliberately a
+/// `withdraw` txn like the debit it undoes, so the withdraw filter shows the pair
+/// together — a refund hidden under `charge` would read as income.
+const WITHDRAW_REFUND_LABEL: &str = "出金の取消（返金）";
+
 /// Cosmetic card face (design: holder / number / expiry).
 #[derive(Debug, Serialize)]
 pub struct Profile {
@@ -26,7 +42,7 @@ pub struct Profile {
 #[derive(Debug, Serialize)]
 pub struct Txn {
     pub id: String,
-    pub kind: String, // pay | send | receive | charge
+    pub kind: String, // pay | send | receive | charge | withdraw
     pub label: String,
     pub amount: i64, // signed (this account's perspective)
     pub ts: i64,
@@ -77,6 +93,18 @@ pub enum TxResult {
     },
 }
 
+/// Outcome of reserving eme for a withdrawal. Like [`TxResult`], only `Ok` is a
+/// success and the rest are ordinary domain results.
+///
+/// There is no counterparty: the eme leaves the wallet system entirely (it comes
+/// back as emeralds in a chest), so the debit stands alone.
+#[derive(Debug)]
+pub enum WithdrawReserve {
+    Ok { tx_id: String, balance_after: i64 },
+    BadAmount,
+    Insufficient { balance: i64 },
+}
+
 fn profile_of(a: &Account) -> Profile {
     Profile {
         holder: a.holder.clone(),
@@ -113,8 +141,8 @@ pub fn home(conn: &Connection, account_id: &str) -> rusqlite::Result<Option<Home
     }))
 }
 
-/// Recent ledger rows, newest first. `filter` ∈ all|pay|send|charge (anything
-/// else ⇒ all). `receive` rows appear only under `all`.
+/// Recent ledger rows, newest first. `filter` ∈ all|pay|send|charge|withdraw
+/// (anything else ⇒ all). `receive` rows appear only under `all`.
 pub fn history(
     conn: &Connection,
     account_id: &str,
@@ -132,7 +160,7 @@ pub fn history(
         })
     };
     let rows = match filter {
-        "pay" | "send" | "charge" => {
+        "pay" | "send" | "charge" | "withdraw" => {
             let mut stmt = conn.prepare(
                 "SELECT id, kind, label, amount, ts_unix_ms FROM transactions \
                  WHERE account_id = ?1 AND kind = ?2 ORDER BY ts_unix_ms DESC LIMIT ?3",
@@ -265,6 +293,37 @@ pub fn credit_charge(
     now: i64,
     label: &str,
 ) -> rusqlite::Result<i64> {
+    credit(tx, account_id, amount, now, "charge", label)
+}
+
+/// Give a withdrawal's reserve back, inside the caller's transaction.
+///
+/// Recorded as a `withdraw` txn like the debit it undoes, NOT as a `charge`: the
+/// two belong to the same operation and the withdraw filter must show them as the
+/// pair they are. Only [`crate::charge`] calls this, and only from the one
+/// transaction that moved the op out of a non-terminal state — see the refund
+/// rules there, which are what keeps a retried/duplicated failure from refunding
+/// twice.
+pub fn refund_withdraw(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    amount: i64,
+    now: i64,
+) -> rusqlite::Result<i64> {
+    credit(tx, account_id, amount, now, "withdraw", WITHDRAW_REFUND_LABEL)
+}
+
+/// Credit `amount` to `account_id` and record a `kind`/`label` txn, inside the
+/// caller's transaction. Returns the new balance, or an out-of-range error on
+/// overflow (honest-fail on money arithmetic).
+fn credit(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    amount: i64,
+    now: i64,
+    kind: &str,
+    label: &str,
+) -> rusqlite::Result<i64> {
     // Defense-in-depth: mirror the bounds check in `transfer` so future call
     // sites can't accidentally credit zero or a pathological amount.
     if amount <= 0 || amount > MAX_AMOUNT {
@@ -286,7 +345,7 @@ pub fn credit_charge(
         tx,
         &Uuid::new_v4().to_string(),
         account_id,
-        "charge",
+        kind,
         label,
         None,
         None,
@@ -295,6 +354,54 @@ pub fn credit_charge(
         now,
     )?;
     Ok(after)
+}
+
+/// Debit `amount` エメ for a withdrawal, inside the caller's transaction —
+/// the mirror image of [`credit_charge`], and the FIRST half of a withdrawal.
+///
+/// Reserve-first is not a style choice: granting emeralds before the debit would
+/// mean a failed debit leaves emeralds that no eme paid for (in-world inflation),
+/// while a debit whose grant fails is merely eme parked in an op, refundable by
+/// [`refund_withdraw`]. So the balance moves here, before the mod is asked for
+/// anything, and stays moved until the op reaches a terminal state.
+///
+/// `accounts.balance` carries `CHECK (balance >= 0)`, so the balance is read and
+/// checked before the UPDATE (as in [`transfer`]) rather than letting a
+/// constraint violation stand in for the insufficient-funds answer.
+pub fn reserve_withdraw(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    amount: i64,
+    now: i64,
+    label: &str,
+) -> rusqlite::Result<WithdrawReserve> {
+    if amount <= 0 || amount > MAX_WITHDRAW_PER_OP {
+        return Ok(WithdrawReserve::BadAmount);
+    }
+    // A missing row is an internal inconsistency (the account is the session's,
+    // and sessions point at live accounts), so it errors rather than passing for
+    // a zero balance.
+    let bal: i64 = tx.query_row(
+        "SELECT balance FROM accounts WHERE account_id = ?1",
+        [account_id],
+        |r| r.get(0),
+    )?;
+    if bal < amount {
+        return Ok(WithdrawReserve::Insufficient { balance: bal });
+    }
+    let after = bal - amount; // non-negative: checked bal >= amount
+    tx.execute(
+        "UPDATE accounts SET balance = ?2, updated_unix_ms = ?3 WHERE account_id = ?1",
+        params![account_id, after, now],
+    )?;
+    let tx_id = Uuid::new_v4().to_string();
+    insert_txn(
+        tx, &tx_id, account_id, "withdraw", label, None, None, -amount, after, now,
+    )?;
+    Ok(WithdrawReserve::Ok {
+        tx_id,
+        balance_after: after,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -425,4 +532,132 @@ pub fn seed_demo_merchants(conn: &mut Connection) -> rusqlite::Result<()> {
     tx.commit()?;
     tracing::info!("seeded {} demo merchants", demo.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::PooledConn;
+
+    /// One account holding `balance` エメ, on its own in-memory DB. The pooled
+    /// handle keeps the pool (and therefore the `:memory:` database) alive.
+    fn account_with(balance: i64) -> PooledConn {
+        let pool = crate::db::open_memory().expect("in-memory pool");
+        let conn = pool.get().expect("checkout");
+        conn.execute(
+            "INSERT INTO accounts (account_id, balance, created_unix_ms, updated_unix_ms) \
+             VALUES ('acct-a', ?1, 0, 0)",
+            [balance],
+        )
+        .expect("seed account");
+        conn
+    }
+
+    fn balance_of(conn: &Connection) -> i64 {
+        balance(conn, "acct-a").expect("balance reads")
+    }
+
+    /// Every ledger row for the account as `(kind, amount, balance_after)`,
+    /// oldest first.
+    fn rows(conn: &Connection) -> Vec<(String, i64, i64)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, amount, balance_after FROM transactions \
+                 WHERE account_id = 'acct-a' ORDER BY rowid ASC",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_short_balance_reserves_nothing_at_all() {
+        // The one that must never half-happen: an insufficient withdrawal leaves
+        // the balance and the ledger exactly as they were, so the caller can
+        // abandon the request without anything to undo.
+        let mut conn = account_with(100);
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let r = reserve_withdraw(&tx, "acct-a", 101, 1_000, "エメラルドで受け取り").unwrap();
+        assert!(
+            matches!(r, WithdrawReserve::Insufficient { balance: 100 }),
+            "{r:?}"
+        );
+        tx.commit().unwrap();
+        assert_eq!(balance_of(&conn), 100);
+        assert!(rows(&conn).is_empty());
+    }
+
+    #[test]
+    fn a_reserve_debits_once_and_records_one_negative_withdraw_row() {
+        let mut conn = account_with(100);
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let r = reserve_withdraw(&tx, "acct-a", 40, 1_000, "エメラルドで受け取り").unwrap();
+        let WithdrawReserve::Ok { balance_after, .. } = r else {
+            panic!("expected a reserve, got {r:?}");
+        };
+        assert_eq!(balance_after, 60);
+        tx.commit().unwrap();
+
+        assert_eq!(balance_of(&conn), 60);
+        assert_eq!(rows(&conn), vec![("withdraw".to_string(), -40, 60)]);
+    }
+
+    #[test]
+    fn a_reserve_is_bounded_by_what_the_mod_can_materialise() {
+        let mut conn = account_with(MAX_WITHDRAW_PER_OP * 2);
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        for bad in [0, -1, MAX_WITHDRAW_PER_OP + 1] {
+            let r = reserve_withdraw(&tx, "acct-a", bad, 1_000, "エメラルドで受け取り").unwrap();
+            assert!(matches!(r, WithdrawReserve::BadAmount), "{bad} was reserved");
+        }
+        // …and the bound itself is reachable (funds permitting), so the limit is
+        // the stated one and not one-off.
+        let r = reserve_withdraw(
+            &tx,
+            "acct-a",
+            MAX_WITHDRAW_PER_OP,
+            1_000,
+            "エメラルドで受け取り",
+        )
+        .unwrap();
+        assert!(matches!(r, WithdrawReserve::Ok { .. }), "{r:?}");
+        tx.commit().unwrap();
+        assert_eq!(balance_of(&conn), MAX_WITHDRAW_PER_OP);
+        assert_eq!(rows(&conn).len(), 1);
+    }
+
+    #[test]
+    fn a_refund_is_a_withdraw_row_so_the_pair_reads_as_one_operation() {
+        // A refund under `charge` would show up in the charge filter as income
+        // the player never charged; under `withdraw` it sits next to the debit it
+        // undoes.
+        let mut conn = account_with(100);
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        reserve_withdraw(&tx, "acct-a", 40, 1_000, "エメラルドで受け取り").unwrap();
+        let after = refund_withdraw(&tx, "acct-a", 40, 2_000).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(after, 100);
+        assert_eq!(balance_of(&conn), 100);
+        assert_eq!(
+            rows(&conn),
+            vec![
+                ("withdraw".to_string(), -40, 60),
+                ("withdraw".to_string(), 40, 100),
+            ]
+        );
+        // Both rows are in the withdraw filter, and neither leaks into charge.
+        assert_eq!(history(&conn, "acct-a", 50, "withdraw").unwrap().len(), 2);
+        assert!(history(&conn, "acct-a", 50, "charge").unwrap().is_empty());
+    }
 }

@@ -24,12 +24,35 @@
 //!   MoyMoy `account_id`, and no column correlates the two. Treating it as one
 //!   would hand whoever controls a Mochi account a claim over a MoyMoy wallet it
 //!   never proved anything about. It is logged, and nothing else.
-//! * Nothing here creates a way to move value OUT of a wallet. `emerald_ops`
-//!   only ever runs `direction = 'charge'` (emeralds → eme) and the mod's only
-//!   verbs are `emerald.charge` / `inventory.query`. A server operator can, at
-//!   worst, fund their OWN wallet from their OWN server's emeralds; they hold no
-//!   operation over anybody else's MoyMoy balance, and this module must not
-//!   become the place that changes.
+//! * An assertion moves value OUT of a wallet only as the second half of a
+//!   withdrawal the session itself authorized. This used to say that nothing here
+//!   creates such a path at all — `emerald_ops` ran `direction = 'charge'` only,
+//!   and the mod's verbs were `emerald.charge` / `inventory.query`. Withdrawal
+//!   (`direction = 'withdraw'`, verb `emerald.withdraw`) deliberately ends that,
+//!   so what actually holds is narrower and worth stating exactly:
+//!
+//!   - The debit is still authorized by the session and nothing else. An
+//!     assertion cannot start a withdrawal; it decides only WHERE the eme comes
+//!     back out (which character, on which server), and it is refused unless the
+//!     request is already authenticated as the account being debited.
+//!   - It is bound to that one withdrawal. The signed `request_hash` covers the
+//!     `idem_key` and the amount under a withdraw-only domain, and the challenge
+//!     is issued to this account for the withdraw purpose and spent once — so a
+//!     captured assertion cannot be re-aimed at a second payout, at a larger one,
+//!     or at a charge.
+//!   - `AttestedFacts::account_id` is still never read for authorization. An
+//!     attester names a destination; it can no more nominate whose wallet pays
+//!     than it could before.
+//!   - An attester still holds no operation over a balance. The worst a hostile
+//!     one can do is claim a character it does not own — which costs the ATTESTER
+//!     nothing and gains it nothing, because a payout only ever happens against a
+//!     debit the wallet's own owner consented to.
+//!
+//!   What is genuinely new is a trust boundary, not a loophole: whether the eme
+//!   actually comes back as emeralds now depends on a server this backend does
+//!   not run. The user takes that on knowingly (they approve the payout naming
+//!   that server), and `charge.rs` treats an unproven grant as unresolved rather
+//!   than refunding it — see the withdraw rules there.
 //!
 //! ## Who is trusted to attest, and where that is decided
 //!
@@ -92,6 +115,18 @@ pub fn pubkey_url() -> String {
 /// request for 10000.
 pub fn charge_request_hash(idem_key: &str, amount: i64) -> String {
     request_hash("moymoy.charge.v1", &[idem_key, &amount.to_string()])
+}
+
+/// The request binding for a withdrawal: the idem_key and the amount, under a
+/// withdraw-only domain.
+///
+/// Same shape as [`charge_request_hash`] and deliberately a DIFFERENT domain, so
+/// the two never verify as each other. That separation is the whole point here:
+/// the operations run in opposite directions, and an assertion the user approved
+/// to consume 100 エメ worth of emeralds must not authorize paying 100 エメ back
+/// out (nor the reverse).
+pub fn withdraw_request_hash(idem_key: &str, amount: i64) -> String {
+    request_hash("moymoy.withdraw.v1", &[idem_key, &amount.to_string()])
 }
 
 /// The request binding for a character confirmation.
@@ -268,6 +303,9 @@ impl AttestVerifier {
 pub enum AttestPurpose {
     /// Authorize one specific `(idem_key, amount)` consume.
     Charge,
+    /// Authorize one specific `(idem_key, amount)` payout — the opposite
+    /// direction, and never interchangeable with [`AttestPurpose::Charge`].
+    Withdraw,
     /// Confirm which character this account is playing, for inventory reads.
     Session,
 }
@@ -276,6 +314,7 @@ impl AttestPurpose {
     pub fn as_str(self) -> &'static str {
         match self {
             AttestPurpose::Charge => "charge",
+            AttestPurpose::Withdraw => "withdraw",
             AttestPurpose::Session => "session",
         }
     }
@@ -285,6 +324,7 @@ impl AttestPurpose {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "charge" => Some(AttestPurpose::Charge),
+            "withdraw" => Some(AttestPurpose::Withdraw),
             "session" => Some(AttestPurpose::Session),
             _ => None,
         }
@@ -453,6 +493,54 @@ mod tests {
     }
 
     #[test]
+    fn a_charge_assertion_cannot_authorize_a_withdrawal_or_the_reverse() {
+        // The consequential one: the two run in OPPOSITE directions, so a
+        // crossover would let consent to spend emeralds pay eme back out (or
+        // consent to a payout take the player's emeralds instead).
+        let mut withdraw = charge_claims("idem-1", 250);
+        withdraw.request_hash = withdraw_request_hash("idem-1", 250);
+        assert_eq!(
+            reject(&withdraw, &charge_request_hash("idem-1", 250)),
+            ClaimsRejected::RequestHashMismatch
+        );
+        let charge = charge_claims("idem-1", 250);
+        assert_eq!(
+            reject(&charge, &withdraw_request_hash("idem-1", 250)),
+            ClaimsRejected::RequestHashMismatch
+        );
+        // A withdrawal is bound to its own amount and key, exactly as a charge is.
+        assert!(check(&withdraw, &withdraw_request_hash("idem-1", 250)).is_ok());
+        for (key, amount) in [("idem-1", 251), ("idem-2", 250)] {
+            assert_eq!(
+                reject(&withdraw, &withdraw_request_hash(key, amount)),
+                ClaimsRejected::RequestHashMismatch,
+                "({key}, {amount}) was accepted"
+            );
+        }
+        // …and a character confirmation authorizes neither direction.
+        let mut session = charge_claims("idem-1", 250);
+        session.request_hash = session_request_hash();
+        assert_eq!(
+            reject(&session, &withdraw_request_hash("idem-1", 250)),
+            ClaimsRejected::RequestHashMismatch
+        );
+        assert_eq!(
+            reject(&withdraw, &session_request_hash()),
+            ClaimsRejected::RequestHashMismatch
+        );
+        // The three hash spaces are disjoint at the source: same parts, different
+        // domains.
+        let (c, w, s) = (
+            charge_request_hash("idem-1", 250),
+            withdraw_request_hash("idem-1", 250),
+            session_request_hash(),
+        );
+        assert_ne!(c, w);
+        assert_ne!(c, s);
+        assert_ne!(w, s);
+    }
+
+    #[test]
     fn another_backends_assertion_is_refused() {
         let mut claims = charge_claims("idem-1", 250);
         claims.audience = "piggleshop".to_string();
@@ -524,13 +612,18 @@ mod tests {
     fn purpose_parsing_is_fail_closed() {
         assert_eq!(AttestPurpose::parse("charge"), Some(AttestPurpose::Charge));
         assert_eq!(
+            AttestPurpose::parse("withdraw"),
+            Some(AttestPurpose::Withdraw)
+        );
+        assert_eq!(
             AttestPurpose::parse("session"),
             Some(AttestPurpose::Session)
         );
-        for bad in ["", "Charge", "sessions", "admin"] {
+        for bad in ["", "Charge", "sessions", "admin", "withdrawal", "Withdraw"] {
             assert_eq!(AttestPurpose::parse(bad), None, "{bad:?} was accepted");
         }
         assert_eq!(AttestPurpose::Charge.as_str(), "charge");
+        assert_eq!(AttestPurpose::Withdraw.as_str(), "withdraw");
         assert_eq!(AttestPurpose::Session.as_str(), "session");
     }
 

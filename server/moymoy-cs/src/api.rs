@@ -22,7 +22,7 @@
 //!   GET  /auth/me         (auth)
 //!   GET  /auth/lookup?handle=            (auth — send-target resolution)
 //!   GET  /wallet/home     (auth)
-//!   GET  /wallet/history?limit=&filter=  (auth)
+//!   GET  /wallet/history?limit=&filter=  (auth — all|pay|send|charge|withdraw)
 //!   GET  /wallet/friends  (auth)
 //!   GET  /wallet/merchants (auth)
 //!   POST /wallet/attest/challenge {purpose}   (auth)
@@ -31,6 +31,7 @@
 //!   POST /wallet/send     {idem_key, to_handle, amount}            (auth)
 //!   POST /wallet/pay      {idem_key, merchant_id, amount}          (auth)
 //!   POST /wallet/charge   {idem_key, amount, assertion?}           (auth)
+//!   POST /wallet/withdraw {idem_key, amount, assertion?}           (auth)
 //!   GET  /wallet/op?op_id=                                         (auth)
 
 use std::sync::Arc;
@@ -113,6 +114,7 @@ pub fn router(state: AppState) -> Router {
         .route("/wallet/send", post(send))
         .route("/wallet/pay", post(pay))
         .route("/wallet/charge", post(charge))
+        .route("/wallet/withdraw", post(withdraw))
         .route("/wallet/op", get(op_status))
         // Dev-only funding affordance (MC-less E2E). Gated by MOYMOY_DEV_CREDIT=1;
         // 403 otherwise. Never enable in a real deploy.
@@ -1032,6 +1034,115 @@ async fn charge(
     // would, freshly consented to, so record it: without this the user would
     // approve a charge and then immediately be asked to confirm the character
     // again just to see the resulting inventory.
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        st.char_sessions
+            .put(&acct.account_id, &mc_uuid, facts.attester_id(), now_ms());
+    }
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct WithdrawReq {
+    idem_key: String,
+    amount: i64,
+    /// Absent on the first attempt, exactly as on a charge — the app only
+    /// produces an assertion once the answer is `attestation_required`, so a
+    /// retry replays instead of raising a second consent modal.
+    assertion: Option<String>,
+}
+
+/// Pay eme back out as in-world emeralds.
+///
+/// The account is the SESSION's, always. The assertion decides only which
+/// character receives the emeralds and on which server; it cannot name the wallet
+/// that pays, and it cannot start a withdrawal on its own.
+async fn withdraw(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<WithdrawReq>,
+) -> Result<Json<Value>, ApiError> {
+    if req.idem_key.trim().is_empty() {
+        return Err(ApiError::bad_request("idem_key required"));
+    }
+    if !st.can_charge() {
+        return Ok(Json(json!({ "ok": false, "error": "mc_unavailable" })));
+    }
+    // A replay cannot debit again, so it needs no fresh consent — and asking for
+    // it would prompt the user to approve a payout that is already in flight.
+    if let Some(prev) = st
+        .charge
+        .replay_withdraw(&acct.account_id, &req.idem_key)
+        .await?
+    {
+        return Ok(Json(prev));
+    }
+    // Refuse what cannot succeed BEFORE asking the phone for consent: a modal the
+    // user approves only to be told "insufficient" also burns the challenge it was
+    // issued for. Both checks are advisory — the authoritative ones run inside the
+    // reserve transaction, which is the only place that can be raced.
+    if req.amount <= 0 || req.amount > wallet::MAX_WITHDRAW_PER_OP {
+        return Ok(Json(json!({ "ok": false, "error": "bad_amount" })));
+    }
+    let id = acct.account_id.clone();
+    let balance = blocking(st.pool.clone(), move |conn| {
+        wallet::balance(conn, &id).map_err(ApiError::from)
+    })
+    .await?;
+    if balance < req.amount {
+        return Ok(Json(
+            json!({ "ok": false, "error": "insufficient", "balance": balance }),
+        ));
+    }
+    let Some(assertion) = req.assertion.as_deref().filter(|a| !a.trim().is_empty()) else {
+        return Ok(Json(
+            json!({ "ok": false, "error": "attestation_required" }),
+        ));
+    };
+    // Bound to THIS withdrawal, under a domain of its own: an assertion approved
+    // for a charge does not verify here, and one approved for 100 エメ does not
+    // authorize paying out 10000.
+    let facts = match st
+        .attest
+        .verify(
+            assertion,
+            &attest::withdraw_request_hash(&req.idem_key, req.amount),
+            attest::now_unix_secs(),
+        )
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "withdraw: assertion refused");
+            return Ok(Json(json!({ "ok": false, "error": e.code() })));
+        }
+    };
+    if !st.challenges.consume(
+        facts.challenge(),
+        &acct.account_id,
+        AttestPurpose::Withdraw.as_str(),
+        now_ms(),
+    ) {
+        return Ok(Json(json!({ "ok": false, "error": "attest_challenge" })));
+    }
+    let Some(mc_uuid) = identity::normalize_uuid(facts.subject()) else {
+        tracing::error!(subject = %facts.subject(),
+            "withdraw: signed subject is not a UUID — refusing rather than paying out to it");
+        return Ok(Json(json!({ "ok": false, "error": "attest_invalid" })));
+    };
+    log_accepted_assertion("wallet/withdraw", &acct.account_id, &facts);
+    let value = st
+        .charge
+        .begin_withdraw(
+            &req.idem_key,
+            &acct.account_id,
+            &mc_uuid,
+            facts.attester_id(),
+            req.amount,
+        )
+        .await?;
+    // Same reasoning as on a charge: this carried a freshly consented (character,
+    // server) pair, so record it rather than re-prompting for a confirmation just
+    // to show the resulting inventory.
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
         st.char_sessions
             .put(&acct.account_id, &mc_uuid, facts.attester_id(), now_ms());

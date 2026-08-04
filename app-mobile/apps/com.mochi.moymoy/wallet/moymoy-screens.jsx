@@ -294,6 +294,27 @@ function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
   );
 }
 
+/* ─── エメ入出金セグメント (チャージ / 出金) ───────────────────── */
+function MoyEmeModeSwitch({ mode, onMode }) {
+  const segs = [["charge", "チャージ"], ["withdraw", "出金"]];
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", border: "1.5px solid var(--ink)",
+      margin: "12px 16px 0" }}>
+      {segs.map(([id, label], i) => {
+        const active = mode === id;
+        return (
+          <button key={id} onClick={() => onMode(id)} style={{
+            padding: "10px 0", border: "none", borderLeft: i === 0 ? "none" : "1.5px solid var(--ink)",
+            background: active ? "var(--moy-deep)" : "var(--bg-white)", color: active ? "#fff" : "var(--ink)",
+            cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14 }}>
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 /* ─── チャージ画面 (インベントリの手持ちエメラルドのみ) ──────────── */
 function MoyCharge({ balance, inv, canCharge, invStatus, attesting, onConfirmCharacter, onConfirm }) {
   const available = inv.emeralds + inv.blocks * 9; // 9エメ = 1ブロック
@@ -427,10 +448,149 @@ function MoyCharge({ balance, inv, canCharge, invStatus, attesting, onConfirmCha
 const chipStyle = { border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "2px 2px 0 var(--ink)",
   padding: "7px 12px", cursor: "pointer", fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700 };
 
+/* ─── 出金画面 (残高 → ゲーム内エメラルドで受け取る) ─────────────── */
+function MoyWithdraw({ balance, canCharge, invStatus, attesting, onConfirmCharacter, onConfirm }) {
+  const cap = Math.min(balance, 20736); // 1回の出金上限 = 20,736エメ（インベントリ1個分）
+  const [amt, setAmt] = msState(0);
+  const press = (k) => {
+    setAmt(v => {
+      if (k === "⌫") return Math.floor(v / 10);
+      const add = k === "00" ? "00" : k;
+      const next = Number(String(v) + add);
+      return next > 9999999 ? v : next;
+    });
+  };
+  const overBalance = amt > balance;
+  const overLimit = !overBalance && amt > 20736;
+  const over = overBalance || overLimit;
+
+  if (!canCharge) {
+    return (
+      <div style={{ padding: "40px 24px 120px", textAlign: "center" }}>
+        <EmeGem size={56} style={{ margin: "0 auto 16px", opacity: 0.5 }} />
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 15, fontWeight: 700, color: "var(--ink)" }}>
+          出金は現在利用できません
+        </div>
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", marginTop: 8, lineHeight: 1.7 }}>
+          出金には Minecraft サーバーへの接続が必要です。<br />
+          サーバーに参加してから、もう一度お試しください。
+        </div>
+      </div>
+    );
+  }
+
+  // Withdraw doesn't need to READ the character's inventory — there is nothing
+  // to read, it only WRITES emeralds into it — but it still needs the character
+  // confirmed first: this is how the user is shown, before approving, which
+  // character is about to receive the emeralds.
+  if (invStatus === "attestation_required" || (invStatus && invStatus.indexOf("attest_") === 0)) {
+    return (
+      <div style={{ padding: "40px 24px 120px", textAlign: "center" }}>
+        <EmeGem size={56} style={{ margin: "0 auto 16px", opacity: 0.5 }} />
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 15, fontWeight: 700, color: "var(--ink)" }}>
+          キャラクターの確認が必要です
+        </div>
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", marginTop: 8, lineHeight: 1.7 }}>
+          どのキャラクターにエメラルドを渡すかを、<br />
+          MochiOS に確認してもらいます。
+        </div>
+        {invStatus !== "attestation_required" && (
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--carle-red)", marginTop: 12, lineHeight: 1.7 }}>
+            {errLabel(invStatus)}
+          </div>
+        )}
+        <button disabled={attesting} onClick={onConfirmCharacter} style={{ marginTop: 20, padding: "14px 22px",
+          border: "1.5px solid #000", background: attesting ? "#bdbdbd" : "var(--moy)", color: "#fff",
+          boxShadow: attesting ? "none" : "4px 4px 0 #0B5A33", cursor: attesting ? "default" : "pointer",
+          fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15 }}>
+          {attesting ? "確認中…" : "キャラクターを確認"}
+        </button>
+      </div>
+    );
+  }
+
+  // Same distinction as MoyCharge: the mod couldn't be reached, so don't imply
+  // there is simply nothing to withdraw — say why and let the user retry.
+  if (invStatus === "character_unreachable") {
+    return (
+      <div style={{ padding: "40px 24px 120px", textAlign: "center" }}>
+        <EmeGem size={56} style={{ margin: "0 auto 16px", opacity: 0.5 }} />
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 15, fontWeight: 700, color: "var(--ink)" }}>
+          受け取り先のキャラクターを確認できません
+        </div>
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)", marginTop: 8, lineHeight: 1.7 }}>
+          Minecraft のキャラクターに接続できませんでした。<br />
+          ゲームにログインしているか、サーバー側の連携（mod）設定をご確認ください。
+        </div>
+      </div>
+    );
+  }
+
+  const blocks = Math.floor(amt / 9);
+  const rest = amt % 9;
+
+  return (
+    <div style={{ padding: "16px 16px 120px" }}>
+      <div className="eyebrow" style={{ color: "var(--moy-deep)" }}>受け取り内容 · プレビュー</div>
+
+      {/* preview panel — Minecraft hotbar style */}
+      <div style={{ marginTop: 8, border: "1.5px solid var(--ink)", boxShadow: "3px 3px 0 var(--ink)",
+        background: "var(--bg-white)", padding: "14px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            <MineSlot kind="block" count={blocks} />
+            <MineSlot kind="emerald" count={rest} />
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 600, color: "var(--ink-soft)" }}>
+              {blocks} ブロック ＋ {rest} エメラルドを受け取ります
+            </div>
+            <div style={{ marginTop: 3 }}>
+              <Eme amount={amt} size={22} color="var(--moy-deep)" />
+            </div>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--ink-soft)",
+              letterSpacing: "0.08em", marginTop: 2 }}>RECEIVE · 受け取り額</div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 18, textAlign: "center" }}>
+        <div className="eyebrow" style={{ color: "var(--moy-deep)" }}>出金金額</div>
+        <Eme amount={amt} size={48} color={over ? "var(--carle-red)" : "var(--ink)"} />
+        <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 11,
+          color: over ? "var(--carle-red)" : "var(--ink-soft)" }}>
+          {overBalance ? "残高が不足しています"
+            : overLimit ? "1回の出金は 20,736 エメまでです"
+            : `出金後残高  ${formatEme(balance - amt)} エメ`}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 14, justifyContent: "center", flexWrap: "wrap" }}>
+        <button onClick={() => setAmt(v => Math.min(cap, v + 9))} style={chipStyle}>＋1ブロック</button>
+        <button onClick={() => setAmt(v => Math.min(cap, v + 64))} style={chipStyle}>＋1スタック</button>
+        <button onClick={() => setAmt(cap)} style={{ border: "1.5px solid var(--moy-deep)",
+          background: "var(--moy-mint)", padding: "7px 12px", cursor: "pointer", color: "var(--moy-deep)",
+          fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700 }}>全額</button>
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <MoyKeypad onPress={press} />
+        <button disabled={amt <= 0 || over} onClick={() => onConfirm(amt)} style={{
+          width: "100%", marginTop: 12, padding: "16px", border: "1.5px solid #000",
+          background: amt <= 0 || over ? "#bdbdbd" : "var(--moy)", color: "#fff",
+          boxShadow: amt <= 0 || over ? "none" : "4px 4px 0 #0B5A33", cursor: amt <= 0 || over ? "default" : "pointer",
+          fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 17, letterSpacing: "0.04em",
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+          <EmeGem size={20} /> エメラルドを受け取る
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ─── 履歴 ───────────────────────────────────────────────────────── */
 function MoyHistory({ txns }) {
   const [filter, setFilter] = msState("all");
-  const tabs = [["all", "すべて"], ["pay", "支払い"], ["send", "送金"], ["charge", "チャージ"]];
+  const tabs = [["all", "すべて"], ["pay", "支払い"], ["send", "送金"], ["charge", "チャージ"], ["withdraw", "出金"]];
   const shown = filter === "all" ? txns : txns.filter(t => t.kind === filter);
   return (
     <div style={{ padding: "16px 16px 120px" }}>
@@ -454,7 +614,7 @@ function MoyHistory({ txns }) {
 
 /* ─── 確認シート ─────────────────────────────────────────────────── */
 function MoyConfirmSheet({ kind, target, amount, balance, busy, error, onCancel, onConfirm }) {
-  const verb = kind === "send" ? "送金" : kind === "charge" ? "チャージ" : "支払い";
+  const verb = kind === "send" ? "送金" : kind === "charge" ? "チャージ" : kind === "withdraw" ? "出金" : "支払い";
   return (
     <div style={{ position: "absolute", inset: 0, zIndex: 110, display: "flex", flexDirection: "column",
       justifyContent: "flex-end", background: "rgba(10,30,18,0.45)" }} onClick={busy ? undefined : onCancel}>
@@ -481,7 +641,7 @@ function MoyConfirmSheet({ kind, target, amount, balance, busy, error, onCancel,
         <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)",
           display: "flex", justifyContent: "space-between", padding: "10px 0",
           borderTop: "1px solid rgba(0,0,0,0.1)" }}>
-          <span>{kind === "charge" ? "チャージ後残高" : "支払い後残高"}</span>
+          <span>{kind === "charge" ? "チャージ後残高" : kind === "withdraw" ? "出金後残高" : "支払い後残高"}</span>
           <span style={{ color: "var(--ink)", fontWeight: 700 }}>
             {formatEme(kind === "charge" ? balance + amount : balance - amount)} エメ
           </span>
@@ -518,6 +678,9 @@ const ERR_LABEL = {
   character_unreachable: "キャラクターに接続できません（ゲーム／サーバー連携をご確認ください）",
   charge_pending: "チャージは保留中です（反映までお待ちください）",
   charge_failed: "チャージに失敗しました。もう一度お試しください",
+  withdraw_pending: "出金は保留中です（反映までお待ちください）",
+  withdraw_failed: "出金に失敗しました。残高は返金されています",
+  withdraw_stuck: "出金の結果を確認できませんでした。運営にお問い合わせください（残高は保留中です）",
   unauthorized: "セッションが切れました。ログインし直してください",
   // ── host attestation (DEV.md §7.3.10 G4) ──
   // The codes the OS/SDK produce keep their own wording — a user who declined, a
@@ -532,7 +695,9 @@ const ERR_LABEL = {
   attest_denied: "キャラクターの確認をキャンセルしました",
   attest_timeout: "キャラクターの確認がタイムアウトしました。もう一度お試しください",
   attest_unavailable: "いまキャラクターを確認できません。しばらくしてからもう一度お試しください",
-  attest_no_host: "この画面ではチャージできません。Minecraft 内の MochiOS からご利用ください",
+  // Kind-neutral: the same code is reported for a charge and for a withdrawal,
+  // and both are unavailable for the same reason (no host game to attest).
+  attest_no_host: "この画面では利用できません。Minecraft 内の MochiOS からご利用ください",
   attest_no_scope: "アプリの設定が不足しています（attestation.request）。アプリを更新してください",
   attest_os_error: "MochiOS がキャラクターを確認できませんでした",
   attest_no_crypto: "この環境では確認に必要な暗号機能が使えません",
@@ -562,6 +727,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   const idemRef = msRef(null);
 
   const [tab, setTab] = msState("home");
+  const [emeMode, setEmeMode] = msState("charge"); // "charge" | "withdraw" — segment on the charge tab
   const [flow, setFlow] = msState(null);       // {kind, target}  amount-entry
   const [confirm, setConfirm] = msState(null);  // {kind, target, amount}
   const [busy, setBusy] = msState(false);
@@ -697,6 +863,8 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
         res = await MoyMoy.send(target.handle, amount, idemRef.current);
       } else if (kind === "pay") {
         res = await MoyMoy.pay(target.id, amount, idemRef.current);
+      } else if (kind === "withdraw") {
+        res = await MoyMoy.withdraw(amount, idemRef.current);
       } else {
         res = await MoyMoy.charge(amount, idemRef.current);
       }
@@ -709,16 +877,30 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       }
 
       let shownAmount = amount;
-      if (kind === "charge") {
-        // Charge is async: poll the op until the mod settles the consumed amount.
+      if (kind === "charge" || kind === "withdraw") {
+        // Charge/withdraw are async: poll the op until the mod settles the amount.
         const op = await pollOp(res.op_id);
         if (op && op.unauthorized) { setBusy(false); setConfirm(null); onExpired(); return; }
         if (!op || op.state !== "settled") {
           if (!mountedRef.current) return;
-          const terminal = op && (op.state === "failed" || op.state === "stuck");
-          // Terminal failure ⇒ this op is dead; let a retry start a fresh op.
-          if (terminal) idemRef.current = null;
-          setErr(errLabel(terminal ? "charge_failed" : "charge_pending"));
+          if (kind === "charge") {
+            const terminal = op && (op.state === "failed" || op.state === "stuck");
+            // Terminal failure ⇒ this op is dead; let a retry start a fresh op.
+            if (terminal) idemRef.current = null;
+            setErr(errLabel(terminal ? "charge_failed" : "charge_pending"));
+          } else if (op && op.state === "failed") {
+            // A failed withdrawal is refunded server-side and dead — a retry must
+            // start a fresh op.
+            idemRef.current = null;
+            setErr(errLabel("withdraw_failed"));
+          } else if (op && op.state === "stuck") {
+            // Unlike a failure, "stuck" means the outcome is unknown — it may yet
+            // settle — so keep pointing at the SAME op instead of risking a second
+            // withdrawal alongside a first whose result we can't confirm.
+            setErr(errLabel("withdraw_stuck"));
+          } else {
+            setErr(errLabel("withdraw_pending"));
+          }
           setBusy(false);
           await refresh(() => mountedRef.current);
           return;
@@ -728,9 +910,9 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
 
       await refresh(() => mountedRef.current);
       if (!mountedRef.current) return;
-      // Only a charge changes the in-world inventory; re-reading it after a send
-      // or a payment would be a pointless round-trip to the game server.
-      if (kind === "charge") {
+      // Only a charge or withdrawal changes the in-world inventory; re-reading it
+      // after a send or a payment would be a pointless round-trip to the game server.
+      if (kind === "charge" || kind === "withdraw") {
         await refreshInventory(() => mountedRef.current);
       }
       if (!mountedRef.current) return;
@@ -758,9 +940,18 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
         {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={setTab} />}
         {tab === "pay" && <MoyPay merchants={merchants} onPick={t => setFlow({ kind: "pay", target: t })} />}
         {tab === "send" && <MoySend friends={friends} onPick={t => setFlow({ kind: "send", target: t })} />}
-        {tab === "charge" && <MoyCharge balance={balance} inv={inv} canCharge={canCharge} invStatus={invStatus}
-          attesting={attesting} onConfirmCharacter={confirmCharacter}
-          onConfirm={(amount) => { setErr(null); setConfirm({ kind: "charge", target: null, amount }); }} />}
+        {tab === "charge" && (
+          <>
+            <MoyEmeModeSwitch mode={emeMode} onMode={setEmeMode} />
+            {emeMode === "charge"
+              ? <MoyCharge balance={balance} inv={inv} canCharge={canCharge} invStatus={invStatus}
+                  attesting={attesting} onConfirmCharacter={confirmCharacter}
+                  onConfirm={(amount) => { setErr(null); setConfirm({ kind: "charge", target: null, amount }); }} />
+              : <MoyWithdraw balance={balance} canCharge={canCharge} invStatus={invStatus}
+                  attesting={attesting} onConfirmCharacter={confirmCharacter}
+                  onConfirm={(amount) => { setErr(null); setConfirm({ kind: "withdraw", target: null, amount }); }} />}
+          </>
+        )}
         {tab === "history" && <MoyHistory txns={txns} />}
       </div>
 
@@ -800,6 +991,6 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
 }
 
 Object.assign(window, {
-  MoyKeypad, MineSlot, EmeBlockMini, MoyPay, MoySend, MoyAmountEntry, MoyCharge, MoyHistory,
-  MoyConfirmSheet, MoyMoyApp,
+  MoyKeypad, MineSlot, EmeBlockMini, MoyPay, MoySend, MoyAmountEntry, MoyEmeModeSwitch,
+  MoyCharge, MoyWithdraw, MoyHistory, MoyConfirmSheet, MoyMoyApp,
 });

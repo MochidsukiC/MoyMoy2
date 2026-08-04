@@ -212,7 +212,8 @@ function CompleteOverlay({ kind, target, amount, sound, onClose }) {
     const t = setTimeout(onClose, 2600);
     return () => clearTimeout(t);
   }, []);
-  const verb = kind === "send" ? "送金しました" : kind === "charge" ? "チャージしました" : "支払いました";
+  const verb = kind === "send" ? "送金しました" : kind === "charge" ? "チャージしました"
+    : kind === "withdraw" ? "出金しました" : "支払いました";
   return (
     <div onClick={onClose} style={{ position: "absolute", inset: 0, zIndex: 200,
       display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
@@ -402,10 +403,11 @@ function MoyHome({ balance, txns, profile, onTab }) {
 function TxnRow({ t, last }) {
   const incoming = t.amount > 0;
   const meta = {
-    pay:     { glyph: "◈", pal: "emerald", tag: "支払い" },
-    send:    { glyph: "⇄", pal: "turquoise", tag: "送金" },
-    receive: { glyph: "↓", pal: "green", tag: "受取" },
-    charge:  { glyph: "＋", pal: "meadow", tag: "チャージ" },
+    pay:      { glyph: "◈", pal: "emerald", tag: "支払い" },
+    send:     { glyph: "⇄", pal: "turquoise", tag: "送金" },
+    receive:  { glyph: "↓", pal: "green", tag: "受取" },
+    charge:   { glyph: "＋", pal: "meadow", tag: "チャージ" },
+    withdraw: { glyph: "↑", pal: "orange", tag: "出金" },
   }[t.kind] || { glyph: "◈", pal: "emerald", tag: "" };
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",

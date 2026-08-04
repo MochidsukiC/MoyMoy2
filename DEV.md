@@ -13,8 +13,8 @@ MochiOS2.0 プラットフォーム向けの電子マネー / ウォレット / 
 - **構成（3コンポーネント）**:
   - `server/moymoy-cs/` — Rust+axum バックエンド → `moymoy.cs.mnn`。**トンネル内蔵型SDK**(`mochi-hub-cs-sdk` の `CsTunnel::start`)。ウォレットの唯一の権威。SQLite 永続化。**MC mod 無しでも完全動作**。
   - `app-mobile/apps/com.mochi.moymoy/` — HTML/JS バンドル。`fetch("https://moymoy.cs.mnn/...")`。デザイン「MochiOS Mobile.html」駆動。
-  - `mod/` — Forge 1.20.1 MC サーバーサイドmod → `moymoy.mc.mnn`。エメラルド消費/付与の真実。connector の `CommandDispatch.Handler` を `register("moymoy", …)`。**オプショナル**。
-- **エメラルドチャージ**: アプリ起点＋ゲーム内 両対応。双方向コマンドバス（backend が `cs_hosts:["moymoy"]` を claim、`reliable_send` 送信 / `run_inbound` 受信）。
+  - `mod/` — Forge 1.20.1 MC サーバーサイドmod → `moymoy.mc.mnn`。エメラルド消費/付与の真実。connector の `MnnServer` API に `MnnHandler` を実装(`MoyMoyExtension`)、呼び出し元は `MnnRequest#caller()` で `cs:app.moymoy` に固定（旧 `CommandDispatch.Handler` の名前突合は認可でないため廃止）。**オプショナル**。
+- **エメラルドチャージ/出金**: チャージはアプリ起点＋ゲーム内 両対応、出金はアプリ起点のみ。双方向コマンドバス（backend が `cs_hosts:["moymoy"]` を claim、`reliable_send` 送信 / `run_inbound` 受信）。
 - **整合性**: 「消費の真実=mod / 残高の権威=backend」を `emerald_ops` 台帳 + 二層冪等キー(`idem_key`/`op_id`) + at-least-once 再送 + 冪等決済で eventually-consistent に。
 - **方針**: 旧 MoyMoy(`D:\IdeaProjects\MoyMoy`)はドメインの緩い参考のみ。MochiOS2.0 本体は原則無改変（app_backends 配置・mod jar 配置・`mcserver_id` 設定・証明書発行のみ。`hosted_app_ids` は廃止）。
 
@@ -22,17 +22,17 @@ MochiOS2.0 プラットフォーム向けの電子マネー / ウォレット / 
 
 ## 現在の仕様（デザイン「MochiOS Mobile.html」駆動で確定）
 
-デザインは 電子マネー×クレジットカード風のエメラルド決済アプリ。タブは **home / send(送る) / pay(支払う) / charge(チャージ) / history(履歴)**。
+デザインは 電子マネー×クレジットカード風のエメラルド決済アプリ。タブは **home / send(送る) / pay(支払う) / charge(チャージ、内部にチャージ/出金セグメント) / history(履歴)**。ボトムナビ5タブ・ホームのクイックアクション3つは不変。
 通貨は整数「エメ」、**9エメ = 1エメラルドブロック**（Minecraft）。
-取引種別 `kind`: `pay`(支払い) / `send`(送金) / `receive`(受取) / `charge`(チャージ)。各取引 `{id, kind, label, amount(符号付), ts}`。
+取引種別 `kind`: `pay`(支払い) / `send`(送金) / `receive`(受取) / `charge`(チャージ) / `withdraw`(出金、引落は負・返金は正)。各取引 `{id, kind, label, amount(符号付), ts}`。
 **請求/承認(request/approve)機能はデザインに無い** → 実装しない。
 
 UIフロー:
 - **home**: 利用可能残高 + カード(holder/number/expiry) + クイックアクション(pay/send/charge) + 最近の取引4件。
 - **send**: フレンド(プレイヤー)選択 → 金額 → 確認 → 完了。残高減・相手は receive。
 - **pay**: 近くの加盟店選択 → 金額 → 確認 → 完了。残高減・加盟店口座へ。
-- **charge**: インベントリ(手持ちエメラルド + ブロック、9エメ=1ブロック)を換算 → 金額 → 確認 → 完了。エメラルド消費し残高加算。**MC mod 依存**。
-- **history**: 全取引リスト(フィルタ: すべて/支払い/送金/チャージ)。
+- **charge**: チャージ/出金セグメント切替。チャージはインベントリ(手持ちエメラルド + ブロック、9エメ=1ブロック)を換算 → 金額 → 確認 → 完了、エメラルド消費し残高加算。出金は金額 → 着金先キャラクター確認 → 完了、残高減で mod がエメラルド付与（§出金整合）。いずれも**MC mod 依存**。
+- **history**: 全取引リスト(フィルタ: すべて/支払い/送金/チャージ/出金)。
 
 ### アカウントモデル（v2・独立アカウント + PIN）
 **独立した MoyMoy アカウント（電子マネー型）**。`account_id` はサーバ生成 UUID で、Minecraft UUID とは独立。
@@ -40,7 +40,7 @@ UIフロー:
 - **資格情報**: `handle`（一意・小文字正規化・`[A-Za-z0-9_]` 3〜20）＋ `PIN`（4〜6桁数字, **Argon2id** ハッシュ保存）。handle は送金宛先（`@handle`）に兼用。
 - **セッション**: register/login で 256bit ランダムトークンを発行し、HTTP ヘッダ `X-MoyMoy-Session` で送る。DB には **SHA-256 ハッシュ**で保存（期限 30日・logout で失効）。**backend が全ウォレットリクエストの本人を検証**（旧 mc_uuid 自己申告を解消）。
 - **マルチアカウント**: 1端末に複数口座をリンク。クライアント保持リスト（`mochi.storage` / dev は localStorage）が正本で、ヘッダのアバターから切替・追加・ログアウト。サーバは `moymoy_sessions.phone_id` をメタデータ記録のみ。
-- **MCキャラ連携**: チャージ時に現在の `gameUuid`（os.gameUuid）を `account_mc_links` へ自動リンク（1口座に複数キャラ可）。MC UUID は「チャージ用の連携リソース」。1キャラ=1口座（`account_mc_links.mc_uuid` UNIQUE、別口座からのチャージ/在庫照会は `character_claimed` で拒否）。
+- **MCキャラ連携（v5）**: 口座↔キャラの永続的な写像は保持しない。どのキャラのエメラルドを操作してよいかはリクエスト毎にユーザー同意付きの Hub 署名 attestation が決める（§出金整合「認可」参照）。`emerald_ops.attester_id` は同意されたサーバーへ再送を届けるためのルーティング情報であり、所有の証明ではない。
 - **メール検証 / 2FA / リカバリ（v4）**: **MNN メール（`@*.mnn`）限定**。`MOCHI_MAIL_SERVICE_BEARER` 設定時は**開設にメール＋OTP必須**（1メール1口座、`email_lower` UNIQUE）、ログインは PIN＋メール2FA、PIN 忘れはメール OTP で再設定。未設定なら**従来の handle+PIN へ自動 degrade**。OTP は 6桁・SHA-256(+`MOYMOY_OTP_PEPPER`)保存・10分・5回上限・単回・再送クールダウン（`moymoy_otps`）。送信は `mochi-hub-mailer` の `MnnMailSender`（IPvM ゲートウェイ `/mail/otp-deliver` 経由で相手の in-world メールアプリへ配送。外部SMTPは使わない）。`valid_email` は `local@<単一ラベル>.mnn` のみ受理。dev 検証は `MOYMOY_DEV_OTP_LOG=1`（コードをログ出力）。
 
 ### バックエンド HTTP API
@@ -49,22 +49,34 @@ UIフロー:
 - `POST /auth/register {handle, display_name, pin, email?, phone_id?}` → メール有効時 `{ok, pending:"verify_email", email}`／無効時 `{ok, session, account}` ／ `POST /auth/register/verify {email, code}` → `{ok, session, account}`
 - `POST /auth/login {handle, pin, phone_id?}` → 2FA 時 `{ok, pending:"2fa", email}`／それ以外 `{ok, session, account}` ／ `POST /auth/login/verify {handle, code}` → `{ok, session, account}`
 - `POST /auth/recover/start {handle}` → 常に `{ok}`（列挙防止） ／ `POST /auth/recover/verify {handle, code, new_pin}` → `{ok, session, account}`
-- `POST /auth/logout`（session） ／ `GET /auth/me` → `{ok, account, email, email_verified, linked_mc:[{mc_uuid,mcid}]}` ／ `GET /auth/lookup?handle=` → 送金宛先解決
+- `POST /auth/logout`（session） ／ `GET /auth/me` → `{ok, account, email, email_verified}` ／ `GET /auth/lookup?handle=` → 送金宛先解決
 - `GET /wallet/home` → `{ok, balance, profile:{holder,number,expiry}, txns:[...recent], can_charge}`
-- `GET /wallet/history?limit=&filter=all|pay|send|charge` ／ `GET /wallet/friends`（最近の相手・handle 付）／ `GET /wallet/merchants`
-- `GET /wallet/inventory?mc_uuid=&mcid=` → `{ok, emeralds, blocks, chargeable}`（**MC mod 依存**）
+- `GET /wallet/history?limit=&filter=all|pay|send|charge|withdraw` ／ `GET /wallet/friends`（最近の相手・handle 付）／ `GET /wallet/merchants`
+- `POST /wallet/attest/challenge {purpose}` → ワンタイム challenge 発行（`purpose`: `charge`/`session`/`withdraw`）／ `POST /wallet/attest/session {assertion}` → 現在のキャラクターを確認（inventory 読み取り用。消費の認可そのものではなく、チャージ/出金は各々が別途 assertion を要する）
+- `GET /wallet/inventory`（引数なし、対象は直前に `/wallet/attest/session` で確認したキャラ）→ `{ok, emeralds, blocks, chargeable}`。失敗: `mc_unavailable`（can_charge=false）/ `attestation_required`（未確認、またはキャラがオフラインと判明）/ `character_unreachable`（mod 無応答）（**MC mod 依存**）
 - `POST /wallet/send {idem_key, to_handle, amount}` → `@handle` 宛 P2P 送金
 - `POST /wallet/pay {idem_key, merchant_id, amount}` → 加盟店支払い
-- `POST /wallet/charge {idem_key, amount, mc_uuid, mcid?}` → エメラルド→エメ（着金=account_id / 消費ルーティング=mc_uuid、自動リンク、§チャージ整合）
-- `GET /wallet/op?op_id=` → チャージ進捗（所有権検証付き）
+- `POST /wallet/charge {idem_key, amount, assertion?}` → エメラルド→エメ（着金=account_id / 消費対象キャラ・サーバーは同意付き assertion が決定、§チャージ整合）
+- `POST /wallet/withdraw {idem_key, amount, assertion?}` → エメ→エメラルド（着金先キャラ/サーバーは同意付き assertion が決定、§出金整合）。失敗: `mc_unavailable` / `insufficient`（assertion を求める前に返る）/ `attestation_required` / `bad_amount` / `attest_*`
+- `GET /wallet/op?op_id=` → チャージ/出金 共通の進捗ポーリング（所有権検証付き）
 - `POST /wallet/_dev/credit {handle, amount}` → dev 専用クレジット（`MOYMOY_DEV_CREDIT=1` ゲート）
 
 ### SQLite スキーマ
-`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until, **email, email_lower(UNIQUE), email_verified**) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires) / `account_mc_links`(account_id, mc_uuid(UNIQUE), mcid) / `moymoy_otps`(otp_id, purpose=signup|login2fa|recovery, email_lower, account_id, code_hash, payload_json, attempts, expires) / `transactions` / `merchants` / `idempotency`(PK=idem_key,scope) / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, state=pending|sent|settled|failed|stuck, …)。マイグレーションは user_version ステッパ（v1 baseline `schema.sql` → v2 独立アカウント → v3 1キャラ1口座 → v4 メール/OTP、各 `db/schema_vN.sql`）。詳細は `server/moymoy-cs/src/db/`。
+`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until, **email, email_lower(UNIQUE), email_verified**) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires) / `moymoy_otps`(otp_id, purpose=signup|login2fa|recovery, email_lower, account_id, code_hash, payload_json, attempts, expires) / `transactions`(kind に `withdraw` 追加、引落は負・返金は正) / `merchants` / `idempotency`(PK=idem_key,scope。出金は scope=`withdraw:<account_id>`) / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, attester_id=同意されたサーバー(再送先を固定するルーティング情報。所有の証明ではない), direction=charge|withdraw, state=pending|sent|settled|failed|stuck, …)。出金は既存カラムに新しい値が増えるのみで**マイグレーション不要**（`kind`/`direction` に CHECK 制約なし）。マイグレーションは user_version ステッパ（v1 baseline `schema.sql` → v2 独立アカウント → v3 1キャラ1口座 → v4 メール/OTP → v5 `account_mc_links` を DROP しキャラクター所有の証明をリクエスト毎の Hub 署名 attestation へ移行、各 `db/schema_vN.sql`）。詳細は `server/moymoy-cs/src/db/`。
 
 ### コマンドバス verb（backend→mod / mod→backend ack）
 - `emerald.charge {op_id, idem_key, target_uuid, amount}` → mod 消費(インベントリのエメラルド+ブロック) → ack `{op_id, status, settled:consumed}`
+- `emerald.withdraw {op_id, idem_key, target_uuid, amount}` → mod がエメラルド付与(`amount/9`ブロック+`amount%9`エメ、満杯時は足元ドロップ) → ack `{op_id, status, granted}`（`settled` とは別名。status: `ok`/`duplicate`(再付与せず同額を再ack)/`unknown`(claim済みだが付与を証明できず`stuck`・返金なし)/`player_offline`/`bad_request`/`unauthorized`/`internal_error`）
 - `inventory.query {req_id, target_uuid}` → mod が手持ちを返答 `{req_id, emeralds, blocks}`（charge画面のインベントリ表示用。任意）
+
+### 出金整合とattestation（§出金整合、チャージの逆方向）
+出金 = エメ残高 → ゲーム内エメラルドで受け取る。チャージは「先に消費 → ack で入金」、出金は「先に引落(予約) → 付与要求 → ack で確定」と安全な失敗の向きが逆転する（付与を先にするとエメラルドが無から増えインフレする）。
+- 確定的失敗（`player_offline` 等・付与なし）は同一トランザクション内で即返金。付与されたか**不明**（`unknown`）な場合は返金しない（返金するとエメラルドと残高の両取りになる）ため `stuck` にして手動レビュー（R008 と同じ規律）。返金は state を非終端から動かした当のトランザクション内でのみ行い、UPDATE の変更行数でガードして reconcile と ack の同時到達による二重返金を構造的に防ぐ。
+- `reconcile` の dead-letter は方向別: チャージの一括 UPDATE には `direction='charge'` の絞りが入り、出金は1行ずつ処理（未送達 `pending` → 返金して `failed` ／曖昧な `sent` → 返金なしで `stuck`）。再送は台帳の `direction` で verb を分岐（出金 op をチャージとして再送するとプレイヤーのエメラルドを逆に没収するため必須）。
+- **認可**: `AttestPurpose::Withdraw`（purpose 文字列 `"withdraw"`）と request-hash ドメイン `moymoy.withdraw.v1` を新設。ドメイン分離＋challenge の purpose バインドにより、チャージ用 assertion で出金はできず逆も不可。
+- **上限**: 1操作あたり 20,736 エメ（=2,304 エメラルドブロック=インベントリ1個分）を backend と mod が独立に強制（無制限だと mod 側で数百万スタックが生成されサーバースレッドを固めるため）。
+- **mod 側冪等**: `grants` コンパウンド（`op_id → -1`=claim済み未確定／`≥0`=確定付与額）で管理。チャージ用の `ops` は不変・後方互換。claim → ディスクへ同期フラッシュ → 付与 → 確定記録 → フラッシュ、の二相（付与は無から生成するため記録前クラッシュ＋リプレイでの二重生成を防ぐ必須要件）。判定〜claim〜付与〜確定は1回の `server.submit` 内で完結させ、同一 op の同時実行が両方とも「未 claim」を観測することを構造的に不可能にしている。
+- **不変条件の変更**: 従来「ウォレットから価値が外へ出る経路は無い」が成立していたが、出金ではこれは成立しない。代わりに ①出金は必ずセッション本人の操作、②金額と `idem_key` に束縛されたユーザー同意付き assertion を要する、③`AttestedFacts::account_id` は依然として認可に読まれない、④attester（サーバー運営者）は他人の残高を動かす手段を持たず宛先キャラを名乗れるのみ、が担保される。新たな信頼境界は「ユーザーが出金先 MC サーバーを信用する」こと。
 
 ---
 
@@ -75,9 +87,11 @@ UIフロー:
 - **memo 未実装**: デザインの送金/支払いフローに memo 入力欄が無いため、API からも除外（受理して捨てる挙動は不採用）。必要時は transactions.memo への配線を追加。
 - **in-game チャットコマンドからの backend 報告は不可**: `mochi` connector(`MochiMod`)は `DISPATCH`(inbound ルーティング)のみ公開で、ハンドラ外からの unsolicited 送信API が無い。よってエメラルドチャージは**アプリ起点**で完結する。真の `/eme deposit` には mochi connector への outbound 送信API追加（承認の要る MochiOS2.0 改変）が必要。
 - エメラルドチャージの致命ウィンドウ（consume成功・ack喪失・SavedDataフラッシュ前クラッシュ）は台帳+reconciliation+`setDirty()`直後フラッシュで最小化（exactly-once は原理的限界）。
+- **出金 mod 側フラッシュのベストエフォート性**: `EmeraldOpStore.flush()` はベストエフォート。バニラの `SavedData#save(File)` は書き込み失敗をログのみで飲み込み dirty フラグを無条件でクリアするため、書き込み失敗直後にクラッシュすると claim が失われリプレイで二重付与が起こりうる（mod 側に検知手段なし）。
+- `.dat` 破損時にバニラの `DimensionDataStorage#get` が例外を握り潰しストアを丸ごと空扱いにする窓（`ops`/`grants` 共通、チャージにも元からある）。
+- **出金の信頼境界**: 出金先 MC サーバーへの信用が新たに発生する。悪意あるサーバーは `ok` を返しつつ実際には付与しないことができ、機能の性質上これは回避ではなく同意の上で受容するリスク。
 - **CodeX 再レビュー（反映済）**: v2 再設計に recursive-codex-reviewer を実施。妥当指摘を反映 — backend `382acc2`（冪等の複合PK化で二重決済防止 / `user_version` を tx 内へ移しマイグレーション原子化 / 握り潰しログ化 ほか）、frontend `ffb40c8`（`me()` を ok/expired/unknown で識別し一時エラーで口座を消さない / アンマウントガード / 401 即時処理 ほか）。
 - **承認ゲート保留（共有層に跨る設計課題・未着手）**: 着手前に設計案の承認が必要。
-  - **R007**: `/wallet/inventory` の mc_uuid 所有権検証。リンクは charge 時に確立されるため、未リンク照会を許容しつつリンク後のみ検証する設計が要る。
   - **R008**: `reconcile` の op TTL / dead-letter。`sent` の消費済みエメラルドを安全に失効させる escalate フロー（単純 TTL は消費済み無クレジット化の危険）。
   - **R05/R06**: SDK の `_session` がグローバルのため、非アクティブ口座の logout / 切替検証中に並行 API が誤セッションを送る競合。`getJson/postJson` への per-call トークン引数化で根治。
   - **R13 / charge 再試行**: `store.set` 失敗の握り潰し、チャージ poll タイムアウト後の再試行で別 op_id の二重消費窓。
@@ -113,3 +127,5 @@ UIフロー:
 - [ ] backend 再配置（`deploy-backend.ps1 -EnableCharge` で moymoy-cs＋MC証明書を Hub workdir へ）
 - [ ] フル E2E（in-world で 0.2.2 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
 - [ ] 承認ゲート保留: `MOYMOY_OTP_PEPPER` の本番 fail-closed 化 / `AccountInfo` の email 型統合 / refresh 失敗の UI エラー状態化 / `run_inbound` 切断理由の可視化（mc-sdk 共有層）
+- [x] **出金**（エメ→エメラルド）: backend（先引落→付与要求→ack確定、`AttestPurpose::Withdraw`、dead-letter方向別処理）／mod（`grants` 冪等ストア・二相コミット）／アプリ（チャージタブ内チャージ/出金セグメント）
+- [ ] 出金のフル E2E 実機検証（in-world でチャージ → 出金 → インベントリ反映 → 履歴表示）

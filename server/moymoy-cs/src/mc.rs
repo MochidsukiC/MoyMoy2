@@ -31,17 +31,28 @@
 //! plane, no correlation table, no second claim, and no client certificate. The
 //! backend is reachable at plain `moymoy.cs.mnn` again.
 //!
+//! ## The verbs
+//!
+//! * `emerald.charge` — consume the character's emeralds (emeralds → eme).
+//! * `emerald.withdraw` — grant emeralds to the character (eme → emeralds), the
+//!   same exchange run backwards. Its ack reports `granted` rather than
+//!   `settled`, so neither direction can read the other's settlement.
+//! * `inventory.query` — read the character's chargeable inventory (no effect).
+//!
 //! ## What survives, and why
 //!
 //! * `op_id` — NOT a correlation id (HTTP correlates by connection) but the
-//!   **idempotency key** the mod claims a completed consumption under, so a
-//!   retried charge re-acks the same settled amount instead of consuming twice.
-//!   It stays in the payload and in the `emerald_ops` ledger.
+//!   **idempotency key** the mod claims a completed op under, so a retried charge
+//!   re-acks the same settled amount instead of consuming twice, and a retried
+//!   withdrawal re-acks the same granted amount instead of paying out twice. It
+//!   stays in the payload and in the `emerald_ops` ledger.
 //! * `req_id` on an inventory query — the mod drops a query that carries an empty
 //!   one, so it is still generated and sent; it is simply no longer *used* here.
-//! * The consume-first ledger and its reconciliation pass — a request can still
-//!   fail after the mod consumed (timeout, mid-stream error), which is exactly
-//!   what [`ChargeOutcome::Ambiguous`] marks and what reconciliation re-drives.
+//! * The ledger and its reconciliation pass — a request can still fail after the
+//!   mod acted (timeout, mid-stream error), which is exactly what
+//!   [`ChargeOutcome::Ambiguous`] marks and what reconciliation re-drives. The
+//!   ledger orders the two directions oppositely (consume-first for a charge,
+//!   debit-first for a withdrawal); `charge.rs` explains why.
 
 use std::time::Duration;
 
@@ -53,7 +64,7 @@ use mochi_proto_attest::{public_key_from_b64url, ATTEST_ALG};
 
 use crate::attest::pubkey_url as attest_pubkey_url;
 
-/// Deadline for one charge round-trip. Deliberately LONGER than the connector
+/// Deadline for one charge/withdraw round-trip. Deliberately LONGER than the connector
 /// sidecar's own 30 s mod deadline so the honest `504` it synthesises wins the
 /// race: a local timeout would leave consumption unknowable, while the sidecar's
 /// 504 at least bounds where the request got to.
@@ -71,27 +82,30 @@ const INVENTORY_TIMEOUT: Duration = Duration::from_secs(3);
 /// `attest_unavailable`, which a retry resolves.
 const PUBKEY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Outcome of asking the mod to consume emeralds.
+/// Outcome of asking the mod to move emeralds — in either direction.
 ///
-/// The variants exist to keep **whether emeralds may have been consumed**
+/// The variants exist to keep **whether the mod may have acted in-world**
 /// unambiguous, because that is what decides whether the ledger may treat a
 /// failure as harmless. Nothing here ever collapses "we don't know" into "it
-/// didn't happen".
+/// didn't happen". Which way the uncertainty is dangerous depends on the
+/// direction (an un-credited consume vs. an un-refunded payout), so the variants
+/// stay direction-neutral and `charge.rs` decides what each one means.
 pub enum ChargeOutcome {
     /// The mod answered. The value is its settlement ack (`{op_id, status,
-    /// settled}`) — feed it to `charge::settle_ack`.
+    /// settled}` for a charge, `{op_id, status, granted}` for a withdrawal) —
+    /// feed it to the matching settler in `charge.rs`.
     Acked(Value),
     /// The Hub had no live connector for that server (404/503). The address is a
     /// fixed server now, not a character lookup, so this means "that server is
     /// not connected", not "the player is offline". Either way the Hub decided it
-    /// before dialing anyone, so nothing was consumed.
+    /// before dialing anyone, so nothing happened in-world.
     ServerUnreachable,
     /// Nothing left this process (the tunnel is down, or the request could not be
-    /// built). Nothing was consumed.
+    /// built). Nothing happened in-world.
     NotSent,
-    /// The request WAS on the wire when the exchange failed. Consumption is
-    /// unknown — the op must stay non-terminal so reconciliation re-drives it and
-    /// the mod's idempotent re-ack settles it.
+    /// The request WAS on the wire when the exchange failed. Whether the mod acted
+    /// is unknown — the op must stay non-terminal so reconciliation re-drives it
+    /// and the mod's idempotent re-ack settles it.
     Ambiguous(String),
 }
 
@@ -138,40 +152,79 @@ impl McLink {
             "target_uuid": uuid.to_string(),
             "amount": amount,
         });
+        self.send_op("charge", attester_id, op_id, &payload).await
+    }
+
+    /// Ask the mod on `attester_id` to GRANT `amount` emeralds to `uuid` — the
+    /// other half of the wallet, and the exact mirror of [`send_charge`] on the
+    /// wire (same address, same `op_id` idempotency, same ack-is-the-response).
+    ///
+    /// The ack's amount field is `granted`, not `settled`, on purpose: the two
+    /// directions must not be able to read each other's acks. See
+    /// `charge::settle_withdraw_ack`.
+    pub async fn send_withdraw(
+        &self,
+        attester_id: &str,
+        uuid: &Uuid,
+        op_id: &str,
+        idem_key: &str,
+        amount: i64,
+    ) -> ChargeOutcome {
+        let payload = serde_json::json!({
+            "op_id": op_id,
+            "idem_key": idem_key,
+            "verb": "emerald.withdraw",
+            "target_uuid": uuid.to_string(),
+            "amount": amount,
+        });
+        self.send_op("withdraw", attester_id, op_id, &payload).await
+    }
+
+    /// One request/ack exchange with the mod, shared by both directions so a
+    /// charge and a withdrawal classify their failures identically — the ledger's
+    /// safety rests on that classification, and two copies of it would drift.
+    /// `direction` is carried only so every line says which way the op ran.
+    async fn send_op(
+        &self,
+        direction: &str,
+        attester_id: &str,
+        op_id: &str,
+        payload: &Value,
+    ) -> ChargeOutcome {
         let url = direct_url(attester_id);
-        let resp = match self.post(&url, &payload, CHARGE_TIMEOUT).await {
+        let resp = match self.post(&url, payload, CHARGE_TIMEOUT).await {
             Ok(r) => r,
-            Err(e) => return charge_send_failure(&url, op_id, e),
+            Err(e) => return charge_send_failure(&url, op_id, direction, e),
         };
 
         let body = String::from_utf8_lossy(&resp.body).into_owned();
         if !is_success(resp.status) {
             // 404 (nothing claims that server's zone) and 503 (the claim has no
             // live node) are both decided by the Hub BEFORE any server is dialed,
-            // so they are the two statuses that provably consumed nothing.
+            // so they are the two statuses that provably changed nothing in-world.
             // Anything else got at least as far as a connector.
             if resp.status == 404 || resp.status == 503 {
-                tracing::info!(%url, op_id, status = resp.status, %body,
-                    "charge not routable — that server's connector is not live (nothing consumed)");
+                tracing::info!(%url, op_id, direction, status = resp.status, %body,
+                    "emerald op not routable — that server's connector is not live (nothing happened in-world)");
                 return ChargeOutcome::ServerUnreachable;
             }
-            tracing::warn!(%url, op_id, status = resp.status, %body,
-                "charge failed past the Hub — consumption is UNKNOWN; leaving the op for reconciliation");
+            tracing::warn!(%url, op_id, direction, status = resp.status, %body,
+                "emerald op failed past the Hub — its in-world effect is UNKNOWN; leaving the op for reconciliation");
             return ChargeOutcome::Ambiguous(format!("http_{}", resp.status));
         }
 
-        // 2xx: the mod acks inline for every charge it processes, so a missing or
+        // 2xx: the mod acks inline for every op it processes, so a missing or
         // unparseable ack is a broken contract — never settle on a guess.
         match serde_json::from_str::<Value>(&body) {
             Ok(v) if v.get("op_id").is_some() => ChargeOutcome::Acked(v),
             Ok(_) => {
-                tracing::error!(%url, op_id, %body,
-                    "charge answered 2xx with no op_id in the ack — cannot settle; leaving the op for reconciliation");
+                tracing::error!(%url, op_id, direction, %body,
+                    "emerald op answered 2xx with no op_id in the ack — cannot settle; leaving the op for reconciliation");
                 ChargeOutcome::Ambiguous("ack_without_op_id".to_string())
             }
             Err(e) => {
-                tracing::error!(%url, op_id, error = %e, %body,
-                    "charge answered 2xx with a malformed ack — cannot settle; leaving the op for reconciliation");
+                tracing::error!(%url, op_id, direction, error = %e, %body,
+                    "emerald op answered 2xx with a malformed ack — cannot settle; leaving the op for reconciliation");
                 ChargeOutcome::Ambiguous("malformed_ack".to_string())
             }
         }
@@ -318,31 +371,39 @@ fn is_success(status: u16) -> bool {
 }
 
 /// Classify a failure to complete the exchange, keeping "nothing was written" and
-/// "it was on the wire" apart — the distinction the ledger depends on.
-fn charge_send_failure(url: &str, op_id: &str, err: HttpSendError) -> ChargeOutcome {
+/// "it was on the wire" apart — the distinction the ledger depends on. Shared by
+/// both directions (the classification is about the transport, not the verb);
+/// `direction` is logged so an operator can see which way the op ran.
+fn charge_send_failure(
+    url: &str,
+    op_id: &str,
+    direction: &str,
+    err: HttpSendError,
+) -> ChargeOutcome {
     match err {
         // Nothing reached the Hub: no tunnel, or the stream never opened.
         HttpSendError::NotConnected => {
-            tracing::warn!(%url, op_id, "charge NOT sent — the cs tunnel is down; reconciliation will retry");
+            tracing::warn!(%url, op_id, direction, "emerald op NOT sent — the cs tunnel is down; reconciliation will retry");
             ChargeOutcome::NotSent
         }
         HttpSendError::Open(m) => {
-            tracing::warn!(%url, op_id, error = %m, "charge NOT sent — could not open the tunnel stream");
+            tracing::warn!(%url, op_id, direction, error = %m, "emerald op NOT sent — could not open the tunnel stream");
             ChargeOutcome::NotSent
         }
-        // The request was rejected before a stream existed, so nothing was
-        // consumed — but this is a bug in how we built it, not a transient.
+        // The request was rejected before a stream existed, so nothing happened
+        // in-world — but this is a bug in how we built it, not a transient.
         e @ (HttpSendError::BadUrl(_) | HttpSendError::BadRequest(_)) => {
-            tracing::error!(%url, op_id, error = %e, "charge request is malformed — NOT sent (this is a backend bug)");
+            tracing::error!(%url, op_id, direction, error = %e, "emerald op request is malformed — NOT sent (this is a backend bug)");
             ChargeOutcome::NotSent
         }
         // Everything else (and every future variant of this #[non_exhaustive]
         // enum) happened with the request already on the wire. Defaulting to
-        // ambiguous is the asset-safe direction: at worst the op is retried and
-        // the mod re-acks `duplicate`.
+        // ambiguous is the asset-safe direction in BOTH directions: a charge is
+        // retried until the mod re-acks `duplicate`, and a withdrawal is never
+        // refunded on a guess that the payout did not land.
         other => {
-            tracing::warn!(%url, op_id, error = %other,
-                "charge exchange failed mid-flight — consumption is UNKNOWN; leaving the op for reconciliation");
+            tracing::warn!(%url, op_id, direction, error = %other,
+                "emerald op exchange failed mid-flight — its in-world effect is UNKNOWN; leaving the op for reconciliation");
             ChargeOutcome::Ambiguous(other.to_string())
         }
     }
@@ -364,29 +425,35 @@ mod tests {
 
     #[test]
     fn a_down_tunnel_is_not_sent_never_ambiguous() {
-        // Nothing was written, so the op stays 'pending' and a dead-letter can
-        // safely fail it — no consumed emeralds to write off.
-        assert!(matches!(
-            charge_send_failure("u", "op", HttpSendError::NotConnected),
-            ChargeOutcome::NotSent
-        ));
-        assert!(matches!(
-            charge_send_failure("u", "op", HttpSendError::Open("refused".into())),
-            ChargeOutcome::NotSent
-        ));
+        // Nothing was written, so the op stays 'pending': a dead-letter can safely
+        // fail a charge (no consumed emeralds to write off) and safely refund a
+        // withdrawal (no emeralds were granted).
+        for direction in ["charge", "withdraw"] {
+            assert!(matches!(
+                charge_send_failure("u", "op", direction, HttpSendError::NotConnected),
+                ChargeOutcome::NotSent
+            ));
+            assert!(matches!(
+                charge_send_failure("u", "op", direction, HttpSendError::Open("refused".into())),
+                ChargeOutcome::NotSent
+            ));
+        }
     }
 
     #[test]
     fn a_mid_flight_failure_is_ambiguous() {
-        // The request reached the Hub; the mod may have consumed. The op must stay
-        // non-terminal so a late/duplicate ack can still settle it.
-        assert!(matches!(
-            charge_send_failure("u", "op", HttpSendError::Http("reset".into())),
-            ChargeOutcome::Ambiguous(_)
-        ));
-        assert!(matches!(
-            charge_send_failure("u", "op", HttpSendError::Body("eof".into())),
-            ChargeOutcome::Ambiguous(_)
-        ));
+        // The request reached the Hub; the mod may have consumed (or granted). The
+        // op must stay non-terminal so a late/duplicate ack can still settle it —
+        // and so a withdrawal is never refunded while a payout may have landed.
+        for direction in ["charge", "withdraw"] {
+            assert!(matches!(
+                charge_send_failure("u", "op", direction, HttpSendError::Http("reset".into())),
+                ChargeOutcome::Ambiguous(_)
+            ));
+            assert!(matches!(
+                charge_send_failure("u", "op", direction, HttpSendError::Body("eof".into())),
+                ChargeOutcome::Ambiguous(_)
+            ));
+        }
     }
 }
