@@ -143,6 +143,34 @@ PIN 検証は「短いトランザクションで失敗カウンタを先に書�
 
 ---
 
+## [2026-08-05] 夜間セキュリティ/バグ監査
+
+資金移動・元帳整合性・認証/OTP/リスク判定・SDK を対象に多エージェント監査。各指摘は反証専任の検証者2名（到達可能性・悪用可能性、「確信が持てなければ反証扱い」の指示付き）を通し、両方が反証できなかったものだけを載せている。棄却された指摘は書いていない。
+
+**修正済み（`3cabd87`）【CRITICAL】**: `app-mobile/apps/com.mochi.moymoy/moymoy-sdk.js` の `base()` が dev 用の上書き `?moymoy_http=` を in-world 判定より先に読んでいた。別アプリが `mochi-internal://com.mochi.moymoy/index.html?moymoy_http=<攻撃者>` へ遷移させるとクエリは cold start まで生き残るため、本物の MoyMoy が攻撃者のバックエンドを向いて起動する。見た目は普通のログイン画面のまま、入力された handle と PIN、ログイン済みならセッショントークンが攻撃者に渡る。manifest の `allowed_origins` は防御にならない（MochiOS 側でそれを強制しているのは `mochi.api.call` だけで、この SDK は生の `fetch` を使う。この層の欠落自体は MochiOS2.0 の DEV.md に承認待ちとして記録した）。
+
+**監査中に別途修正されたもの**: 本監査は `api.rs:1330` の `withdraw_gate` が attestation 不在を検出する前に単回使用 OTP を消費してしまい 5,000 エメ超の出金が絶対に成功しない件を検出したが、検証中に `bd69589` で独立に修正されていた（peek / step_up 分離）。重複対応はしていない。
+
+### 未修正 — 要判断
+
+- **【MEDIUM・承認ゲート】`server/moymoy-cs/src/riskauth.rs:256,275` — step-up の判定が資金移動トランザクションの外側で1回しか行われない。**
+  24時間累計（`outflow_24h`）をトランザクション外で読み、`riskauth::settle` はロックアウトしか再確認しないため、並行リクエストが全員「移動前」の累計を読む。セッションと PIN を握った攻撃者（メールは受け取れない）が同額のリクエストを同時に多数投げると、全部が `Requirement::Pin` と判定され、`STEPUP_DAILY`(10,000) のメール OTP 要求を迂回できる。被害は青天井ではなく、接続プール `max_size(8)` が並行度の上限になるので概ね「8 × Pin 帯の上限額」で頭打ちになり、以降はコミット済み累計を読んで正しく OTP を要求する。出金は 1 op ごとに Hub 署名済み assertion が要るぶん更に弱く、実際に効くのは主に `/wallet/send`。
+  **判断が要る点**: `send` と `approve` は `riskauth::settle` が既に money tx 内にあるので、`StepUpTicket` に「クリアした Requirement と判定に使った額」を持たせて tx 内で `assess_for` を再実行すれば閉じる。しかし **withdraw は閉じられない** — `withdraw_gate` は自分の tx を commit して接続を返した後、非同期の attestation 往復を挟んでから `charge::begin_withdraw` の別 tx で reserve する（最も広い窓）。ここを塞ぐにはチケットを `api.rs → charge.rs → charge/withdraw.rs` へ引き回し、`api.rs:1317-1321` が明文で置いた「このゲートは charge モジュールのトランザクションに手を出さない」という設計判断を覆す必要がある。**send/approve だけ直して「解決済み」にすると、不可逆な in-world 払い出しを伴う withdraw が racy なまま残る**ので、3経路まとめて設計してから着手すること。なお同じ形の 24h 上限を正しく tx 内で扱う実装が `merchant.rs:712-748` の `check_issuance(tx, …)` にあり、参考になる。
+
+- **【MEDIUM】`server/moymoy-cs/src/api.rs:937` — `/wallet/send` の冪等キーが呼び出し元でスコープされていない。**
+  グローバルな `"send"` スコープで記録・参照するため、ある口座の `idem_key` が全口座のものと衝突する。`/wallet/charge` では `charge_scope(account_id)` を導入し schema v5 で移行してこの欠陥を閉じたのに、send 経路だけ取り残されている。攻撃者が被害者の `idem_key` を当てると `replay()` が被害者の記録をそのまま返す（他人の取引内容が読める）。
+  修正方向は既に確立している（`charge_scope` と同じ形にする）が、既存レコードの移行が要るので schema 変更として扱うこと。
+
+- **【MEDIUM】`server/moymoy-cs/src/merchant.rs:600` — 停止された加盟店をオーナー自身が即座に復帰できる。**
+  `merchants.status` が行為者を区別しない単一カラムで、`set_status` のガードは `status != 'deleted'` だけ。運営向けの停止コマンドは `admin::run` に存在せず（`refund` のみ）DB 直接更新かオーナー経由になるが、どちらにせよオーナーが `POST /merchant/portal/status` に `active` を送れば戻せる。不正加盟店を止める操作を、その加盟店自身が取り消せる。
+  **判断が要る点**: 運営による停止とオーナーによる停止を別の状態として持つか、運営専用の上書きフラグを足すか。認可モデルの変更。
+
+- **【LOW】`server/moymoy-cs/src/payments.rs:475` — 加盟店 status の検査が資金移動の述語に入っていない。**
+  `approve` は Argon2id 検証の前に一度 `is_active()` を見るだけで、claim UPDATE の述語は `state='created' AND expires_unix_ms > now` しか見ない。PIN 検証中（数百ミリ秒）に停止された加盟店が、進行中の承認から集金できる。
+
+- **【MEDIUM】`mod/src/main/java/jp/houlab/mochidsuki/moymoy/MoyMoyExtension.java:234` — `emerald.charge` の重複排除が消費時点で耐久でもレース安全でもない。**
+  `store.recorded(opId)` を connector の IO スレッド上で `server.submit(...)` の前に見るため、同じ `op_id` の並行到着で二重消費の窓がある。
+
 ## TODO
 
 - [x] 段階0: デザイン取込（claude_design MCP）→ 仕様確定
