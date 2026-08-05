@@ -26,12 +26,14 @@ MOYMOY_DB_PATH = "moymoy.db"
 MOYMOY_CS_TLS  = "1"
 
 # Embedded cs tunnel → Hub endpoints. These match a local `mochi-inworld` devstack;
-# override for a non-local Hub. The bearer is a secret — set it from your secret
-# store, not in a committed file.
+# override for a non-local Hub. The handshake bearer is NOT set here: it is this
+# process's own per-process identity token (MOCHI_SVC_IDENTITY_TOKEN), minted
+# and injected by the hub launcher. The legacy shared MOCHI_TUNNEL_BEARER is
+# retired — the Hub derives no principal from it, so presenting it is always
+# rejected.
 MOCHI_TUNNEL_HUB_WS   = "ws://127.0.0.1:7411"
 MOCHI_TUNNEL_HUB_QUIC = "127.0.0.1:7420"
 MOCHI_IPVM_ROUTER_URL = "http://127.0.0.1:7400"
-# MOCHI_TUNNEL_BEARER = "<secret>"
 
 # Emerald charge needs NO configuration of its own: it rides the cs tunnel above
 # as HTTP in MNN, so there is no command-bus endpoint and no mTLS client
@@ -41,11 +43,14 @@ MOCHI_IPVM_ROUTER_URL = "http://127.0.0.1:7400"
 
 # Email verification / login 2FA / PIN recovery (OPTIONAL). MoyMoy delivers OTP
 # codes over the MNN overlay to *.mnn mailboxes (the in-world mail app) — NO
-# external SMTP. When the mail bearer is set, account creation requires a code +
-# recovery is available; when unset, the wallet degrades to handle+PIN only.
-# The bearer is a SECRET service token — set it from your secret store. The
-# in-world devstack default is "dev-mail-token" (tools/mochi-inworld.ps1).
-# MOCHI_MAIL_SERVICE_BEARER = "<mnn-mail service bearer>"
+# external SMTP. Delivery authenticates with THIS process's own per-process
+# identity token (MOCHI_SVC_IDENTITY_TOKEN), minted and injected by the hub
+# launcher — there is nothing to set here. The old shared-secret
+# MOCHI_MAIL_SERVICE_BEARER is retired. Since the same token is required just to
+# open the embedded cs tunnel (MOYMOY_CS_TUNNEL, default on), a normal
+# launcher-run backend always has it, so email verification/2FA/recovery is
+# effectively always on in production. It only degrades to handle+PIN in a
+# MOYMOY_CS_TUNNEL=0 loopback smoke, which has no identity token to present.
 # MOCHI_MAIL_GATEWAY_URL    = "http://127.0.0.1:7411"   # IPvM gateway (default)
 # Optional offline-brute-force resistance for the OTP table:
 # MOYMOY_OTP_PEPPER = "<random secret>"
