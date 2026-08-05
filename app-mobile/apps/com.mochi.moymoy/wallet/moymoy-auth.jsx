@@ -735,6 +735,7 @@ function MoyMoyRoot({ onClose }) {
           // during use is handled by the wallet's onExpired — never delete on a blip.
           setAccounts(list);
           setActiveId(active.account_id);
+          MoyMoy.link(active.session);
           setPhase("app");
           return;
         }
@@ -757,6 +758,7 @@ function MoyMoyRoot({ onClose }) {
     setAccounts(list);
     setActiveId(entry.account_id);
     MoyMoy.setSession(session);
+    MoyMoy.link(session);
     await saveAccounts(list, entry.account_id);
     setAdding(false);
     setPhase("app");
@@ -777,6 +779,7 @@ function MoyMoyRoot({ onClose }) {
     }
     if (verdict === "ok") {
       MoyMoy.setSession(acc.session);
+      MoyMoy.link(acc.session);
       setActiveId(id);
       await saveAccounts(accounts, id);
       return;

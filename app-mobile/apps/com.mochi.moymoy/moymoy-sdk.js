@@ -78,6 +78,35 @@
     return null;
   }
 
+  // Device owner's Mochi account UUID (self-asserted). Best-effort: null on
+  // browser-dev (no `mochi` global), on an unsynced device (no owner yet), or
+  // if the host API throws.
+  async function mochiOwner() {
+    try {
+      if (window.mochi && mochi.phoneState && mochi.phoneState.get) {
+        const st = await mochi.phoneState.get();
+        return (st && st.owner) || null;
+      }
+    } catch (e) {
+      console.warn("MoyMoy.mochiOwner: phoneState API threw", e);
+    }
+    return null;
+  }
+
+  // Register this device's owner so it receives incoming-payment
+  // notifications. Best-effort and never blocks the caller: skips silently
+  // when there is no owner to report, and only warns on failure.
+  async function link(session) {
+    const owner = await mochiOwner();
+    if (!owner) return;
+    try {
+      const r = await postJson("/wallet/link", { mochi_account_id: owner }, session);
+      if (!r || !r.ok) console.warn("MoyMoy.link: /wallet/link answered not-ok", r);
+    } catch (e) {
+      console.warn("MoyMoy.link: /wallet/link failed", e);
+    }
+  }
+
   // ── persistent storage (account/session list lives here) ────────────────────
   function hasMochiStorage() {
     return !!(window.mochi && mochi.storage && mochi.storage.get);
@@ -331,6 +360,7 @@
     inWorld,
     base,
     phoneId,
+    link,
     newIdem,
     setSession,
     store,
