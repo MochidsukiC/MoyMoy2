@@ -33,7 +33,7 @@ const NOTIFICATIONS_URL: &str = "http://127.0.0.1:7406";
 const POLL: Duration = Duration::from_secs(2);
 /// Rows drained per pass; a burst beyond this waits for the next tick.
 const BATCH: i64 = 32;
-/// Delivery failures a row survives before it is dropped.
+/// Failures a row survives before it is dropped.
 const MAX_ATTEMPTS: i64 = 5;
 /// First retry delay; doubles per failure (5s, 10s, 20s, 40s).
 const BACKOFF_BASE_MS: i64 = 5_000;
@@ -42,7 +42,7 @@ const BACKOFF_BASE_MS: i64 = 5_000;
 const APP_ID: &str = "com.mochi.moymoy";
 const ACTION_URI: &str = "mochi-internal://com.mochi.moymoy/index.html";
 
-/// One due outbox row, with everything delivery needs already resolved.
+/// One due outbox row, resolved and ready to deliver.
 struct Job {
     outbox_id: String,
     attempts: i64,
@@ -53,6 +53,17 @@ struct Job {
     amount: i64,
     /// Mochi accounts of every live linked session (deduped by the query).
     recipients: Vec<String>,
+}
+
+/// What happened to one outbox row this pass — all [`apply_outcomes`] needs.
+/// Resolve failures and delivery failures both land here (`delivered: false`),
+/// deliberately on the same path: a transient error recovers on a later
+/// attempt, a permanent one (the account row is gone) ages out at
+/// [`MAX_ATTEMPTS`], and neither can stall the rows behind it.
+struct Outcome {
+    outbox_id: String,
+    attempts: i64,
+    delivered: bool,
 }
 
 /// Spawn the delivery loop. Without a per-process identity token the loop
@@ -92,25 +103,29 @@ pub fn spawn(pool: Pool) {
 }
 
 /// One drain pass: resolve due rows (blocking hop), fan out the HTTP posts,
-/// apply the outcomes (blocking hop).
+/// apply the outcomes (blocking hop, one transaction).
 async fn pass(pool: &Pool, sender: Option<&(reqwest::Client, String)>) -> anyhow::Result<()> {
-    let jobs = {
+    let (jobs, mut outcomes) = {
         let pool = pool.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
+        tokio::task::spawn_blocking(move || {
             let conn = pool.get()?;
             fetch_due(&conn, now_ms())
         })
         .await??
     };
-    if jobs.is_empty() {
+    if jobs.is_empty() && outcomes.is_empty() {
         return Ok(());
     }
 
     let Some((client, token)) = sender else {
-        // Degrade mode: drop rather than accumulate. Debug, not warn — the
-        // disabled state was announced once at startup.
-        tracing::debug!(count = jobs.len(), "delivery disabled — discarding due notification rows");
-        let ids: Vec<String> = jobs.into_iter().map(|j| j.outbox_id).collect();
+        // Degrade mode: drop rather than accumulate — resolved or not. Debug,
+        // not warn: the disabled state was announced once at startup.
+        let ids: Vec<String> = jobs
+            .iter()
+            .map(|j| j.outbox_id.clone())
+            .chain(outcomes.iter().map(|o| o.outbox_id.clone()))
+            .collect();
+        tracing::debug!(count = ids.len(), "delivery disabled — discarding due notification rows");
         let pool = pool.clone();
         tokio::task::spawn_blocking(move || {
             let conn = pool.get()?;
@@ -120,10 +135,13 @@ async fn pass(pool: &Pool, sender: Option<&(reqwest::Client, String)>) -> anyhow
         return Ok(());
     };
 
-    let mut outcomes = Vec::with_capacity(jobs.len());
     for job in jobs {
         let delivered = deliver(client, token, &job).await;
-        outcomes.push((job, delivered));
+        outcomes.push(Outcome {
+            outbox_id: job.outbox_id,
+            attempts: job.attempts,
+            delivered,
+        });
     }
     let pool = pool.clone();
     tokio::task::spawn_blocking(move || {
@@ -134,9 +152,16 @@ async fn pass(pool: &Pool, sender: Option<&(reqwest::Client, String)>) -> anyhow
     Ok(())
 }
 
-/// The due rows, oldest first, each with its recipients and holder resolved in
-/// the same connection checkout.
-fn fetch_due(conn: &Connection, now: i64) -> anyhow::Result<Vec<Job>> {
+/// The due rows, oldest first: the ones that resolved (with recipients and
+/// holder, in the same connection checkout) and, separately, the ones that did
+/// NOT resolve — already shaped as failed [`Outcome`]s.
+///
+/// Resolution is isolated PER ROW on purpose: one row whose account read
+/// errors (vanished row, transient I/O) must not fail the pass — that would
+/// skip `apply_outcomes`, leave its `attempts` untouched, and let the head of
+/// the queue jam every row behind it for ever. Failing soft here puts the row
+/// on the same backoff-then-age-out path as a delivery failure.
+fn fetch_due(conn: &Connection, now: i64) -> anyhow::Result<(Vec<Job>, Vec<Outcome>)> {
     let rows: Vec<(String, String, String, i64, i64)> = {
         let mut stmt = conn.prepare(
             "SELECT outbox_id, account_id, label, amount, attempts \
@@ -150,18 +175,39 @@ fn fetch_due(conn: &Connection, now: i64) -> anyhow::Result<Vec<Job>> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         v
     };
-    rows.into_iter()
-        .map(|(outbox_id, account_id, label, amount, attempts)| {
-            Ok(Job {
+    let mut jobs = Vec::new();
+    let mut failed = Vec::new();
+    for (outbox_id, account_id, label, amount, attempts) in rows {
+        match resolve(conn, &account_id, now) {
+            Ok((holder, recipients)) => jobs.push(Job {
                 outbox_id,
                 attempts,
-                holder: holder_label(conn, &account_id)?,
+                holder,
                 label,
                 amount,
-                recipients: recipients(conn, &account_id, now)?,
-            })
-        })
-        .collect()
+                recipients,
+            }),
+            Err(e) => {
+                tracing::debug!(error = %e, outbox_id = %outbox_id,
+                    "outbox row failed to resolve — scheduling it like a delivery failure");
+                failed.push(Outcome {
+                    outbox_id,
+                    attempts,
+                    delivered: false,
+                });
+            }
+        }
+    }
+    Ok((jobs, failed))
+}
+
+/// Holder and recipients for one credited account — the per-row half of
+/// [`fetch_due`], separated so its `?`s stop at the row boundary.
+fn resolve(conn: &Connection, account_id: &str, now: i64) -> anyhow::Result<(String, Vec<String>)> {
+    Ok((
+        holder_label(conn, account_id)?,
+        recipients(conn, account_id, now)?,
+    ))
 }
 
 /// Every device (Mochi account) a live session of `account_id` has linked.
@@ -238,34 +284,46 @@ async fn deliver(client: &reqwest::Client, token: &str, job: &Job) -> bool {
 
 /// Delete delivered rows; back off failed ones, dropping them at
 /// [`MAX_ATTEMPTS`]. The drop is the designed end of the best-effort contract
-/// (the service is down or refusing us), not a swallowed error — hence the
-/// warning, and hence no refund-like compensation: the ledger already holds
-/// the deposit this row failed to announce.
-fn apply_outcomes(conn: &Connection, outcomes: &[(Job, bool)], now: i64) -> anyhow::Result<()> {
-    for (job, delivered) in outcomes {
-        if *delivered {
-            delete_rows(conn, std::slice::from_ref(&job.outbox_id))?;
+/// (the service is down, refusing us, or the row cannot resolve any more), not
+/// a swallowed error — hence the warning, and hence no refund-like
+/// compensation: the ledger already holds the deposit this row failed to
+/// announce.
+///
+/// The whole pass commits as ONE transaction: up to [`BATCH`] rows take the
+/// write lock once, instead of each DELETE/UPDATE opening its own implicit
+/// write transaction and elbowing the wallet's `BEGIN IMMEDIATE` up to 32
+/// times per tick.
+fn apply_outcomes(conn: &Connection, outcomes: &[Outcome], now: i64) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for o in outcomes {
+        if o.delivered {
+            tx.execute("DELETE FROM notification_outbox WHERE outbox_id = ?1", [&o.outbox_id])?;
             continue;
         }
-        let attempts = job.attempts + 1;
+        let attempts = o.attempts + 1;
         if attempts >= MAX_ATTEMPTS {
-            tracing::warn!(outbox_id = %job.outbox_id, attempts, "notification undeliverable — dropping");
-            delete_rows(conn, std::slice::from_ref(&job.outbox_id))?;
+            tracing::warn!(outbox_id = %o.outbox_id, attempts, "notification undeliverable — dropping");
+            tx.execute("DELETE FROM notification_outbox WHERE outbox_id = ?1", [&o.outbox_id])?;
         } else {
-            conn.execute(
+            tx.execute(
                 "UPDATE notification_outbox SET attempts = ?2, next_attempt_unix_ms = ?3 \
                  WHERE outbox_id = ?1",
-                rusqlite::params![job.outbox_id, attempts, now + (BACKOFF_BASE_MS << (attempts - 1))],
+                rusqlite::params![o.outbox_id, attempts, now + (BACKOFF_BASE_MS << (attempts - 1))],
             )?;
         }
     }
+    tx.commit()?;
     Ok(())
 }
 
+/// Batch delete (degrade mode) — one transaction, same locking rationale as
+/// [`apply_outcomes`].
 fn delete_rows(conn: &Connection, ids: &[String]) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
     for id in ids {
-        conn.execute("DELETE FROM notification_outbox WHERE outbox_id = ?1", [id])?;
+        tx.execute("DELETE FROM notification_outbox WHERE outbox_id = ?1", [id])?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -273,6 +331,7 @@ fn delete_rows(conn: &Connection, ids: &[String]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::db::PooledConn;
+    use rusqlite::OptionalExtension;
 
     /// A wallet with one account (`acct-a`, handle `alice`) on an in-memory DB.
     fn wallet() -> PooledConn {
@@ -309,6 +368,16 @@ mod tests {
         .unwrap();
     }
 
+    fn attempts_of(conn: &Connection, id: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT attempts FROM notification_outbox WHERE outbox_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
     #[test]
     fn recipients_are_live_linked_sessions_deduped_by_device() {
         let conn = wallet();
@@ -330,7 +399,8 @@ mod tests {
         queue(&conn, "o-early", 1, NOW); // due, older
         queue(&conn, "o-backoff", 0, NOW + 1); // not due yet
 
-        let jobs = fetch_due(&conn, NOW).unwrap();
+        let (jobs, failed) = fetch_due(&conn, NOW).unwrap();
+        assert!(failed.is_empty());
         assert_eq!(
             jobs.iter().map(|j| j.outbox_id.as_str()).collect::<Vec<_>>(),
             vec!["o-early", "o-later"]
@@ -340,22 +410,77 @@ mod tests {
         assert_eq!((jobs[0].label.as_str(), jobs[0].amount), ("Bob から受取", 40));
     }
 
+    /// M1: a row whose account row is gone resolves to a soft failure that ages
+    /// out on the normal backoff path — it must not error the pass, and it must
+    /// not stall the healthy rows behind it.
+    #[test]
+    fn a_row_whose_account_vanished_fails_soft_and_ages_out_without_stalling_the_queue() {
+        let conn = wallet();
+        const NOW: i64 = 1_000;
+        session(&conn, "s1", Some("m-1"), NOW + 1);
+        // Manufacture the orphan the FK would normally prevent — the case this
+        // guards is a defensive one (nothing deletes accounts today).
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO notification_outbox \
+               (outbox_id, account_id, kind, label, amount, created_unix_ms) \
+             VALUES ('o-ghost', 'acct-ghost', 'receive', 'x', 1, 1)",
+            [],
+        )
+        .unwrap();
+        queue(&conn, "o-ok", 2, 0);
+
+        let (jobs, failed) = fetch_due(&conn, NOW).unwrap();
+        // The healthy, younger row still resolves and would deliver…
+        assert_eq!(
+            jobs.iter().map(|j| j.outbox_id.as_str()).collect::<Vec<_>>(),
+            vec!["o-ok"]
+        );
+        // …while the orphan is shaped exactly like a delivery failure.
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            (failed[0].outbox_id.as_str(), failed[0].delivered),
+            ("o-ghost", false)
+        );
+
+        // Driven round the same backoff path, it consumes attempts and drains.
+        let mut attempts = failed[0].attempts;
+        let mut rounds = 0;
+        loop {
+            apply_outcomes(
+                &conn,
+                &[Outcome {
+                    outbox_id: "o-ghost".into(),
+                    attempts,
+                    delivered: false,
+                }],
+                NOW,
+            )
+            .unwrap();
+            match attempts_of(&conn, "o-ghost") {
+                Some(a) => attempts = a,
+                None => break,
+            }
+            rounds += 1;
+            assert!(rounds <= MAX_ATTEMPTS, "the orphan never drained");
+        }
+        // The healthy row was never touched by any of it.
+        assert_eq!(attempts_of(&conn, "o-ok"), Some(0));
+    }
+
     #[test]
     fn a_failure_backs_off_and_the_last_one_drops_the_row() {
         let conn = wallet();
         const NOW: i64 = 1_000;
         queue(&conn, "o-1", 1, 0);
-        let job = |attempts| Job {
+        let outcome = |attempts| Outcome {
             outbox_id: "o-1".into(),
             attempts,
-            holder: "@alice".into(),
-            label: "x".into(),
-            amount: 1,
-            recipients: vec!["m-1".into()],
+            delivered: false,
         };
 
         // First failure: still present, pushed into the future.
-        apply_outcomes(&conn, &[(job(0), false)], NOW).unwrap();
+        apply_outcomes(&conn, &[outcome(0)], NOW).unwrap();
         let (attempts, due): (i64, i64) = conn
             .query_row(
                 "SELECT attempts, next_attempt_unix_ms FROM notification_outbox WHERE outbox_id = 'o-1'",
@@ -367,29 +492,24 @@ mod tests {
         assert_eq!(due, NOW + BACKOFF_BASE_MS);
 
         // Final failure: the row is gone (the ledger, not the outbox, is the record).
-        apply_outcomes(&conn, &[(job(MAX_ATTEMPTS - 1), false)], NOW).unwrap();
-        let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM notification_outbox", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(left, 0);
+        apply_outcomes(&conn, &[outcome(MAX_ATTEMPTS - 1)], NOW).unwrap();
+        assert_eq!(attempts_of(&conn, "o-1"), None);
     }
 
     #[test]
     fn a_delivered_row_is_deleted() {
         let conn = wallet();
         queue(&conn, "o-1", 1, 0);
-        let job = Job {
-            outbox_id: "o-1".into(),
-            attempts: 0,
-            holder: "@alice".into(),
-            label: "x".into(),
-            amount: 1,
-            recipients: vec!["m-1".into()],
-        };
-        apply_outcomes(&conn, &[(job, true)], 1_000).unwrap();
-        let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM notification_outbox", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(left, 0);
+        apply_outcomes(
+            &conn,
+            &[Outcome {
+                outbox_id: "o-1".into(),
+                attempts: 0,
+                delivered: true,
+            }],
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(attempts_of(&conn, "o-1"), None);
     }
 }
