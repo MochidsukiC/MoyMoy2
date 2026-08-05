@@ -32,6 +32,7 @@
 //!   POST /wallet/charge   {idem_key, amount, assertion?}           (auth)
 //!   POST /wallet/withdraw {idem_key, amount, assertion?, pin?}     (auth)
 //!   GET  /wallet/op?op_id=                                         (auth)
+//!   POST /wallet/link    {mochi_account_id}                        (auth — deposit-notification device link)
 //!   POST /wallet/stepup/otp                                        (auth)
 //!   GET  /wallet/payment/intent?intent_id=                         (auth)
 //!   POST /wallet/payment/approve {intent_id, pin}                  (auth)
@@ -141,6 +142,8 @@ pub fn router(state: AppState) -> Router {
         .route("/wallet/charge", post(charge))
         .route("/wallet/withdraw", post(withdraw))
         .route("/wallet/op", get(op_status))
+        // Where this session's deposit notifications go (crate::notify).
+        .route("/wallet/link", post(link))
         // The second factor for the movements riskauth escalates.
         .route("/wallet/stepup/otp", post(stepup_otp))
         // EC payment, payer side. The approval screen's only source of truth.
@@ -1422,6 +1425,42 @@ async fn dev_credit(
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+// ── deposit-notification device link ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LinkReq {
+    mochi_account_id: String,
+}
+
+/// Register the Mochi account (the device's owner, from `phoneState.get().owner`)
+/// that THIS session's deposit notifications go to.
+///
+/// Self-asserted by design — the same trust model as mail's `/mail/link`
+/// (APNs-style device registration): the value only directs where this
+/// account's own notifications are sent, moves no money, and is never read for
+/// authorization. It lives on the session row, so logout / expiry unlink it
+/// with the session and there is no unlink endpoint to keep in sync.
+async fn link(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<LinkReq>,
+) -> Result<Json<Value>, ApiError> {
+    // Canonicalize (lowercase hyphenated) so recipients' DISTINCT dedupe cannot
+    // be split by case or formatting of the same UUID.
+    let Some(mochi) = identity::normalize_uuid(&req.mochi_account_id) else {
+        return Ok(Json(json!({ "ok": false, "error": "bad_account_id" })));
+    };
+    let value = blocking(st.pool, move |conn| {
+        conn.execute(
+            "UPDATE moymoy_sessions SET mochi_account_id = ?1 WHERE token_hash = ?2",
+            rusqlite::params![mochi, acct.session_key],
+        )?;
+        Ok::<Value, ApiError>(json!({ "ok": true }))
+    })
+    .await?;
+    Ok(Json(value))
+}
 
 /// Run a blocking DB closure on the blocking pool, mapping pool/join failures to
 /// `ApiError`.

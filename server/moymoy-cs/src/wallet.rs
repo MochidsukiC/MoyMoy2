@@ -260,18 +260,20 @@ pub fn transfer(
         sender_after,
         now,
     )?;
+    let receive_label = format!("{sender_display} から受取");
     insert_txn(
         tx,
         &Uuid::new_v4().to_string(),
         to_id,
         "receive",
-        &format!("{sender_display} から受取"),
+        &receive_label,
         Some(from_id),
         Some(&sender_display),
         amount,
         receiver_after,
         now,
     )?;
+    queue_deposit_notification(tx, to_id, "receive", &receive_label, amount, now)?;
 
     // The caller commits (after recording idempotency) so the whole unit is atomic.
     Ok(TxResult::Ok {
@@ -353,7 +355,43 @@ fn credit(
         after,
         now,
     )?;
+    queue_deposit_notification(tx, account_id, kind, label, amount, now)?;
     Ok(after)
+}
+
+/// Queue a deposit notification for `account_id`, inside the same transaction
+/// that credits it.
+///
+/// Every balance increase flows through [`transfer`]'s receiver side or
+/// [`credit`], so these two call sites are the single choke point: a
+/// notification row exists exactly when its credit committed, never otherwise
+/// (a rolled-back operation leaves nothing to deliver). That property — not the
+/// table itself — is why this lives here and not in the HTTP handlers, several
+/// of which never see a deposit (charge settles and withdraw refunds land on
+/// background settlers, and the admin refund runs in a separate CLI process).
+/// Delivery, device links and retry policy are all [`crate::notify`]'s problem.
+fn queue_deposit_notification(
+    conn: &Connection,
+    account_id: &str,
+    kind: &str,
+    label: &str,
+    amount: i64,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO notification_outbox \
+           (outbox_id, account_id, kind, label, amount, created_unix_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            Uuid::new_v4().to_string(),
+            account_id,
+            kind,
+            label,
+            amount,
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 /// Debit `amount` エメ for a withdrawal, inside the caller's transaction —
@@ -672,5 +710,96 @@ mod tests {
         // Both rows are in the withdraw filter, and neither leaks into charge.
         assert_eq!(history(&conn, "acct-a", 50, "withdraw").unwrap().len(), 2);
         assert!(history(&conn, "acct-a", 50, "charge").unwrap().is_empty());
+    }
+
+    /// Every outbox row as `(account_id, kind, label, amount)`, oldest first.
+    fn outbox(conn: &Connection) -> Vec<(String, String, String, i64)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT account_id, kind, label, amount FROM notification_outbox \
+                 ORDER BY rowid ASC",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_transfer_queues_one_notification_for_the_receiver_only() {
+        let mut conn = account_with(100);
+        conn.execute(
+            "INSERT INTO accounts (account_id, handle, handle_lower, display_name, balance, \
+               created_unix_ms, updated_unix_ms) \
+             VALUES ('acct-b', 'bob', 'bob', 'Bob', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let r = transfer(&tx, "acct-a", "acct-b", 40, "send", "@bob へ送金").unwrap();
+        assert!(matches!(r, TxResult::Ok { .. }), "{r:?}");
+        tx.commit().unwrap();
+
+        // One row, for the credited side, carrying the receiver-facing label —
+        // the debited sender gets nothing (a deposit notice, not an activity log).
+        let queued = outbox(&conn);
+        assert_eq!(queued.len(), 1);
+        let (account_id, kind, label, amount) = &queued[0];
+        assert_eq!((account_id.as_str(), kind.as_str(), *amount), ("acct-b", "receive", 40));
+        let receiver_label: String = conn
+            .query_row(
+                "SELECT label FROM transactions WHERE account_id = 'acct-b' AND kind = 'receive'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(label, &receiver_label);
+    }
+
+    #[test]
+    fn a_credit_queues_one_notification_with_its_kind_and_label() {
+        let mut conn = account_with(0);
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        credit_charge(&tx, "acct-a", 27, 1_000, "インベントリのエメラルド").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            outbox(&conn),
+            vec![(
+                "acct-a".to_string(),
+                "charge".to_string(),
+                "インベントリのエメラルド".to_string(),
+                27
+            )]
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_credit_leaves_no_notification_behind() {
+        // The property the outbox exists for: no commit, no notification. A
+        // delivery loop that ran right now must find nothing to say.
+        let mut conn = account_with(0);
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        credit_charge(&tx, "acct-a", 27, 1_000, "インベントリのエメラルド").unwrap();
+        drop(tx); // rollback
+        assert!(outbox(&conn).is_empty());
+        assert_eq!(balance_of(&conn), 0);
+    }
+
+    #[test]
+    fn a_withdraw_reserve_is_a_debit_and_queues_nothing() {
+        let mut conn = account_with(100);
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        reserve_withdraw(&tx, "acct-a", 40, 1_000, "エメラルドで受け取り").unwrap();
+        tx.commit().unwrap();
+        assert!(outbox(&conn).is_empty());
     }
 }

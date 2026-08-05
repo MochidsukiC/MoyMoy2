@@ -20,6 +20,7 @@ mod error;
 mod identity;
 mod mc;
 mod merchant;
+mod notify;
 mod otp;
 mod payments;
 mod riskauth;
@@ -137,6 +138,11 @@ async fn main() -> anyhow::Result<()> {
     // process has its own identity token; otherwise the wallet degrades to
     // handle+PIN.
     let mailer = otp::Mailer::from_env();
+
+    // Deposit notifications: drain the transactional outbox (wallet.rs writes
+    // it inside each crediting transaction) to the OS notifications service.
+    // Best-effort by design; without an identity token rows are discarded.
+    notify::spawn(pool.clone());
 
     let state = AppState {
         pool: pool.clone(),

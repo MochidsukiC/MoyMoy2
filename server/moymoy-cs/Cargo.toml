@@ -87,6 +87,13 @@ mochi-proto-attest = { path = "../../../MochiOS2.0/protocols/attest", features =
 # identity ⇒ email features degrade off.
 mochi-hub-mailer = { path = "../../../MochiOS2.0/hub/mailer" }
 
+# Deposit-notification delivery (src/notify.rs): loopback HTTP POST to the
+# MochiOS notifications service, bearer = this process's identity token. Version
+# and features pinned to MochiOS2.0's workspace reqwest (which mochi-hub-mailer
+# already pulls transitively) so the dependency tree does not grow. No TLS
+# features on purpose: the destination is plain-HTTP loopback only.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
 [dev-dependencies]
 # `dev-signer` mints a VALID assertion from a fixed seed, so the accept path — the
 # one that decides whether a charge goes through — is testable without running a

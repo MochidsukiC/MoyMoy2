@@ -34,8 +34,12 @@ const SCHEMA_V5: &str = include_str!("schema_v5.sql");
 /// The v6 delta: merchants gain an owner, an API credential, a status and a
 /// confusable-skeleton name claim; `payment_intents` carries EC payments.
 const SCHEMA_V6: &str = include_str!("schema_v6.sql");
+/// The v7 delta: deposit notifications — a per-session device link
+/// (`moymoy_sessions.mochi_account_id`) and the transactional
+/// `notification_outbox` wallet.rs writes inside each crediting transaction.
+const SCHEMA_V7: &str = include_str!("schema_v7.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -144,8 +148,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 6;
         tracing::info!("sqlite migrated to schema v6 (self-serve merchants + payment intents)");
     }
-    // Future: `if version < 7 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V7)?;
-    //          tx.pragma_update(None, "user_version", 7)?; tx.commit()?; version = 7; }`
+    if version < 7 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V7)?;
+        tx.pragma_update(None, "user_version", 7)?;
+        tx.commit()?;
+        version = 7;
+        tracing::info!("sqlite migrated to schema v7 (deposit notifications: device links + outbox)");
+    }
+    // Future: `if version < 8 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V8)?;
+    //          tx.pragma_update(None, "user_version", 8)?; tx.commit()?; version = 8; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }
@@ -397,6 +409,49 @@ mod tests {
             })
             .unwrap();
         assert_eq!(listed, 0);
+    }
+
+    /// v7 must give existing sessions a NULL device link (no device suddenly
+    /// starts receiving notifications it never registered for) and an outbox
+    /// whose retry columns default to "due now, never tried".
+    #[test]
+    fn migration_v7_adds_a_null_device_link_and_a_due_now_outbox() {
+        let mut conn = v4_db();
+        insert_account(&conn, "acct-a");
+
+        migrate(&mut conn).expect("v4 → current");
+
+        conn.execute(
+            "INSERT INTO moymoy_sessions \
+               (session_id, account_id, token_hash, created_unix_ms, last_seen_unix_ms, expires_unix_ms) \
+             VALUES ('s1', 'acct-a', 'th-1', 0, 0, 9)",
+            [],
+        )
+        .expect("pre-v7-shaped session insert still works");
+        let link: Option<String> = conn
+            .query_row(
+                "SELECT mochi_account_id FROM moymoy_sessions WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(link, None);
+
+        conn.execute(
+            "INSERT INTO notification_outbox \
+               (outbox_id, account_id, kind, label, amount, created_unix_ms) \
+             VALUES ('o1', 'acct-a', 'receive', 'テスト から受取', 5, 1)",
+            [],
+        )
+        .expect("outbox insert with defaulted retry columns");
+        let (attempts, due): (i64, i64) = conn
+            .query_row(
+                "SELECT attempts, next_attempt_unix_ms FROM notification_outbox WHERE outbox_id = 'o1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((attempts, due), (0, 0));
     }
 
     #[test]
