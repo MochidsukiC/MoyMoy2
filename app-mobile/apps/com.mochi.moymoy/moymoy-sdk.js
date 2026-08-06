@@ -467,6 +467,11 @@
         max_open_intents: limits ? limits.max_open_intents : undefined,
         daily_issue_cap: limits ? limits.daily_issue_cap : undefined,
       }),
+    // Sales + escrow status. Read-only, session-only (no PIN) — same trust
+    // level as merchantList. `limit` is optional; the server clamps it
+    // (default 50 / max 200) and echoes the effective value back.
+    merchantSales: (merchantId, limit) =>
+      getJson("/merchant/portal/sales", { merchant_id: merchantId, limit }),
 
     // ── OS launch intent ──
     // Consume the payload another app launched us with. Single-use: a second call

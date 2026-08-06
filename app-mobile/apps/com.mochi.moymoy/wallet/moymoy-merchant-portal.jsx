@@ -1,4 +1,4 @@
-/* global React, CrystalIcon, EmeGem, formatEme, MoyMoy, MoyPinStep, errLabelFor, msState, msEffect, msRef, fieldStyle, ctaStyle */
+/* global React, CrystalIcon, EmeGem, formatEme, formatCount, MoyMoy, MoyPinStep, errLabelFor, msState, msEffect, msRef, fieldStyle, ctaStyle */
 /* =====================================================================
    MoyMoy — 加盟店管理 (設定内)
 
@@ -36,6 +36,111 @@ function moyDateLabel(ts) {
     d.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
 }
 
+/* ─── 売上 (エスクロー状況) ────────────────────────────────────────
+   決済モデルが「承認と同時に送金」から「エスクローで保留 → 履行報告 →
+   10分ゲート後に送金」に変わったことで、加盟店オーナーに新しい問い
+   （「買い手は払ったのに残高が増えていない、金はどこにあるのか」）が
+   生まれた。この一群はそれに答えるためのもの。 */
+
+/* stage === "none" はエスクロー対象外（未決済扱いの決済 / エスクロー導入前の
+   決済）で、どちらも正常。ここに異常のバッジを出すと、既存の正常な決済まで
+   壊れて見える。だからラベルを持たせず、バッジ自体を描かない。 */
+const ESCROW_STAGE = {
+  held:      { label: "入金保留中",          border: "var(--carle-red)", bg: "rgba(227,38,54,0.08)", color: "var(--carle-red)" },
+  fulfilled: { label: "報告済み・送金待ち",  border: "var(--ink)",       bg: "rgba(0,0,0,0.05)",     color: "var(--ink)" },
+  released:  { label: "入金済み",            border: "var(--moy-deep)",  bg: "var(--moy-mint)",      color: "var(--moy-deep)" },
+};
+function EscrowStageBadge({ stage }) {
+  const s = ESCROW_STAGE[stage];
+  if (!s) return null;
+  return (
+    <span style={{ border: "1.5px solid " + s.border, background: s.bg, color: s.color,
+      padding: "1px 6px", fontFamily: "var(--font-jp)", fontSize: 10, fontWeight: 700,
+      whiteSpace: "nowrap" }}>{s.label}</span>
+  );
+}
+
+/* 1件の売上行。金額はすべて minor — formatEme を必ず経由する。 */
+function SalesRow({ sale, last }) {
+  const escrow = sale.escrow || { stage: "none" };
+  // 部分履行（一部だけ届けられず差額が返金された）かどうかは、返金額の
+  // 有無で判定する。fulfilled_amount_minor だけでは「満額履行」と区別できない。
+  const partial = (escrow.refunded_amount_minor || 0) > 0;
+  return (
+    <div style={{ padding: "12px 14px", background: "var(--bg-white)",
+      borderBottom: last ? "none" : "1px solid rgba(0,0,0,0.08)" }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 700, color: "var(--ink)",
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {sale.description || "（内容の記載なし）"}
+          </div>
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)", marginTop: 2 }}>
+            {moyDateLabel(sale.created_unix_ms)}
+          </div>
+        </div>
+        <div style={{ textAlign: "right", flexShrink: 0 }}>
+          <div style={{ fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: 15, color: "var(--ink)" }}>
+            {formatEme(sale.amount_minor)} エメ
+          </div>
+          <div style={{ marginTop: 4 }}><EscrowStageBadge stage={escrow.stage} /></div>
+        </div>
+      </div>
+
+      {escrow.stage === "held" && (
+        <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.6 }}>
+          買い手はすでに支払い済みです。お店の側で履行を報告すると、
+          {escrow.release_due_unix_ms ? moyDateLabel(escrow.release_due_unix_ms) + " 以降に" : "しばらくして"}
+          この口座へ入金されます。
+        </div>
+      )}
+      {escrow.stage === "fulfilled" && escrow.release_due_unix_ms && (
+        <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.6 }}>
+          履行の報告は受け付けています。{moyDateLabel(escrow.release_due_unix_ms)} 以降に入金されます。
+        </div>
+      )}
+      {escrow.stage === "released" && escrow.released_unix_ms && (
+        <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)" }}>
+          {moyDateLabel(escrow.released_unix_ms)} に入金済みです。
+        </div>
+      )}
+
+      {partial && (
+        <div style={{ marginTop: 8, padding: "8px 10px", border: "1px dashed rgba(0,0,0,0.28)",
+          fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink)", lineHeight: 1.7 }}>
+          一部のみ履行されました。差額は買い手へ返金されています。
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+            <span>入金される額</span>
+            <span style={{ fontWeight: 700 }}>{formatEme(escrow.fulfilled_amount_minor)} エメ</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <span>返金額</span>
+            <span style={{ fontWeight: 700 }}>{formatEme(escrow.refunded_amount_minor)} エメ</span>
+          </div>
+          {escrow.fulfil_reason && (
+            <div style={{ marginTop: 4, color: "var(--ink-soft)" }}>理由: {escrow.fulfil_reason}</div>
+          )}
+        </div>
+      )}
+
+      {sale.refunded && (
+        <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, fontWeight: 700, color: "var(--carle-red)" }}>
+          この決済は取り消され、買い手へ返金されています
+        </div>
+      )}
+
+      {/* payer_ref はソルト付きの擬似 ID。買い手を特定できる情報ではないので、
+          そう読めるラベルは付けない — 問い合わせの突き合わせ用の技術参照値として
+          小さく添えるだけ。 */}
+      {sale.payer_ref && (
+        <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--ink-soft)", opacity: 0.7 }}>
+          支払い参照（匿名化） {sale.payer_ref}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* 発行直後の 1 回だけ見せる API キー。DB にはハッシュしか無いので、この画面を
    閉じたら本当に二度と出せない。それを画面上で明言する。 */
 function MoyApiKeyReveal({ apiKey, onClose }) {
@@ -71,7 +176,7 @@ function MerchantPortal({ open, onClose }) {
   const [list, setList] = msState([]);
   const [loading, setLoading] = msState(true);
   const [loadErr, setLoadErr] = msState(null);
-  const [view, setView] = msState("list");   // list | register | detail
+  const [view, setView] = msState("list");   // list | register | detail | sales
   const [selected, setSelected] = msState(null); // merchant_id
   const [revealed, setRevealed] = msState(null); // 一度だけ見せる平文キー
   const [ask, setAsk] = msState(null);       // {title, sub, cta, run(pin)}
@@ -80,6 +185,10 @@ function MerchantPortal({ open, onClose }) {
   const [err, setErr] = msState(null);
   const [form, setForm] = msState({ name: "", sub: "" });
   const [limits, setLimits] = msState({ max_open_intents: "", daily_issue_cap: "" });
+  // 売上 (エスクロー状況)。/merchant/portal/sales の応答をそのまま持つ
+  // ({ok:true, ...} または {ok:false, error}) — 未取得なら null。
+  const [sales, setSales] = msState(null);
+  const [salesLoading, setSalesLoading] = msState(false);
   const aliveRef = msRef(true);
 
   async function reload() {
@@ -99,9 +208,30 @@ function MerchantPortal({ open, onClose }) {
     if (!open) return;
     aliveRef.current = true;
     setLoading(true); setView("list"); setErr(null); setRevealed(null); setAsk(null);
+    setSales(null); setSalesLoading(false);
     reload();
     return () => { aliveRef.current = false; };
   }, [open]);
+
+  // 売上タブを開いたとき（または別の加盟店に切り替えたとき）に読み直す。
+  // list/register/detail では叩かない — 見てもいない画面のために毎回
+  // 往復させない。
+  msEffect(() => {
+    if (view !== "sales" || !selected) return;
+    let alive = true;
+    (async () => {
+      setSalesLoading(true); setSales(null);
+      try {
+        const r = await MoyMoy.merchantSales(selected);
+        if (alive) setSales(r);
+      } catch (e) {
+        console.warn("MoyMoy: merchant sales load failed", e);
+        if (alive) setSales({ ok: false, error: "network" });
+      }
+      if (alive) setSalesLoading(false);
+    })();
+    return () => { alive = false; };
+  }, [view, selected]);
 
   if (!open) return null;
 
@@ -202,13 +332,15 @@ function MerchantPortal({ open, onClose }) {
             <button
               onClick={() => {
                 if (view === "list") { onClose(); return; }
+                // 売上はある加盟店の詳細のサブ画面なので、一覧ではなく詳細へ戻る。
+                if (view === "sales") { setView("detail"); setErr(null); return; }
                 setView("list"); setErr(null); setRevealed(null);
               }}
               style={{ background: "transparent", border: "none", cursor: "pointer", color: "#fff",
               fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 700, letterSpacing: "0.16em",
               display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M15 18l-6-6 6-6" /></svg>
-              {view === "list" ? "閉じる" : "一覧へ"}
+              {view === "list" ? "閉じる" : view === "sales" ? "詳細へ" : "一覧へ"}
             </button>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <EmeGem size={24} />
@@ -336,6 +468,13 @@ function MerchantPortal({ open, onClose }) {
                 <MoyApiKeyReveal apiKey={revealed.api_key} onClose={() => setRevealed(null)} />
               )}
 
+              <button onClick={() => { setErr(null); setView("sales"); }} style={{ width: "100%", marginTop: 16,
+                padding: "14px", border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)",
+                cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15,
+                color: "var(--moy-deep)", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <EmeGem size={18} /> 売上を見る（保留中の入金を確認）
+              </button>
+
               <div style={{ marginTop: 16, border: "1.5px solid var(--ink)", padding: "12px 14px",
                 fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)" }}>
                 {[
@@ -428,6 +567,84 @@ function MerchantPortal({ open, onClose }) {
             <div style={{ padding: "30px 0", textAlign: "center", fontFamily: "var(--font-jp)",
               fontSize: 13, color: "var(--ink-soft)" }}>加盟店が見つかりません</div>
           )}
+
+          {view === "sales" && current && (
+            <>
+              <div style={{ fontFamily: "var(--font-jp)", fontSize: 18, fontWeight: 800, color: "var(--ink)" }}>
+                {current.name} の売上
+              </div>
+
+              {salesLoading && (
+                <div style={{ padding: "40px 0", textAlign: "center", fontFamily: "var(--font-jp)",
+                  fontSize: 13, color: "var(--ink-soft)" }}>読み込み中…</div>
+              )}
+
+              {!salesLoading && sales && !sales.ok && (
+                <div style={{ padding: "20px 0", textAlign: "center", fontFamily: "var(--font-jp)",
+                  fontSize: 13, fontWeight: 700, color: "var(--carle-red)", lineHeight: 1.7 }}>
+                  {errLabelFor({ code: sales.error })}
+                </div>
+              )}
+
+              {!salesLoading && sales && sales.ok && (
+                <>
+                  {/* 「買い手は払ったのに残高が増えていない」への答え。この画面で
+                      いちばん目立たせるべき数字。 */}
+                  <div style={{ marginTop: 14, border: "1.5px solid " + (sales.held_count > 0 ? "var(--carle-red)" : "var(--ink)"),
+                    background: sales.held_count > 0 ? "rgba(227,38,54,0.06)" : "var(--bg-white)",
+                    padding: "14px" }}>
+                    <div className="eyebrow" style={{ color: sales.held_count > 0 ? "var(--carle-red)" : "var(--moy-deep)" }}>
+                      保留中（エスクロー中）の売上
+                    </div>
+                    <div style={{ marginTop: 4, fontFamily: "var(--font-mono)", fontWeight: 800, fontSize: 26,
+                      color: sales.held_count > 0 ? "var(--carle-red)" : "var(--ink)" }}>
+                      {formatEme(sales.held_total_minor)} エメ
+                    </div>
+                    <div style={{ marginTop: 2, fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)" }}>
+                      {sales.held_count > 0
+                        ? formatCount(sales.held_count) + " 件が買い手から支払い済みで、まだこの口座には入金されていません。"
+                        : "現在、保留中の売上はありません。"}
+                    </div>
+                  </div>
+
+                  {/* 履行の報告はポータルからはできない（現状は加盟店 API キー経由）。
+                      ボタンを置かない代わりに、ここで理由を明示しておく — でないと
+                      「何もできない画面」に見える。 */}
+                  <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11,
+                    color: "var(--ink-soft)", lineHeight: 1.7 }}>
+                    履行の報告は、このアプリではなくお店の連携（API キー）側から行います。
+                    報告後、10分ほどでこの口座へ入金されます。
+                  </div>
+
+                  {sales.truncated && (
+                    <div style={{ marginTop: 14, padding: "9px 12px", border: "1.5px solid var(--ink)",
+                      background: "rgba(0,0,0,0.04)", fontFamily: "var(--font-jp)", fontSize: 11,
+                      fontWeight: 700, color: "var(--ink)", lineHeight: 1.6 }}>
+                      直近 {formatCount(sales.limit)} 件のみ表示しています。これは全件ではありません。
+                    </div>
+                  )}
+
+                  <div style={{ marginTop: 20 }}>
+                    <div className="h-section">取引一覧</div>
+                  </div>
+                  <div style={{ marginTop: 10, border: "1.5px solid var(--ink)" }}>
+                    {(sales.sales || []).map((s, i) => (
+                      <SalesRow key={s.intent_id} sale={s} last={i === sales.sales.length - 1} />
+                    ))}
+                    {(!sales.sales || sales.sales.length === 0) && (
+                      <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",
+                        fontSize: 13, color: "var(--ink-soft)" }}>まだ売上がありません</div>
+                    )}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {view === "sales" && !current && (
+            <div style={{ padding: "30px 0", textAlign: "center", fontFamily: "var(--font-jp)",
+              fontSize: 13, color: "var(--ink-soft)" }}>加盟店が見つかりません</div>
+          )}
         </div>
       </div>
 
@@ -441,4 +658,4 @@ function MerchantPortal({ open, onClose }) {
   );
 }
 
-Object.assign(window, { MerchantPortal, MoyApiKeyReveal, moyDateLabel });
+Object.assign(window, { MerchantPortal, MoyApiKeyReveal, moyDateLabel, EscrowStageBadge, SalesRow });
