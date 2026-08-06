@@ -44,11 +44,18 @@ function moyDateLabel(ts) {
 
 /* stage === "none" はエスクロー対象外（未決済扱いの決済 / エスクロー導入前の
    決済）で、どちらも正常。ここに異常のバッジを出すと、既存の正常な決済まで
-   壊れて見える。だからラベルを持たせず、バッジ自体を描かない。 */
+   壊れて見える。だからラベルを持たせず、バッジ自体を描かない。
+
+   held と parked は違う状態。held は「支払い済み・履行待ち」で正常な進行中、
+   parked は「6時間の自動報告期限を過ぎ、自動返金もされず、人の判断待ちで
+   止まっている」— 加盟店が能動的に確認すべき状態。held の薄い網掛けに対し、
+   parked は carle-red の塗りつぶしにして、一見して別物と分かるようにする
+   （held より強い表示にする、という要求への対応）。 */
 const ESCROW_STAGE = {
-  held:      { label: "入金保留中",          border: "var(--carle-red)", bg: "rgba(227,38,54,0.08)", color: "var(--carle-red)" },
-  fulfilled: { label: "報告済み・送金待ち",  border: "var(--ink)",       bg: "rgba(0,0,0,0.05)",     color: "var(--ink)" },
-  released:  { label: "入金済み",            border: "var(--moy-deep)",  bg: "var(--moy-mint)",      color: "var(--moy-deep)" },
+  held:      { label: "入金保留中",            border: "var(--carle-red)", bg: "rgba(227,38,54,0.08)", color: "var(--carle-red)" },
+  parked:    { label: "入金停止中（要確認）",  border: "var(--carle-red)", bg: "var(--carle-red)",     color: "#fff" },
+  fulfilled: { label: "報告済み・送金待ち",    border: "var(--ink)",       bg: "rgba(0,0,0,0.05)",     color: "var(--ink)" },
+  released:  { label: "入金済み",              border: "var(--moy-deep)",  bg: "var(--moy-mint)",      color: "var(--moy-deep)" },
 };
 function EscrowStageBadge({ stage }) {
   const s = ESCROW_STAGE[stage];
@@ -92,6 +99,27 @@ function SalesRow({ sale, last }) {
           買い手はすでに支払い済みです。お店の側で履行を報告すると、
           {escrow.release_due_unix_ms ? moyDateLabel(escrow.release_due_unix_ms) + " 以降に" : "しばらくして"}
           この口座へ入金されます。
+        </div>
+      )}
+      {/* parked: 6時間の報告期限を過ぎても履行報告が無く、かつ（旧仕様と違い）
+          自動返金もされずに止まっている状態。ここに書けるのは事実だけ:
+          代金は消えていないこと、自動では動かないこと、いま報告しても
+          not_held で弾かれる（すでに held の段階を過ぎている）ため無意味な
+          ことだけ。「報告すれば入金される」も「払い出される」も断言しない
+          — 払い出し経路が実在しないため、そう読める文言を書かない。 */}
+      {escrow.stage === "parked" && (
+        <div style={{ marginTop: 8, padding: "8px 10px", border: "1.5px solid var(--carle-red)",
+          background: "rgba(227,38,54,0.06)", fontFamily: "var(--font-jp)", fontSize: 11,
+          color: "var(--ink)", lineHeight: 1.7 }}>
+          {escrow.parked_unix_ms && (
+            <div style={{ fontWeight: 700, color: "var(--carle-red)" }}>
+              {moyDateLabel(escrow.parked_unix_ms)} から、保留のまま止まっています。
+            </div>
+          )}
+          代金は買い手から引き落とされ、MoyMoy が保持しています（消えたわけではありません）。
+          期限内に履行の報告が届かなかったため、入金は自動では進みません。この注文は
+          すでに保留の段階を過ぎており、いま履行を報告しても受け付けられません。
+          MoyMoy 側での確認が必要です。
         </div>
       )}
       {escrow.stage === "fulfilled" && escrow.release_due_unix_ms && (
@@ -605,6 +633,16 @@ function MerchantPortal({ open, onClose }) {
                         ? formatCount(sales.held_count) + " 件が買い手から支払い済みで、まだこの口座には入金されていません。"
                         : "現在、保留中の売上はありません。"}
                     </div>
+                    {/* この合計には parked（保留のまま停止）も含まれる — 金は
+                        実際にエスクローにあるため。合計だけでは「全部いつもどおり
+                        待っているだけ」に見えてしまうので、一部が停止しているなら
+                        ここで明示して一覧の該当行へ注意を向ける。 */}
+                    {(sales.sales || []).some((s) => s.escrow && s.escrow.stage === "parked") && (
+                      <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
+                        color: "var(--carle-red)" }}>
+                        このうち一部は保留のまま停止しています。下の一覧で「入金停止中（要確認）」の行をご確認ください。
+                      </div>
+                    )}
                   </div>
 
                   {/* 履行の報告はポータルからはできない（現状は加盟店 API キー経由）。
