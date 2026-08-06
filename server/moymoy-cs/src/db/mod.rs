@@ -42,8 +42,13 @@ const SCHEMA_V7: &str = include_str!("schema_v7.sql");
 /// (1/100 エメ) — a pure ×100 rescale, including the amounts frozen inside
 /// `idempotency.response_json` (rewritten in place, never deleted).
 const SCHEMA_V8: &str = include_str!("schema_v8.sql");
+/// The v9 delta: merchant revenue is held in a MoyMoy escrow account between
+/// approval and a merchant-reported fulfilment, so there is always something to
+/// refund from. Adds the escrow lifecycle columns to `payment_intents`, and
+/// closes every pre-v9 `paid` row so the release sweep cannot pay it again.
+const SCHEMA_V9: &str = include_str!("schema_v9.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -168,8 +173,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 8;
         tracing::info!("sqlite migrated to schema v8 (amounts in minor units, 1/100 エメ)");
     }
-    // Future: `if version < 9 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V9)?;
-    //          tx.pragma_update(None, "user_version", 9)?; tx.commit()?; version = 9; }`
+    if version < 9 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V9)?;
+        tx.pragma_update(None, "user_version", 9)?;
+        tx.commit()?;
+        version = 9;
+        tracing::info!("sqlite migrated to schema v9 (merchant revenue held in escrow)");
+    }
+    // Future: `if version < 10 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V10)?;
+    //          tx.pragma_update(None, "user_version", 10)?; tx.commit()?; version = 10; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }
@@ -286,6 +299,15 @@ mod tests {
             conn.execute_batch(sql).expect("schema step applies");
             conn.pragma_update(None, "user_version", v).unwrap();
         }
+        conn
+    }
+
+    /// A connection at exactly schema v8 — a wallet that has been taking payments
+    /// the pre-escrow way, which is the state v9 has to convert safely.
+    fn v8_db() -> Connection {
+        let conn = v7_db();
+        conn.execute_batch(SCHEMA_V8).expect("schema step applies");
+        conn.pragma_update(None, "user_version", 8).unwrap();
         conn
     }
 
@@ -652,6 +674,104 @@ mod tests {
                 "{scope} was rewritten"
             );
         }
+    }
+
+    /// v9 must close the books on every payment that predates escrow.
+    ///
+    /// **This is the statement that would cost real money if it were missing.**
+    /// Every `paid` intent that exists at migration time was settled straight to
+    /// the merchant, so its money is already there. A NULL `released_unix_ms`
+    /// makes such a row match the release sweep's filter, and the first sweep
+    /// after deployment would pay it AGAIN — out of an escrow account that never
+    /// received anything for it, i.e. out of other customers' held payments.
+    #[test]
+    fn migration_v9_closes_the_books_on_payments_that_predate_escrow() {
+        let mut conn = v8_db();
+        insert_account(&conn, "acct-a");
+        conn.execute(
+            "INSERT INTO merchants (merchant_id, account_id, name, created_unix_ms) \
+             VALUES ('m1', 'acct-a', '鉱石商会', 1)",
+            [],
+        )
+        .unwrap();
+        for (id, state) in [
+            ("pi_paid", "paid"),
+            ("pi_paid2", "paid"),
+            ("pi_open", "created"),
+            ("pi_declined", "declined"),
+            ("pi_expired", "expired"),
+        ] {
+            conn.execute(
+                "INSERT INTO payment_intents (intent_id, merchant_id, amount, description, state, \
+                   idem_key, created_unix_ms, updated_unix_ms, expires_unix_ms) \
+                 VALUES (?1, 'm1', 12900, 'りんご 1個', ?2, ?1, 1, 1, 99999999999999)",
+                rusqlite::params![id, state],
+            )
+            .unwrap();
+        }
+
+        migrate(&mut conn).expect("v8 → v9");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        let released = |id: &str| -> Option<i64> {
+            conn.query_row(
+                "SELECT released_unix_ms FROM payment_intents WHERE intent_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Both paid rows are stamped, so the sweep cannot see them.
+        for id in ["pi_paid", "pi_paid2"] {
+            assert!(released(id).is_some(), "{id} was left claimable by the release sweep");
+        }
+        // …and nothing that was never paid is pretended to have been released.
+        for id in ["pi_open", "pi_declined", "pi_expired"] {
+            assert_eq!(released(id), None, "{id} was marked released");
+        }
+
+        // The stamped rows carry no `escrowed_unix_ms`, which is what tells
+        // `force_refund` to take their refund from the merchant (where the money
+        // actually is) rather than from escrow (which never held it).
+        let escrowed: Option<i64> = conn
+            .query_row(
+                "SELECT escrowed_unix_ms FROM payment_intents WHERE intent_id = 'pi_paid'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(escrowed, None);
+
+        // Every other new column starts empty on every row: nothing is fulfilled,
+        // nothing is due, and no ledger rows are claimed to exist.
+        let unset: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM payment_intents \
+                 WHERE release_due_unix_ms IS NULL AND escrow_deadline_unix_ms IS NULL \
+                   AND fulfilled_unix_ms IS NULL AND fulfilled_amount IS NULL \
+                   AND release_tx_id IS NULL AND escrow_refund_tx_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unset, 5);
+
+        // The backfill's `IS NULL` guard, which exists for a hand re-run during
+        // incident recovery rather than for `migrate` (that runs the file once).
+        // Re-stamping would misreport when an already-closed payment moved.
+        let before = released("pi_paid");
+        conn.execute(
+            "UPDATE payment_intents \
+                SET released_unix_ms = CAST(strftime('%s','now') AS INTEGER) * 1000 + 5000 \
+              WHERE state = 'paid' AND released_unix_ms IS NULL",
+            [],
+        )
+        .unwrap();
+        assert_eq!(released("pi_paid"), before);
     }
 
     #[test]

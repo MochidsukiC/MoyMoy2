@@ -631,14 +631,28 @@ pub enum CloseOutcome {
     NotFound,
     /// Customers are still holding bills from this shop.
     HasOpenIntents { count: i64 },
+    /// Money this shop has been paid is still sitting in escrow, waiting to be
+    /// released to it.
+    HasEscrowedFunds { count: i64, total: i64 },
 }
 
 /// Close a merchant permanently, releasing its name and its owner's slot.
 ///
-/// Refused while unanswered intents are outstanding. Somebody may be looking at
-/// an approval screen for this shop right now, and closing it under them would
-/// turn a payment they are part-way through into `merchant_disabled` with no shop
-/// left to ask about it. Cancel the bills first, or let them expire.
+/// Refused in two situations, for the same reason: something of somebody else's
+/// is still attached to this shop.
+///
+/// * **Unanswered intents.** Somebody may be looking at an approval screen for
+///   this shop right now, and closing it under them would turn a payment they are
+///   part-way through into `merchant_disabled` with no shop left to ask about it.
+///   Cancel the bills first, or let them expire.
+/// * **Unreleased escrow (v9).** A customer has already paid and MoyMoy is
+///   holding the money for this shop. Closing now would leave it there with
+///   nothing left to pay it to — the release sweep resolves a merchant to its
+///   account, and a closed shop is exactly the row it would be resolving. Report
+///   the order fulfilled (or have the payment refunded) first, and the money
+///   stops being suspended.
+///
+/// Neither refusal loses anything; both are "finish what is outstanding".
 pub fn close(
     tx: &rusqlite::Transaction<'_>,
     merchant_id: &str,
@@ -665,6 +679,22 @@ pub fn close(
     )?;
     if open > 0 {
         return Ok(CloseOutcome::HasOpenIntents { count: open });
+    }
+    // Money already taken for this shop and not yet paid over to it. Counted from
+    // `payment_intents` rather than from any balance, because that is where the
+    // claim lives — the escrow account holds every shop's suspended money in one
+    // pot, so a balance could not answer "how much of it is this shop's".
+    let (held, total): (i64, i64) = tx.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payment_intents \
+         WHERE merchant_id = ?1 AND escrowed_unix_ms IS NOT NULL AND released_unix_ms IS NULL",
+        [merchant_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if held > 0 {
+        return Ok(CloseOutcome::HasEscrowedFunds {
+            count: held,
+            total,
+        });
     }
     // The name and the credential go at the same moment as the status: a closed
     // shop that kept its skeleton would hold a name nothing can trade under, and
@@ -1184,6 +1214,12 @@ pub(crate) async fn portal_close(
             CloseOutcome::NotFound => json!({ "ok": false, "error": "unknown_merchant" }),
             CloseOutcome::HasOpenIntents { count } => {
                 json!({ "ok": false, "error": "open_intents", "count": count })
+            }
+            CloseOutcome::HasEscrowedFunds { count, total } => {
+                json!({
+                    "ok": false, "error": "escrowed_funds",
+                    "count": count, "total_minor": total,
+                })
             }
         };
         tx.commit()?;

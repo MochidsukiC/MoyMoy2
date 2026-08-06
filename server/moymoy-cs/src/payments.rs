@@ -65,6 +65,31 @@ pub const DEFAULT_TTL_SECS: i64 = 600;
 pub const MIN_TTL_SECS: i64 = 60;
 pub const MAX_TTL_SECS: i64 = 1_800;
 
+/// How long an escrowed payment waits after the merchant reports it fulfilled
+/// before the money is released.
+///
+/// **The gate is the fulfilment report; this is the pause after it.** A shop that
+/// reports an order fulfilled the moment it is placed still cannot have the money
+/// for this long, which is the window in which a mistake can be caught before it
+/// becomes unrecoverable. It is short because it is not the protection — holding
+/// the money until the goods are reported delivered is.
+///
+/// A constant, not configuration, for the reason the risk thresholds are: a hold
+/// period that an environment variable can set to zero is a hold period chosen by
+/// whoever edits the launcher.
+pub const RELEASE_GATE_MS: i64 = 10 * 60 * 1000;
+
+/// How long an escrowed payment may sit with no fulfilment report at all before
+/// it is considered abandoned by the merchant.
+///
+/// **Recorded but not yet acted on.** `escrow_deadline_unix_ms` is written on
+/// every escrowed intent so the data exists from the first payment onward, but
+/// nothing in this build reads it — deciding what happens to an order a shop
+/// never reports on needs the shop's side of the conversation to exist first.
+/// Writing the column now means the intents created in between are not a gap when
+/// that arrives.
+pub const ESCROW_DEADLINE_MS: i64 = 6 * 60 * 60 * 1000;
+
 /// The idempotency namespace one merchant's `idem_key`s live in.
 ///
 /// Scoped per merchant on the same reasoning schema v5 applied to charges: a bare
@@ -92,6 +117,29 @@ pub struct Intent {
     pub refund_tx_id: Option<String>,
     pub created_unix_ms: i64,
     pub expires_unix_ms: i64,
+    // ── escrow (v9) ─────────────────────────────────────────────────────────
+    // All `None` on an intent that never reached `paid`, and all `None` on the
+    // pre-v9 `paid` intents too — except `released_unix_ms`, which the migration
+    // stamped precisely so those rows are not mistaken for money still owed.
+    /// When the payer's money reached the escrow account.
+    pub escrowed_unix_ms: Option<i64>,
+    /// The earliest the release sweep may pay out (`escrowed` + [`RELEASE_GATE_MS`]).
+    pub release_due_unix_ms: Option<i64>,
+    /// When this intent stops waiting for a fulfilment report (`escrowed` +
+    /// [`ESCROW_DEADLINE_MS`]). Written, not yet acted on.
+    pub escrow_deadline_unix_ms: Option<i64>,
+    /// When the merchant reported the order fulfilled. `None` ⇒ still waiting,
+    /// and the sweep will not release however long the gate has been past.
+    pub fulfilled_unix_ms: Option<i64>,
+    /// What the merchant is owed, in minor units. Never above [`Intent::amount`];
+    /// the difference goes back to the payer.
+    pub fulfilled_amount: Option<i64>,
+    /// When escrow paid out. Doubles as the sweep's exactly-once claim.
+    pub released_unix_ms: Option<i64>,
+    /// The escrow → merchant ledger row, if that half moved anything.
+    pub release_tx_id: Option<String>,
+    /// The escrow → payer ledger row, if there was a shortfall to return.
+    pub escrow_refund_tx_id: Option<String>,
 }
 
 impl Intent {
@@ -110,7 +158,9 @@ impl Intent {
 
 const INTENT_COLS: &str = "intent_id, merchant_id, amount, description, order_ref, state, \
      payer_account_id, payer_hint_account_id, launch_app_id, tx_id, refunded_unix_ms, \
-     refund_tx_id, created_unix_ms, expires_unix_ms";
+     refund_tx_id, created_unix_ms, expires_unix_ms, \
+     escrowed_unix_ms, release_due_unix_ms, escrow_deadline_unix_ms, fulfilled_unix_ms, \
+     fulfilled_amount, released_unix_ms, release_tx_id, escrow_refund_tx_id";
 
 fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
     Ok(Intent {
@@ -128,6 +178,14 @@ fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
         refund_tx_id: r.get(11)?,
         created_unix_ms: r.get(12)?,
         expires_unix_ms: r.get(13)?,
+        escrowed_unix_ms: r.get(14)?,
+        release_due_unix_ms: r.get(15)?,
+        escrow_deadline_unix_ms: r.get(16)?,
+        fulfilled_unix_ms: r.get(17)?,
+        fulfilled_amount: r.get(18)?,
+        released_unix_ms: r.get(19)?,
+        release_tx_id: r.get(20)?,
+        escrow_refund_tx_id: r.get(21)?,
     })
 }
 
@@ -227,6 +285,15 @@ pub fn create(
         refund_tx_id: None,
         created_unix_ms: now,
         expires_unix_ms: now + ttl * 1_000,
+        // Nothing is escrowed until somebody approves; `settle` fills these in.
+        escrowed_unix_ms: None,
+        release_due_unix_ms: None,
+        escrow_deadline_unix_ms: None,
+        fulfilled_unix_ms: None,
+        fulfilled_amount: None,
+        released_unix_ms: None,
+        release_tx_id: None,
+        escrow_refund_tx_id: None,
     };
     tx.execute(
         "INSERT INTO payment_intents \
@@ -304,6 +371,163 @@ pub fn expire_pass(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
     )
 }
 
+// ── escrow release ───────────────────────────────────────────────────────────
+
+/// Label on the escrow → merchant payout.
+const RELEASE_LABEL_PREFIX: &str = "売上";
+/// Label on the escrow → payer return of whatever was not fulfilled.
+const ESCROW_REFUND_LABEL_PREFIX: &str = "未履行分の返金";
+
+/// Pay out every escrowed intent whose merchant has reported it fulfilled and
+/// whose release gate has elapsed. Rides the same 30-second pass as
+/// [`expire_pass`] and the emerald reconciliation.
+///
+/// **One row per transaction, not one bulk UPDATE.** `expire_pass` can be a
+/// single statement because expiring an intent owes nobody anything; a release
+/// moves money — up to two ways at once — and the row's state change and those
+/// movements have to be the same atomic unit or a crash between them leaves the
+/// intent marked paid-out with the payout missing. This is the shape
+/// `charge::withdraw`'s dead-letter pass uses, for the same reason.
+///
+/// Returns how many intents were released.
+pub fn release_pass(conn: &mut Connection, now: i64) -> rusqlite::Result<usize> {
+    let due: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT intent_id FROM payment_intents \
+             WHERE released_unix_ms IS NULL AND escrowed_unix_ms IS NOT NULL \
+               AND fulfilled_unix_ms IS NOT NULL AND release_due_unix_ms <= ?1 \
+             ORDER BY release_due_unix_ms ASC LIMIT 50",
+        )?;
+        // Bound to a local so the borrowing `MappedRows` temporary drops at the
+        // `;` (before `stmt`), the same shape `wallet::history` uses.
+        let v = stmt
+            .query_map([now], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        v
+    };
+
+    let mut released = 0usize;
+    for intent_id in due {
+        // One clock for the pass, like `expire_pass` — the selection above already
+        // decided due-ness against it, and re-reading it per row would let a row
+        // selected as due be claimed against a later instant than the one that
+        // chose it.
+        match release_one(conn, &intent_id, now) {
+            Ok(true) => released += 1,
+            Ok(false) => {}
+            Err(e) => {
+                // The row is untouched (the transaction rolled back), so the next
+                // pass sees it again. Logged rather than propagated: one bad row
+                // must not stop the other 49, nor the emerald reconciliation this
+                // pass shares a task with.
+                tracing::error!(error = %e, %intent_id,
+                    "escrow release failed; the intent stays unreleased and will be retried");
+            }
+        }
+    }
+    Ok(released)
+}
+
+/// Release one escrowed intent. `true` when this call is the one that did it.
+///
+/// The claim is `released_unix_ms IS NULL` inside the UPDATE — the same shape as
+/// `force_refund`'s and the withdraw settler's — so two passes (or a pass racing a
+/// restart) produce one payout. Everything after the claim runs in the same
+/// transaction, so "the row says released" and "the money moved" cannot come
+/// apart.
+fn release_one(conn: &mut Connection, intent_id: &str, now: i64) -> rusqlite::Result<bool> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some(intent) = tx
+        .query_row(
+            &format!("SELECT {INTENT_COLS} FROM payment_intents WHERE intent_id = ?1"),
+            [intent_id],
+            row_to_intent,
+        )
+        .optional()?
+    else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    let (Some(payer), Some(m)) = (
+        intent.payer_account_id.clone(),
+        merchant::get(&tx, &intent.merchant_id)?,
+    ) else {
+        // An escrowed intent always has both. Left unreleased for a human rather
+        // than paid to a guess — the money is safe in escrow meanwhile, which is
+        // the whole point of holding it.
+        tx.commit()?;
+        tracing::error!(intent_id, "escrowed intent has no payer or no merchant; not releasing");
+        return Ok(false);
+    };
+
+    // THE claim. Every condition the selection used is repeated here, because the
+    // selection ran outside this transaction and any of them could have changed
+    // since (a late fulfilment edit, another pass, a restart mid-batch).
+    let claimed = tx.execute(
+        "UPDATE payment_intents SET released_unix_ms = ?2, updated_unix_ms = ?2 \
+         WHERE intent_id = ?1 AND released_unix_ms IS NULL AND escrowed_unix_ms IS NOT NULL \
+           AND fulfilled_unix_ms IS NOT NULL AND release_due_unix_ms <= ?2",
+        params![intent_id, now],
+    )?;
+    if claimed == 0 {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    // What the merchant is owed, bounded by what the customer actually paid. The
+    // fulfilment endpoint already refuses anything outside the range; clamping
+    // here as well means a row edited by any other route still cannot pay out more
+    // than escrow received for it.
+    let owed = intent.fulfilled_amount.unwrap_or(0).clamp(0, intent.amount);
+    let refund = intent.amount - owed;
+    let escrow = wallet::escrow_account_id();
+
+    let mut release_tx_id: Option<String> = None;
+    if owed > 0 {
+        let label = format!("{RELEASE_LABEL_PREFIX}: {}", intent.description);
+        match wallet::transfer(&tx, escrow, &m.account_id, owed, "pay", &label)? {
+            TxResult::Ok { tx_id, .. } => release_tx_id = Some(tx_id),
+            other => {
+                // Escrow holds this money by construction, so a refusal here is a
+                // broken invariant. Rolling back un-claims the row so the next
+                // pass retries it — releasing the refund half alone would hand the
+                // customer their money back for goods the shop already sent.
+                drop(tx);
+                tracing::error!(intent_id, owed, merchant = %m.merchant_id, ?other,
+                    "escrow could not pay the merchant; NOTHING was released (the intent stays \
+                     claimable and the money stays in escrow)");
+                return Ok(false);
+            }
+        }
+    }
+
+    let mut escrow_refund_tx_id: Option<String> = None;
+    if refund > 0 {
+        let label = format!("{ESCROW_REFUND_LABEL_PREFIX}: {}", intent.description);
+        match wallet::transfer(&tx, escrow, &payer, refund, "pay", &label)? {
+            TxResult::Ok { tx_id, .. } => escrow_refund_tx_id = Some(tx_id),
+            other => {
+                // Same rollback for the same reason, from the other side: the
+                // merchant must not be paid while the customer's share is stranded
+                // in escrow with the row marked released.
+                drop(tx);
+                tracing::error!(intent_id, refund, payer, ?other,
+                    "escrow could not return the unfulfilled share; NOTHING was released");
+                return Ok(false);
+            }
+        }
+    }
+
+    tx.execute(
+        "UPDATE payment_intents SET release_tx_id = ?2, escrow_refund_tx_id = ?3 \
+         WHERE intent_id = ?1",
+        params![intent_id, release_tx_id, escrow_refund_tx_id],
+    )?;
+    tx.commit()?;
+    tracing::info!(intent_id, owed, refund, merchant = %m.merchant_id, "escrow released");
+    Ok(true)
+}
+
 // ── views ────────────────────────────────────────────────────────────────────
 
 /// The shop behind an intent, as the approval screen shows it.
@@ -358,6 +582,51 @@ pub fn payer_view(conn: &Connection, intent: &Intent, now: i64) -> rusqlite::Res
     }))
 }
 
+/// Where a paid intent's money currently is, as one word.
+///
+/// Distinct from `state`, which is about the ORDER (`created` → `paid` …). A
+/// `paid` intent can be any of these, and to the shop they are three different
+/// situations: money it cannot have yet, money on its way, and money it has.
+pub fn escrow_stage(intent: &Intent) -> &'static str {
+    match (
+        intent.escrowed_unix_ms,
+        intent.fulfilled_unix_ms,
+        intent.released_unix_ms,
+    ) {
+        // Never escrowed: unpaid, or one of the pre-v9 payments the migration
+        // closed. Neither is money this mechanism is holding.
+        (None, _, _) => "none",
+        (Some(_), _, Some(_)) => "released",
+        (Some(_), Some(_), None) => "fulfilled",
+        (Some(_), None, None) => "held",
+    }
+}
+
+/// The escrow half of an intent, for the shop that owns it.
+///
+/// Amount fields carry `_minor` for the reason `/merchant/v1` renamed `amount` in
+/// v8: a number whose unit is only known by convention is a number the next
+/// migration silently changes the meaning of.
+///
+/// The ledger row ids (`release_tx_id`, `escrow_refund_tx_id`) are deliberately
+/// NOT here. This view already withholds the payer's identity behind `payer_ref`;
+/// MoyMoy's internal ledger ids are the same kind of thing — nothing a shop can
+/// act on, and a handle onto the wallet's internals. An operator sees them
+/// through the admin refund report instead.
+fn escrow_view(intent: &Intent) -> Value {
+    json!({
+        "stage": escrow_stage(intent),
+        "escrowed_unix_ms": intent.escrowed_unix_ms,
+        "release_due_unix_ms": intent.release_due_unix_ms,
+        "escrow_deadline_unix_ms": intent.escrow_deadline_unix_ms,
+        "fulfilled_unix_ms": intent.fulfilled_unix_ms,
+        // Both `null` until the shop reports; afterwards they sum to `amount_minor`.
+        "fulfilled_amount_minor": intent.fulfilled_amount,
+        "refunded_amount_minor": intent.fulfilled_amount.map(|f| intent.amount - f.clamp(0, intent.amount)),
+        "released_unix_ms": intent.released_unix_ms,
+    })
+}
+
 /// The face of an intent for the merchant that owns it. Carries `payer_ref` once
 /// paid — a pseudonym stable within this shop and uncorrelatable outside it.
 ///
@@ -383,6 +652,9 @@ pub fn merchant_view(m: &MerchantRow, intent: &Intent, now: i64) -> Result<Value
         "refunded": intent.refunded_unix_ms.is_some(),
         "created_unix_ms": intent.created_unix_ms,
         "expires_unix_ms": intent.expires_unix_ms,
+        // Since v9 `state = paid` no longer means "the shop has the money", so the
+        // shop is told where it actually is rather than being left to assume.
+        "escrow": escrow_view(intent),
     }))
 }
 
@@ -567,8 +839,25 @@ fn settle(
         });
     }
 
-    // Amount and recipient come from the stored intent, never from the request.
-    let result = wallet::transfer(&tx, payer, &m.account_id, intent.amount, "pay", &m.name)?;
+    // Amount comes from the stored intent, never from the request. The
+    // DESTINATION is the escrow account rather than the shop: the payer is
+    // debited now, exactly as before, but the money is MoyMoy's to hold until the
+    // merchant reports the order fulfilled and the release gate elapses (see
+    // `release_pass`). Nothing else about this transaction changes — the claim
+    // above still decides the race, and the buyer still sees one `pay` row
+    // labelled with the shop's name.
+    //
+    // The label stays `m.name` deliberately. It is what the app renders in the
+    // history, and to the buyer this IS a payment to that shop; where the wallet
+    // parks the money in the meantime is not a fact about their purchase.
+    let result = wallet::transfer(
+        &tx,
+        payer,
+        wallet::escrow_account_id(),
+        intent.amount,
+        "pay",
+        &m.name,
+    )?;
     match result {
         TxResult::Ok {
             tx_id,
@@ -576,8 +865,16 @@ fn settle(
             ..
         } => {
             tx.execute(
-                "UPDATE payment_intents SET tx_id = ?2 WHERE intent_id = ?1",
-                params![intent.intent_id, tx_id],
+                "UPDATE payment_intents SET tx_id = ?2, escrowed_unix_ms = ?3, \
+                        release_due_unix_ms = ?4, escrow_deadline_unix_ms = ?5 \
+                 WHERE intent_id = ?1",
+                params![
+                    intent.intent_id,
+                    tx_id,
+                    now,
+                    now + RELEASE_GATE_MS,
+                    now + ESCROW_DEADLINE_MS
+                ],
             )?;
             tx.commit()?;
             Ok(Settled {
@@ -598,6 +895,21 @@ fn settle(
         // wallet and approve the very same intent instead of asking the shop for
         // a new one.
         other => {
+            // `UnknownTarget` used to mean "this shop's account is gone". Since the
+            // money goes to escrow it means the PAYER's row or the escrow row is
+            // missing, and the escrow row missing would fail every payment in the
+            // deployment — a startup that did not seed, not a fact about this
+            // customer. It fails closed either way, but an operator has to be able
+            // to see the difference between that and an ordinary refusal.
+            if matches!(other, TxResult::UnknownTarget) {
+                tracing::error!(
+                    intent_id = %intent.intent_id, payer,
+                    escrow = wallet::escrow_account_id(),
+                    "settle: a payment could not be escrowed because an account row is missing — \
+                     if this is the escrow account, EVERY payment is failing and the startup seed \
+                     (wallet::seed_escrow_account) did not run"
+                );
+            }
             drop(tx);
             Ok(Settled {
                 committed: false,
@@ -645,14 +957,19 @@ pub enum RefundOutcome {
     UnknownIntent,
     NotPaid { state: String },
     AlreadyRefunded,
-    /// The merchant no longer holds the money. Merchant revenue is not escrowed
-    /// (DEV.md: accepted risk), so a shop that collected and withdrew to the MC
-    /// world leaves nothing to reverse. Reported honestly rather than papered
-    /// over with a partial refund from nowhere.
+    /// The merchant no longer holds the money.
+    ///
+    /// **Still reachable, and still the honest answer — for RELEASED payments
+    /// only.** Escrow closed the window rather than the hole: while a payment is
+    /// held, the money is MoyMoy's and a refund always has a source. Once the
+    /// shop has reported the order fulfilled and been paid, its revenue is its
+    /// own and it can withdraw the takings to the MC world, at which point there
+    /// is nothing to reverse and this says so rather than papering over it with a
+    /// refund from nowhere. See [`force_refund`] for which source is used when.
     MerchantShort { balance: i64 },
 }
 
-/// Return a paid intent's money from the merchant to the payer.
+/// Return a paid intent's money to the payer.
 ///
 /// **Not reachable from the merchant API**, by construction: it takes no
 /// credential and lives here for an operator path to call. `paid` is not rewound
@@ -661,6 +978,23 @@ pub enum RefundOutcome {
 /// Exactly-once comes from the claim, in the same shape as the approval above:
 /// `refunded_unix_ms IS NULL` is part of the UPDATE, so two operators pressing
 /// the button together produce one refund.
+///
+/// ## Which account pays
+///
+/// Since v9 that depends on where the money currently is, and the intent row says
+/// so without anyone having to look at balances:
+///
+/// * `released_unix_ms IS NULL` — still escrowed. MoyMoy holds it, so the refund
+///   comes out of the escrow account and **cannot** report
+///   [`RefundOutcome::MerchantShort`]: escrow received exactly this amount for
+///   exactly this intent and has not paid it to anyone.
+/// * released — the shop has been paid. The refund comes from the shop, exactly
+///   as it did before escrow existed, and `MerchantShort` is a real outcome
+///   again if the takings have been withdrawn to the MC world.
+///
+/// The rows the v9 migration stamped released carry no `escrowed_unix_ms`, which
+/// is right: they were settled directly to the merchant and the merchant is where
+/// their refund has to come from.
 pub fn force_refund(
     conn: &mut Connection,
     intent_id: &str,
@@ -699,15 +1033,25 @@ pub fn force_refund(
     if claimed == 0 {
         return Ok(RefundOutcome::AlreadyRefunded);
     }
+    // Where the money is decides where it comes back from. Both halves of the
+    // predicate matter: `escrowed_unix_ms IS NOT NULL` says escrow ever received
+    // it (the pre-v9 rows the migration stamped released did not), and
+    // `released_unix_ms IS NULL` says escrow has not passed it on.
+    let escrowed = intent.escrowed_unix_ms.is_some() && intent.released_unix_ms.is_none();
+    let source = if escrowed {
+        wallet::escrow_account_id()
+    } else {
+        m.account_id.as_str()
+    };
     let label = format!("返金（運営措置）: {reason}");
-    match wallet::transfer(&tx, &m.account_id, &payer, intent.amount, "pay", &label)? {
+    match wallet::transfer(&tx, source, &payer, intent.amount, "pay", &label)? {
         TxResult::Ok { tx_id, .. } => {
             tx.execute(
                 "UPDATE payment_intents SET refund_tx_id = ?2 WHERE intent_id = ?1",
                 params![intent_id, tx_id],
             )?;
             tx.commit()?;
-            tracing::warn!(intent_id, amount = intent.amount, reason,
+            tracing::warn!(intent_id, amount = intent.amount, reason, escrowed,
                 "operator-forced refund applied");
             Ok(RefundOutcome::Ok {
                 tx_id,
@@ -716,10 +1060,23 @@ pub fn force_refund(
         }
         TxResult::Insufficient { balance } => {
             // Rolls back, so the claim unwinds and the refund can be retried once
-            // the merchant has funds again.
-            tracing::error!(intent_id, amount = intent.amount, balance, reason,
-                "operator-forced refund NOT applied — the merchant no longer holds the money \
-                 (revenue is not escrowed; see the accepted risk in DEV.md)");
+            // the source has funds again.
+            //
+            // From ESCROW this is a broken invariant, not an accepted risk: escrow
+            // took in exactly this amount for this intent and the release sweep is
+            // the only thing that pays it out, so a shortfall means something else
+            // spent it. From the MERCHANT it is the accepted risk DEV.md records —
+            // a shop that was paid and withdrew its takings to the MC world leaves
+            // nothing to reverse.
+            if escrowed {
+                tracing::error!(intent_id, amount = intent.amount, balance, reason,
+                    "operator-forced refund NOT applied — the ESCROW account is short, which it \
+                     cannot legitimately be for an unreleased intent (invariant violated)");
+            } else {
+                tracing::error!(intent_id, amount = intent.amount, balance, reason,
+                    "operator-forced refund NOT applied — this payment was already released and \
+                     the merchant no longer holds the money (the accepted risk in DEV.md)");
+            }
             Ok(RefundOutcome::MerchantShort { balance })
         }
         other => Err(ApiError::internal(format!(
@@ -832,6 +1189,10 @@ mod tests {
     /// concurrency test needs the same world on a file-backed database.
     fn seed(pool: &Pool, amount: i64, balance: i64) -> (String, MerchantRow) {
         let mut conn = pool.get().expect("checkout");
+        // What `main` does before it serves anything. A wallet without this
+        // account cannot take a payment at all (every approval transfers into
+        // it), so a fixture without it is not a wallet under test.
+        wallet::seed_escrow_account(&conn).expect("escrow account");
         let hash = auth::hash_pin(PIN).unwrap();
         for (id, handle) in [("acct-a", "payer"), ("acct-m", "shopkeep")] {
             auth::insert_account(&conn, id, handle, handle, handle, &hash, None).unwrap();
@@ -1052,6 +1413,63 @@ mod tests {
             .state
     }
 
+    fn intent_of(pool: &Pool, intent_id: &str) -> Intent {
+        get(&pool.get().unwrap(), intent_id).unwrap().unwrap()
+    }
+
+    fn escrow_balance(pool: &Pool) -> i64 {
+        balance_of(pool, wallet::escrow_account_id())
+    }
+
+    /// Record a fulfilment report the way `/merchant/v1/intent/fulfill` will.
+    ///
+    /// Written against the columns because the endpoint is a later unit; the
+    /// claim it will use (`fulfilled_unix_ms IS NULL`) is the same one, so the
+    /// release behaviour these tests pin does not depend on which writes it.
+    fn fulfil(pool: &Pool, intent_id: &str, fulfilled_amount: i64) {
+        let n = pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE payment_intents SET fulfilled_unix_ms = ?2, fulfilled_amount = ?3 \
+                 WHERE intent_id = ?1 AND fulfilled_unix_ms IS NULL",
+                params![intent_id, now_ms(), fulfilled_amount],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "{intent_id} was already fulfilled");
+    }
+
+    /// Run the release sweep as it would run once the gate has elapsed.
+    ///
+    /// The gate is ten minutes, so the clock is advanced rather than waited on —
+    /// `release_pass` takes `now` for exactly this reason, and passing the real
+    /// clock (as `sweep_now` does) is how the "too early" case is exercised.
+    fn sweep_after_gate(pool: &Pool) -> usize {
+        let mut conn = pool.get().unwrap();
+        release_pass(&mut conn, now_ms() + RELEASE_GATE_MS + 1).unwrap()
+    }
+
+    fn sweep_now(pool: &Pool) -> usize {
+        let mut conn = pool.get().unwrap();
+        release_pass(&mut conn, now_ms()).unwrap()
+    }
+
+    /// Approve, report fulfilled in full, and release — an ordinary completed
+    /// purchase, end to end.
+    fn approve_and_release(pool: &Pool, intent_id: &str, amount: i64) {
+        assert_eq!(do_approve(pool, intent_id, PIN)["ok"], json!(true));
+        fulfil(pool, intent_id, amount);
+        assert_eq!(sweep_after_gate(pool), 1);
+    }
+
+    /// An approval takes exactly the intent's amount from the buyer — and, since
+    /// v9, hands it to ESCROW rather than to the shop.
+    ///
+    /// The buyer's half of this test is unchanged on purpose: the debit, the
+    /// reported amount and the intent's state are what a customer experiences, and
+    /// escrow was not allowed to alter any of them. What changed is the second
+    /// balance — the shop is owed the money, not holding it — and that is the
+    /// whole point of the mechanism, so it is asserted rather than dropped.
     #[test]
     fn an_approval_moves_the_amount_the_intent_says_and_nothing_else() {
         let (pool, intent_id, _) = fixture(300, 1_000);
@@ -1059,8 +1477,17 @@ mod tests {
         assert_eq!(v["ok"], json!(true), "{v}");
         assert_eq!(v["amount"], json!(300));
         assert_eq!(balance_of(&pool, "acct-a"), 700);
-        assert_eq!(balance_of(&pool, "acct-m"), 300);
+        assert_eq!(balance_of(&pool, "acct-m"), 0, "the shop was paid before it delivered");
+        assert_eq!(escrow_balance(&pool), 300);
         assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
+
+        // …and the money reaches the shop once it reports the order fulfilled and
+        // the gate elapses. Nothing else moves: 300 in, 300 out.
+        fulfil(&pool, &intent_id, 300);
+        assert_eq!(sweep_after_gate(&pool), 1);
+        assert_eq!(balance_of(&pool, "acct-m"), 300);
+        assert_eq!(escrow_balance(&pool), 0);
+        assert_eq!(balance_of(&pool, "acct-a"), 700);
     }
 
     /// The claim is the whole safety argument, so it is exercised through
@@ -1140,9 +1567,13 @@ mod tests {
             "no thread reached the claim guard — the race did not happen: {results:#?}"
         );
 
-        // The ledger is the final word: the money moved exactly once.
+        // The ledger is the final word: the money moved exactly once. It is in
+        // escrow rather than the shop's account (v9), which does not weaken the
+        // claim this test guards — one debit of exactly one AMOUNT happened, and
+        // where it landed is a separate decision.
         assert_eq!(balance_of(&db.pool, "acct-a"), START - AMOUNT);
-        assert_eq!(balance_of(&db.pool, &m.account_id), AMOUNT);
+        assert_eq!(escrow_balance(&db.pool), AMOUNT);
+        assert_eq!(balance_of(&db.pool, &m.account_id), 0);
         assert_eq!(state_of(&db.pool, &intent_id), STATE_PAID);
         let paid_rows: i64 = db
             .pool
@@ -1710,10 +2141,46 @@ mod tests {
         // Paid, declined and expired bills are nobody's outstanding claim — and
         // the `payment_intents` foreign key is exactly why closing is a status
         // change rather than a DELETE.
+        //
+        // "Settled" now means released, not merely paid: a paid-but-escrowed bill
+        // IS an outstanding claim (see the test below), so the history has to be
+        // finished before this asserts anything about it.
         let (pool, intent_id, m) = fixture(300, 1_000);
-        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        approve_and_release(&pool, &intent_id, 300);
         assert_eq!(close_shop(&pool, &m.merchant_id), merchant::CloseOutcome::Ok);
         assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
+    }
+
+    /// A shop cannot walk away from money MoyMoy is holding for it.
+    ///
+    /// Closing releases the name and the owner's slot, and the release sweep
+    /// resolves a merchant to its account — so a shop closed with escrow
+    /// outstanding would leave the money suspended with the row it would be paid
+    /// through retired. Same reasoning as the open-intent refusal: finish what is
+    /// outstanding, then close.
+    #[test]
+    fn a_shop_cannot_close_while_money_is_held_for_it() {
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        assert_eq!(
+            close_shop(&pool, &m.merchant_id),
+            merchant::CloseOutcome::HasEscrowedFunds {
+                count: 1,
+                total: 300
+            }
+        );
+        // Reporting the order fulfilled is not enough on its own — the money is
+        // still in escrow until the gate elapses and the sweep moves it.
+        fulfil(&pool, &intent_id, 300);
+        assert_eq!(
+            close_shop(&pool, &m.merchant_id),
+            merchant::CloseOutcome::HasEscrowedFunds {
+                count: 1,
+                total: 300
+            }
+        );
+        assert_eq!(sweep_after_gate(&pool), 1);
+        assert_eq!(close_shop(&pool, &m.merchant_id), merchant::CloseOutcome::Ok);
     }
 
     #[test]
@@ -1734,14 +2201,28 @@ mod tests {
         drop(conn);
         assert_eq!(balance_of(&pool, "acct-a"), 1_000);
         assert_eq!(balance_of(&pool, "acct-m"), 0);
+        // The money came back out of escrow, where the approval had put it, and
+        // the pot is square again — the refund neither invented eme nor left any
+        // of this payment behind for the sweep to find.
+        assert_eq!(escrow_balance(&pool), 0);
         // `paid` is not rewound — the record still says the purchase happened.
         assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
     }
 
+    /// The accepted risk in DEV.md, in the window escrow does NOT cover.
+    ///
+    /// Escrow shortened this window; it did not close it. Once a shop has reported
+    /// an order fulfilled and been paid, the revenue is its own and it may withdraw
+    /// it to the MC world — after which a forced refund has no source, and the
+    /// honest answer is to say so rather than to conjure the money from somewhere.
+    /// That is what this test has always protected, and it protects it on the
+    /// released path now that the escrowed path cannot reach it.
     #[test]
     fn a_refund_the_merchant_can_no_longer_fund_is_reported_not_faked() {
         let (pool, intent_id, _) = fixture(300, 1_000);
-        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        approve_and_release(&pool, &intent_id, 300);
+        assert_eq!(balance_of(&pool, "acct-m"), 300);
+
         let mut conn = pool.get().unwrap();
         // The shop withdrew its takings to the MC world — the accepted risk.
         conn.execute(
@@ -1753,6 +2234,11 @@ mod tests {
         assert!(matches!(out, RefundOutcome::MerchantShort { balance: 0 }), "{out:?}");
         drop(conn);
         assert_eq!(balance_of(&pool, "acct-a"), 700, "money appeared from nowhere");
+        // Escrow is not raided to cover it either: this intent's money left escrow
+        // legitimately, and paying the refund out of the pot would be taking it
+        // from whichever other payments are being held there.
+        assert_eq!(escrow_balance(&pool), 0, "another payment's escrow funded this refund");
+
         // The claim rolled back with the transfer, so a retry is possible once the
         // merchant has funds again.
         let mut conn = pool.get().unwrap();
@@ -1765,6 +2251,141 @@ mod tests {
             force_refund(&mut conn, &intent_id, "fraud").unwrap(),
             RefundOutcome::Ok { .. }
         ));
+    }
+
+    /// **THE test for the sweep.** It runs every 30 seconds for the life of the
+    /// process and restarts land it back on the same rows, so a release that is
+    /// not idempotent pays the shop again on every tick.
+    ///
+    /// The same shape as the withdraw settler's double-refund guard: the claim is
+    /// part of the UPDATE, so only the transaction that moved the row moves money.
+    #[test]
+    fn the_release_sweep_pays_once_however_many_times_it_runs() {
+        let (pool, intent_id, _) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        fulfil(&pool, &intent_id, 300);
+
+        // Ten passes — a restart is not a special case here, it is just another
+        // pass arriving at a row the previous one already handled.
+        let mut releases = 0;
+        for _ in 0..10 {
+            releases += sweep_after_gate(&pool);
+        }
+        assert_eq!(releases, 1, "the sweep released the same payment more than once");
+        assert_eq!(balance_of(&pool, "acct-m"), 300);
+        assert_eq!(escrow_balance(&pool), 0);
+        assert_eq!(balance_of(&pool, "acct-a"), 700);
+
+        // One ledger row for the payout, not ten.
+        let credits: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = 'acct-m' AND kind = 'receive'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(credits, 1);
+    }
+
+    /// The gate is a floor the sweep will not cross, and the fulfilment report is
+    /// a condition it will not assume.
+    #[test]
+    fn the_sweep_waits_for_both_the_report_and_the_gate() {
+        let (pool, intent_id, _) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        // Fulfilled but inside the gate: not yet.
+        fulfil(&pool, &intent_id, 300);
+        assert_eq!(sweep_now(&pool), 0, "the sweep paid out before the gate elapsed");
+        assert_eq!(escrow_balance(&pool), 300);
+        assert_eq!(intent_of(&pool, &intent_id).released_unix_ms, None);
+
+        // Past the gate: released.
+        assert_eq!(sweep_after_gate(&pool), 1);
+        assert_eq!(balance_of(&pool, "acct-m"), 300);
+    }
+
+    #[test]
+    fn an_unreported_payment_is_never_released_however_long_it_waits() {
+        // The distinction that makes escrow worth having. Time alone releases
+        // nothing: a delivery that takes hours keeps its money where a refund can
+        // still reach it, which is precisely the case a timer-only hold fails.
+        let (pool, intent_id, _) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        let mut conn = pool.get().unwrap();
+        // A year past the gate, and past the no-report deadline too.
+        let far_future = now_ms() + 365 * 24 * 60 * 60 * 1000;
+        assert_eq!(release_pass(&mut conn, far_future).unwrap(), 0);
+        drop(conn);
+
+        assert_eq!(escrow_balance(&pool), 300);
+        assert_eq!(balance_of(&pool, "acct-m"), 0);
+        assert_eq!(escrow_stage(&intent_of(&pool, &intent_id)), "held");
+    }
+
+    /// A partial fulfilment splits the escrowed money two ways, and both ways
+    /// happen together or not at all.
+    #[test]
+    fn a_partial_fulfilment_pays_the_shop_and_returns_the_rest_in_one_step() {
+        let (pool, intent_id, _) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        assert_eq!(balance_of(&pool, "acct-a"), 700);
+
+        // Two of three lines shipped.
+        fulfil(&pool, &intent_id, 200);
+        assert_eq!(sweep_after_gate(&pool), 1);
+
+        assert_eq!(balance_of(&pool, "acct-m"), 200, "the shop was paid the wrong share");
+        assert_eq!(balance_of(&pool, "acct-a"), 800, "the buyer was not returned the rest");
+        // Nothing is left behind in the pot: the two halves account for the whole.
+        assert_eq!(escrow_balance(&pool), 0);
+
+        let i = intent_of(&pool, &intent_id);
+        assert_eq!(escrow_stage(&i), "released");
+        assert!(i.release_tx_id.is_some(), "no ledger row for the payout");
+        assert!(i.escrow_refund_tx_id.is_some(), "no ledger row for the return");
+    }
+
+    #[test]
+    fn a_wholly_unfulfilled_payment_returns_everything_and_pays_the_shop_nothing() {
+        let (pool, intent_id, _) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        // Nothing could be delivered at all.
+        fulfil(&pool, &intent_id, 0);
+        assert_eq!(sweep_after_gate(&pool), 1);
+
+        assert_eq!(balance_of(&pool, "acct-a"), 1_000);
+        assert_eq!(balance_of(&pool, "acct-m"), 0);
+        assert_eq!(escrow_balance(&pool), 0);
+        let i = intent_of(&pool, &intent_id);
+        // No payout row was written, because no payout happened — an empty
+        // transfer would be a ledger row for nothing.
+        assert_eq!(i.release_tx_id, None);
+        assert!(i.escrow_refund_tx_id.is_some());
+    }
+
+    /// The counterpart, and the reason escrow exists: while the money is held, a
+    /// forced refund always has a source and `MerchantShort` cannot happen.
+    #[test]
+    fn a_refund_of_an_escrowed_payment_comes_from_moymoy_not_the_shop() {
+        let (pool, intent_id, _) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        // The shop holds nothing at all — under the old model this was exactly the
+        // situation that made a refund impossible.
+        assert_eq!(balance_of(&pool, "acct-m"), 0);
+
+        let mut conn = pool.get().unwrap();
+        let out = force_refund(&mut conn, &intent_id, "chargeback").unwrap();
+        assert!(matches!(out, RefundOutcome::Ok { amount: 300, .. }), "{out:?}");
+        drop(conn);
+
+        assert_eq!(balance_of(&pool, "acct-a"), 1_000, "the buyer was not made whole");
+        assert_eq!(escrow_balance(&pool), 0);
+        assert_eq!(balance_of(&pool, "acct-m"), 0, "the shop was debited for money it never had");
     }
 
     #[test]

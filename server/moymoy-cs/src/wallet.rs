@@ -3,6 +3,8 @@
 //! handlers via `spawn_blocking`. Balance moves run inside a single
 //! `BEGIN IMMEDIATE` transaction (read → check → debit → credit → ledger).
 
+use std::sync::OnceLock;
+
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use uuid::Uuid;
@@ -51,6 +53,74 @@ pub const MAX_WITHDRAW_PER_OP: i64 = 2_073_600;
 /// `withdraw` txn like the debit it undoes, so the withdraw filter shows the pair
 /// together — a refund hidden under `charge` would read as income.
 const WITHDRAW_REFUND_LABEL: &str = "出金の取消（返金）";
+
+// ── the escrow account ───────────────────────────────────────────────────────
+
+/// The name [`escrow_account_id`] is derived from. Never displayed, and never
+/// changed once a deployment has run: it IS the account, so a different string is
+/// a different (empty) account holding none of the money the old one has.
+const ESCROW_SEED_NAME: &str = "moymoy:escrow";
+
+/// What the escrow account is called in a ledger dump. Not a user-facing string —
+/// a payer's own history row carries the SHOP's name in its `label`, which is
+/// what the app displays; this only shows up where an operator reads
+/// `counterparty_name` directly.
+const ESCROW_DISPLAY_NAME: &str = "MoyMoy 決済保留";
+
+/// The account that holds a payment between the customer's approval and the
+/// merchant's fulfilment report.
+///
+/// Derived from a constant rather than stored anywhere, so every process that
+/// touches this database agrees on it without a lookup that could fail halfway
+/// through a payment. The derivation is [`identity::offline_uuid`], the same one
+/// the demo merchants' accounts use.
+pub fn escrow_account_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        identity::offline_uuid(ESCROW_SEED_NAME)
+            .hyphenated()
+            .to_string()
+    })
+}
+
+/// Make sure the escrow account exists. Called at every startup, before anything
+/// can be paid.
+///
+/// **`INSERT OR IGNORE`, with no guard around it.** The obvious thing to copy is
+/// [`seed_demo_merchants`], which skips its whole body when any merchant already
+/// exists — and copying that here would be a bug with no symptom until the first
+/// payment: every deployment that already has data would take the early return,
+/// never create the account, and fail every settlement with `unknown_target`.
+/// A row-level `OR IGNORE` is idempotent on the thing that actually matters.
+///
+/// It must also never UPDATE. The row carries the escrow BALANCE, so an upsert
+/// that rewrote `balance = 0` on boot would erase every payment in flight.
+///
+/// `handle` and `pin_hash` stay NULL, which is this schema's way of spelling
+/// "non-login" (see `schema_v2.sql`): nobody can log into it, it cannot be sent
+/// to from the app, it never appears in a friends list, and it cannot withdraw to
+/// the MC world.
+pub fn seed_escrow_account(conn: &Connection) -> rusqlite::Result<()> {
+    let id = escrow_account_id();
+    let now = now_ms();
+    let created = conn.execute(
+        "INSERT OR IGNORE INTO accounts \
+           (account_id, display_name, balance, holder, card_number, is_merchant, \
+            created_unix_ms, updated_unix_ms) \
+         VALUES (?1, ?2, 0, ?3, ?4, 0, ?5, ?5)",
+        params![
+            id,
+            ESCROW_DISPLAY_NAME,
+            "MOYMOY ESCROW",
+            identity::card_number_for(id),
+            now
+        ],
+    )?;
+    if created > 0 {
+        tracing::info!(account_id = %id, "created the MoyMoy escrow account");
+    }
+    Ok(())
+}
 
 /// Render a minor-unit amount the way a person reads it: `1_550` ⇒ `"15.50"`.
 ///
@@ -689,6 +759,83 @@ mod tests {
         assert!(matches!(z, TxResult::BadAmount), "{z:?}");
         tx.commit().unwrap();
         assert_eq!(balance_of(&conn), 99);
+    }
+
+    /// The escrow account appears on a database that already has data in it.
+    ///
+    /// **The regression guard for a specific near-miss.** The obvious model to
+    /// copy is `seed_demo_merchants`, which returns early when any merchant
+    /// exists. Copied here, the early return would be taken by every deployment
+    /// that has ever traded, the account would never be created, and the failure
+    /// would not show up at startup — it would show up as every single payment
+    /// returning `unknown_target`, on a wallet that had been working the day
+    /// before. So the seed has no such guard, and this proves it.
+    #[test]
+    fn the_escrow_account_is_created_even_on_a_database_that_is_already_in_use() {
+        let conn = account_with(100);
+        // A pre-existing merchant is exactly the condition a count guard would
+        // trip on.
+        conn.execute(
+            "INSERT INTO merchants (merchant_id, account_id, name, created_unix_ms) \
+             VALUES ('m1', 'acct-a', '鉱石商会', 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            balance(&conn, escrow_account_id()).unwrap() == 0
+                && identity::get(&conn, escrow_account_id()).unwrap().is_none(),
+            "the fixture already had an escrow account; this test proves nothing"
+        );
+
+        seed_escrow_account(&conn).unwrap();
+        let escrow = identity::get(&conn, escrow_account_id())
+            .unwrap()
+            .expect("the escrow account was not created on a database with existing rows");
+        // Non-login: no handle and no PIN is how this schema spells "nobody can
+        // sign in as this, send to it, or withdraw from it".
+        assert!(escrow.handle.is_none(), "the escrow account can be logged into");
+        assert_eq!(escrow.balance, 0);
+    }
+
+    /// Re-seeding never disturbs the money already held.
+    ///
+    /// This runs on every boot, and the account's balance IS the escrow: an upsert
+    /// that rewrote `balance = 0` would destroy every payment in flight at the
+    /// moment of a restart — the one moment nobody is watching.
+    #[test]
+    fn re_seeding_the_escrow_account_leaves_the_money_it_holds_alone() {
+        let conn = account_with(0);
+        seed_escrow_account(&conn).unwrap();
+        conn.execute(
+            "UPDATE accounts SET balance = 4200 WHERE account_id = ?1",
+            [escrow_account_id()],
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            seed_escrow_account(&conn).unwrap();
+        }
+
+        assert_eq!(balance(&conn, escrow_account_id()).unwrap(), 4_200);
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE account_id = ?1",
+                [escrow_account_id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn the_escrow_account_is_never_offered_as_a_destination() {
+        // It receives money without being reachable: a payer can only send to a
+        // handle, and the friends list joins on one. A holding account that turned
+        // up in either would be money sent nowhere.
+        let conn = account_with(100);
+        seed_escrow_account(&conn).unwrap();
+        assert!(friends(&conn, "acct-a").unwrap().is_empty());
+        assert!(merchants(&conn).unwrap().is_empty());
     }
 
     #[test]

@@ -74,6 +74,11 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut conn = pool.get()?;
         wallet::seed_demo_merchants(&mut conn)?;
+        // Before anything can be paid, and fatal if it fails: every approval
+        // transfers into this account, so a wallet without it would refuse every
+        // payment with `unknown_target`. Better to not come up at all than to come
+        // up unable to take money.
+        wallet::seed_escrow_account(&conn)?;
     }
     tracing::info!(db = %db_path, "sqlite ready");
 
@@ -108,6 +113,12 @@ async fn main() -> anyhow::Result<()> {
     // (approve carries `expires_unix_ms > now` in its claim, so a late sweep can
     // never let a stale intent be paid), and a second scheduler would be a second
     // thing to get wrong.
+    //
+    // Releasing escrowed payments rides along for the same reason, and is late by
+    // at most one cycle — which costs nothing, because the money is already the
+    // merchant's claim and `release_due_unix_ms` is a floor, not a schedule.
+    // Unlike expiry it moves money, so it works one intent at a time inside its
+    // own transaction rather than as a bulk UPDATE (`payments::release_pass`).
     {
         let charge_rec = charge.clone();
         let pool_rec = pool.clone();
@@ -116,10 +127,18 @@ async fn main() -> anyhow::Result<()> {
                 charge_rec.reconcile().await;
                 let pool = pool_rec.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let conn = pool.get()?;
+                    let mut conn = pool.get()?;
                     let n = payments::expire_pass(&conn, db::now_ms())?;
                     if n > 0 {
                         tracing::info!(count = n, "expired unanswered payment intents");
+                    }
+                    // After the expiry pass, not before: an expired intent was
+                    // never paid, so it can never be one of the rows this releases,
+                    // and running the cheap bulk statement first keeps the write
+                    // lock held for the shortest time.
+                    let released = payments::release_pass(&mut conn, db::now_ms())?;
+                    if released > 0 {
+                        tracing::info!(count = released, "released escrowed payments");
                     }
                     Ok(())
                 })
@@ -127,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(anyhow::Error::from)
                 .and_then(|r| r)
                 {
-                    tracing::error!(error = %e, "payment-intent expiry pass failed");
+                    tracing::error!(error = %e, "payment-intent housekeeping pass failed");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
@@ -317,13 +336,26 @@ usage: moymoy-cs admin <command>
                 println!("  payer       {payer}");
                 println!("  reason      {reason}");
                 println!("  refund tx   {tx_id}");
+                // WHERE the money came back from, and the ledger rows to reconcile
+                // it against. Since v9 that is not always the shop: a payment still
+                // in escrow is returned by MoyMoy, and an operator checking their
+                // own books needs to know which account moved and which rows the
+                // release (if any) had already written.
+                println!("  refunded from {}", payments::escrow_stage(&before));
+                if let Some(id) = &before.release_tx_id {
+                    println!("  release tx  {id} (escrow -> merchant, already paid out)");
+                }
+                if let Some(id) = &before.escrow_refund_tx_id {
+                    println!("  escrow refund tx {id} (unfulfilled share, already returned)");
+                }
                 // `paid` is terminal by design; the refund is recorded alongside
                 // it rather than instead of it.
                 println!("  intent state {} -> {} (refunded)", before.state, before.state);
                 println!(
-                    "  balances    merchant {} エメ / payer {} エメ",
+                    "  balances    merchant {} エメ / payer {} エメ / escrow {} エメ",
                     wallet::format_eme(wallet::balance(&conn, shop_account)?),
                     wallet::format_eme(wallet::balance(&conn, &payer)?),
+                    wallet::format_eme(wallet::balance(&conn, wallet::escrow_account_id())?),
                 );
                 Ok(())
             }
