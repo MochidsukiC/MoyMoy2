@@ -20,6 +20,12 @@
 //! | anything above that | PIN |
 //! | > 5,000 エメ once, > 10,000 エメ in 24h, or an unfamiliar device | PIN + email OTP |
 //!
+//! The constants below state those same numbers in the ledger's minor units
+//! (1/100 エメ), which is what every amount reaching this module is counted in —
+//! so `FRICTIONLESS_SINGLE` is 20,000, not 200. **They are the ×100 of what they
+//! always were, not a re-tuning**: the v8 unit migration deliberately changed no
+//! policy, so the bands a user meets are exactly the ones in the table.
+//!
 //! Constants, not configuration: a wallet whose spending limits can be moved by
 //! an environment variable has limits set by whoever can edit the launcher.
 //! DEV.md records the numbers for operational review.
@@ -43,14 +49,14 @@ use crate::db::now_ms;
 use crate::error::ApiError;
 use crate::otp::{self, VerifyOtp};
 
-/// Single-movement ceiling below which nothing is asked.
-pub const FRICTIONLESS_SINGLE: i64 = 200;
-/// Rolling 24h outflow below which nothing is asked.
-pub const FRICTIONLESS_DAILY: i64 = 1_000;
-/// Single movement above which a second factor is required.
-pub const STEPUP_SINGLE: i64 = 5_000;
-/// Rolling 24h outflow above which a second factor is required.
-pub const STEPUP_DAILY: i64 = 10_000;
+/// Single-movement ceiling below which nothing is asked (200 エメ).
+pub const FRICTIONLESS_SINGLE: i64 = 20_000;
+/// Rolling 24h outflow below which nothing is asked (1,000 エメ).
+pub const FRICTIONLESS_DAILY: i64 = 100_000;
+/// Single movement above which a second factor is required (5,000 エメ).
+pub const STEPUP_SINGLE: i64 = 500_000;
+/// Rolling 24h outflow above which a second factor is required (10,000 エメ).
+pub const STEPUP_DAILY: i64 = 1_000_000;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -568,15 +574,25 @@ mod tests {
 
     #[test]
     fn the_frictionless_band_is_small_recent_and_familiar_all_at_once() {
+        // Stated in the constants rather than in literals: the amounts these
+        // bands are drawn at are minor units now, and a test written in bare
+        // numbers is one that quietly measures a different band whenever the
+        // unit or the policy moves.
         let f = DeviceTrust::Familiar;
-        assert_eq!(assess(200, 0, f), Requirement::None);
-        assert_eq!(assess(200, 800, f), Requirement::None);
+        assert_eq!(assess(FRICTIONLESS_SINGLE, 0, f), Requirement::None);
         // Exactly on both ceilings is still inside them.
-        assert_eq!(assess(200, FRICTIONLESS_DAILY - 200, f), Requirement::None);
-        // One eme over either one leaves it.
-        assert_eq!(assess(201, 0, f), Requirement::Pin);
         assert_eq!(
-            assess(200, FRICTIONLESS_DAILY - 199, f),
+            assess(FRICTIONLESS_SINGLE, FRICTIONLESS_DAILY - FRICTIONLESS_SINGLE, f),
+            Requirement::None
+        );
+        // A single minor unit over either one leaves it.
+        assert_eq!(assess(FRICTIONLESS_SINGLE + 1, 0, f), Requirement::Pin);
+        assert_eq!(
+            assess(
+                FRICTIONLESS_SINGLE,
+                FRICTIONLESS_DAILY - FRICTIONLESS_SINGLE + 1,
+                f
+            ),
             Requirement::Pin
         );
     }
@@ -619,15 +635,21 @@ mod tests {
 
     #[test]
     fn a_running_total_cannot_be_split_into_frictionless_pieces() {
-        // Five 200-eme movements: the sixth crosses the daily ceiling and starts
-        // asking, which is the whole point of counting the window.
+        // Five movements of exactly the single-movement ceiling fill the daily
+        // one; the sixth crosses it and starts asking, which is the whole point
+        // of counting the window.
         let f = DeviceTrust::Familiar;
+        assert_eq!(
+            FRICTIONLESS_DAILY / FRICTIONLESS_SINGLE,
+            5,
+            "the two ceilings no longer stand in the ratio this test walks"
+        );
         let mut spent = 0;
         for _ in 0..5 {
-            assert_eq!(assess(200, spent, f), Requirement::None);
-            spent += 200;
+            assert_eq!(assess(FRICTIONLESS_SINGLE, spent, f), Requirement::None);
+            spent += FRICTIONLESS_SINGLE;
         }
-        assert_eq!(assess(200, spent, f), Requirement::Pin);
+        assert_eq!(assess(FRICTIONLESS_SINGLE, spent, f), Requirement::Pin);
     }
 
     #[test]
@@ -643,7 +665,7 @@ mod tests {
         }
         // …and the amount may still raise it further.
         assert_eq!(
-            Requirement::Pin.max(assess(9_000, 0, DeviceTrust::Familiar)),
+            Requirement::Pin.max(assess(STEPUP_SINGLE + 1, 0, DeviceTrust::Familiar)),
             Requirement::PinAndOtp
         );
     }

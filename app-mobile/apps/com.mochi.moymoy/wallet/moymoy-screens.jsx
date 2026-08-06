@@ -643,15 +643,28 @@ function MoySend({ friends = [], onPick }) {
   );
 }
 
+/* 金額入力キーパッドの上限。旧仕様では amt 自体が整数エメで、9,999,999 が
+   その上限だった。amt は minor (1/100 エメ) を保持するようになったので、
+   同じ実質上限（9,999,999.00 エメ）を保つには ×100 する。単位が変わっただけで、
+   ユーザーが打てる最大金額という業務上の意味は変えていない。 */
+const MOY_MAX_AMOUNT_MINOR = 999999900;
+
 /* ─── 金額入力 (支払う / 送る 共用) ─────────────────────────────── */
 function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
+  // amt は 1/100 エメ単位 (minor) の整数。キーパッドの入力自体は従来どおり
+  // 「整数エメ」で、ここで内部だけ ×100 して保持する — ユーザーの打鍵の
+  // 感覚は変えない。全額ボタンは balance (minor) をそのまま渡すので端数
+  // （セント）を持つことがあり、そこから桁を打ち足すときは
+  // Math.floor(v / 100) でいったんエメの位に戻してから積み増す。
   const [amt, setAmt] = msState(0);
   const press = (k) => {
     setAmt(v => {
-      if (k === "⌫") return Math.floor(v / 10);
+      const eme = Math.floor(v / 100);
+      if (k === "⌫") return Math.floor(eme / 10) * 100;
       const add = k === "00" ? "00" : k;
-      const next = Number(String(v) + add);
-      return next > 9999999 ? v : next;
+      const nextEme = Number(String(eme) + add);
+      const next = nextEme * 100;
+      return next > MOY_MAX_AMOUNT_MINOR ? v : next;
     });
   };
   const over = amt > balance;
@@ -688,10 +701,10 @@ function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
           color: over ? "var(--carle-red)" : "var(--ink-soft)", letterSpacing: "0.04em" }}>
           {over ? "残高が不足しています" : `利用可能残高  ${formatEme(balance)} エメ`}
         </div>
-        {/* quick chips */}
+        {/* quick chips — 値は minor (+100 / +500 / +1000 エメ 相当)。 */}
         <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-          {[100, 500, 1000].map(q => (
-            <button key={q} onClick={() => setAmt(v => Math.min(9999999, v + q))} style={{
+          {[10000, 50000, 100000].map(q => (
+            <button key={q} onClick={() => setAmt(v => Math.min(MOY_MAX_AMOUNT_MINOR, v + q))} style={{
               border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "2px 2px 0 var(--ink)",
               padding: "7px 12px", cursor: "pointer", fontFamily: "var(--font-mono)", fontSize: 12, fontWeight: 700 }}>
               +{formatEme(q)}
@@ -742,14 +755,23 @@ function MoyEmeModeSwitch({ mode, onMode }) {
 
 /* ─── チャージ画面 (インベントリの手持ちエメラルドのみ) ──────────── */
 function MoyCharge({ balance, inv, canCharge, invStatus, attesting, onConfirmCharacter, onConfirm }) {
-  const available = inv.emeralds + inv.blocks * 9; // 9エメ = 1ブロック
+  // 換算可能額は物理インベントリ由来の整数エメ (9エメ = 1ブロック) を
+  // minor に直したもの。amt もこの後ずっと minor で持つので、以降
+  // available と amt はどちらも同じ単位で比較・加算できる。
+  const available = (inv.emeralds + inv.blocks * 9) * 100;
+  // amt は 1/100 エメ単位 (minor)。エメラルドは不可分なので、キーパッドは
+  // 従来どおり「整数エメ」だけを積み増せるようにする — Math.floor(v / 100) で
+  // 常にエメの位に戻してから桁を足すため、amt が 100 の倍数以外になることは
+  // 構造的に無く、サーバーの 400 に頼らず 1 エメ未満の入力を防げる。
   const [amt, setAmt] = msState(0);
   const press = (k) => {
     setAmt(v => {
-      if (k === "⌫") return Math.floor(v / 10);
+      const eme = Math.floor(v / 100);
+      if (k === "⌫") return Math.floor(eme / 10) * 100;
       const add = k === "00" ? "00" : k;
-      const next = Number(String(v) + add);
-      return next > 9999999 ? v : next;
+      const nextEme = Number(String(eme) + add);
+      const next = nextEme * 100;
+      return next > MOY_MAX_AMOUNT_MINOR ? v : next;
     });
   };
   const over = amt > available;
@@ -849,8 +871,9 @@ function MoyCharge({ balance, inv, canCharge, invStatus, attesting, onConfirmCha
         </div>
       </div>
       <div style={{ display: "flex", gap: 8, marginTop: 14, justifyContent: "center", flexWrap: "wrap" }}>
-        <button onClick={() => setAmt(v => Math.min(available, v + 9))} style={chipStyle}>＋1ブロック</button>
-        <button onClick={() => setAmt(v => Math.min(available, v + 64))} style={chipStyle}>＋1スタック</button>
+        {/* 900 = 9エメ (1ブロック分)、6400 = 64エメ (1スタック分)。minor 換算。 */}
+        <button onClick={() => setAmt(v => Math.min(available, v + 900))} style={chipStyle}>＋1ブロック</button>
+        <button onClick={() => setAmt(v => Math.min(available, v + 6400))} style={chipStyle}>＋1スタック</button>
         <button onClick={() => setAmt(available)} style={{ border: "1.5px solid var(--moy-deep)",
           background: "var(--moy-mint)", padding: "7px 12px", cursor: "pointer", color: "var(--moy-deep)",
           fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700 }}>全部</button>
@@ -875,18 +898,25 @@ const chipStyle = { border: "1.5px solid var(--ink)", background: "var(--bg-whit
 
 /* ─── 出金画面 (残高 → ゲーム内エメラルドで受け取る) ─────────────── */
 function MoyWithdraw({ balance, canCharge, invStatus, attesting, onConfirmCharacter, onConfirm }) {
-  const cap = Math.min(balance, 20736); // 1回の出金上限 = 20,736エメ（インベントリ1個分）
+  // 1回の出金上限 = 2,073,600 minor（= 20,736 エメ、インベントリ1個分）。
+  // balance が端数 (セント) を持つ場合に備え、全額ボタンが常に 100 の倍数を
+  // 渡せるよう、エメの位に切り捨ててから比較する。
+  const cap = Math.floor(Math.min(balance, 2073600) / 100) * 100;
+  // amt は 1/100 エメ単位 (minor)。MoyCharge と同じ理由で、キーパッドは
+  // 整数エメ単位でしか積み増せない（Math.floor(v / 100) で常にエメの位へ）。
   const [amt, setAmt] = msState(0);
   const press = (k) => {
     setAmt(v => {
-      if (k === "⌫") return Math.floor(v / 10);
+      const eme = Math.floor(v / 100);
+      if (k === "⌫") return Math.floor(eme / 10) * 100;
       const add = k === "00" ? "00" : k;
-      const next = Number(String(v) + add);
-      return next > 9999999 ? v : next;
+      const nextEme = Number(String(eme) + add);
+      const next = nextEme * 100;
+      return next > MOY_MAX_AMOUNT_MINOR ? v : next;
     });
   };
   const overBalance = amt > balance;
-  const overLimit = !overBalance && amt > 20736;
+  const overLimit = !overBalance && amt > 2073600;
   const over = overBalance || overLimit;
 
   if (!canCharge) {
@@ -951,8 +981,11 @@ function MoyWithdraw({ balance, canCharge, invStatus, attesting, onConfirmCharac
     );
   }
 
-  const blocks = Math.floor(amt / 9);
-  const rest = amt % 9;
+  // プレビューは物理エメラルド換算。amt (minor) を整数エメへ戻してから
+  // 9 で割る — 戻さずに割ると、ブロック数が100倍に見えてしまう。
+  const amtEme = Math.floor(amt / 100);
+  const blocks = Math.floor(amtEme / 9);
+  const rest = amtEme % 9;
 
   return (
     <div style={{ padding: "16px 16px 120px" }}>
@@ -985,13 +1018,14 @@ function MoyWithdraw({ balance, canCharge, invStatus, attesting, onConfirmCharac
         <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 11,
           color: over ? "var(--carle-red)" : "var(--ink-soft)" }}>
           {overBalance ? "残高が不足しています"
-            : overLimit ? "1回の出金は 20,736 エメまでです"
+            : overLimit ? `1回の出金は ${formatEme(2073600)} エメまでです`
             : `出金後残高  ${formatEme(balance - amt)} エメ`}
         </div>
       </div>
       <div style={{ display: "flex", gap: 8, marginTop: 14, justifyContent: "center", flexWrap: "wrap" }}>
-        <button onClick={() => setAmt(v => Math.min(cap, v + 9))} style={chipStyle}>＋1ブロック</button>
-        <button onClick={() => setAmt(v => Math.min(cap, v + 64))} style={chipStyle}>＋1スタック</button>
+        {/* 900 = 9エメ (1ブロック分)、6400 = 64エメ (1スタック分)。minor 換算。 */}
+        <button onClick={() => setAmt(v => Math.min(cap, v + 900))} style={chipStyle}>＋1ブロック</button>
+        <button onClick={() => setAmt(v => Math.min(cap, v + 6400))} style={chipStyle}>＋1スタック</button>
         <button onClick={() => setAmt(cap)} style={{ border: "1.5px solid var(--moy-deep)",
           background: "var(--moy-mint)", padding: "7px 12px", cursor: "pointer", color: "var(--moy-deep)",
           fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700 }}>全額</button>

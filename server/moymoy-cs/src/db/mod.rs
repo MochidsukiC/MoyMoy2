@@ -38,8 +38,12 @@ const SCHEMA_V6: &str = include_str!("schema_v6.sql");
 /// (`moymoy_sessions.mochi_account_id`) and the transactional
 /// `notification_outbox` wallet.rs writes inside each crediting transaction.
 const SCHEMA_V7: &str = include_str!("schema_v7.sql");
+/// The v8 delta: every amount column becomes an integer count of minor units
+/// (1/100 エメ) — a pure ×100 rescale, including the amounts frozen inside
+/// `idempotency.response_json` (rewritten in place, never deleted).
+const SCHEMA_V8: &str = include_str!("schema_v8.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -156,8 +160,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 7;
         tracing::info!("sqlite migrated to schema v7 (deposit notifications: device links + outbox)");
     }
-    // Future: `if version < 8 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V8)?;
-    //          tx.pragma_update(None, "user_version", 8)?; tx.commit()?; version = 8; }`
+    if version < 8 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V8)?;
+        tx.pragma_update(None, "user_version", 8)?;
+        tx.commit()?;
+        version = 8;
+        tracing::info!("sqlite migrated to schema v8 (amounts in minor units, 1/100 エメ)");
+    }
+    // Future: `if version < 9 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V9)?;
+    //          tx.pragma_update(None, "user_version", 9)?; tx.commit()?; version = 9; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }
@@ -258,6 +270,19 @@ mod tests {
             (SCHEMA_V3, 3),
             (SCHEMA_V4, 4),
         ] {
+            conn.execute_batch(sql).expect("schema step applies");
+            conn.pragma_update(None, "user_version", v).unwrap();
+        }
+        conn
+    }
+
+    /// A connection at exactly schema v7 — the state a deployed wallet is in
+    /// before the unit migration touches it. The v6 name backfill is skipped
+    /// deliberately: it is Rust, not SQL, and a synthetic DB seeds its own
+    /// merchants after this returns.
+    fn v7_db() -> Connection {
+        let conn = v4_db();
+        for (sql, v) in [(SCHEMA_V5, 5), (SCHEMA_V6, 6), (SCHEMA_V7, 7)] {
             conn.execute_batch(sql).expect("schema step applies");
             conn.pragma_update(None, "user_version", v).unwrap();
         }
@@ -452,6 +477,181 @@ mod tests {
             )
             .unwrap();
         assert_eq!((attempts, due), (0, 0));
+    }
+
+    /// v8 rescales every amount by 100 and NOTHING else.
+    ///
+    /// The failure this guards against is not "the migration did not run" — it is
+    /// "the migration ran over one column too few, or one too many". A missed
+    /// amount column is a balance out by 100×; a scaled counter is a lockout at
+    /// the wrong number of tries. So the assertions come in two halves and the
+    /// control half matters as much as the other one.
+    #[test]
+    fn migration_v8_scales_amounts_and_leaves_counts_alone() {
+        let mut conn = v7_db();
+        insert_account(&conn, "acct-a");
+        conn.execute(
+            "UPDATE accounts SET balance = 12345, failed_pin_attempts = 3 WHERE account_id = 'acct-a'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (id, account_id, kind, label, amount, balance_after, ts_unix_ms) \
+             VALUES ('t1', 'acct-a', 'charge', 'インベントリのエメラルド', 12345, 12345, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO merchants (merchant_id, account_id, name, created_unix_ms, \
+               daily_issue_cap, max_open_intents) \
+             VALUES ('m-capped', 'acct-a', 'Piggle Shop', 1, 50000, 20), \
+                    ('m-default', 'acct-a', '鉱石商会', 2, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO payment_intents (intent_id, merchant_id, amount, description, state, \
+               idem_key, created_unix_ms, updated_unix_ms, expires_unix_ms) \
+             VALUES ('pi_1', 'm-capped', 129, 'りんご 1個', 'created', 'ord-1', 1, 1, 9)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notification_outbox (outbox_id, account_id, kind, label, amount, \
+               created_unix_ms, attempts) \
+             VALUES ('o1', 'acct-a', 'receive', 'テスト から受取', 5, 1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO emerald_ops (op_id, idem_key, account_id, mc_uuid, direction, \
+               requested_amount, settled_amount, state, created_unix_ms, updated_unix_ms) \
+             VALUES ('op-settled', 'k-1', 'acct-a', 'uuid-1', 'charge', 40, 40, 'settled', 1, 1), \
+                    ('op-open', 'k-2', 'acct-a', 'uuid-1', 'withdraw', 7, NULL, 'sent', 1, 1)",
+            [],
+        )
+        .unwrap();
+        // One record of every shape the idempotency table actually holds.
+        idem_put(&conn, "k-send", "send", r#"{"ok":true,"balance":18846,"tx_id":"t-1"}"#).unwrap();
+        idem_put(&conn, "k-pay", "pay", r#"{"ok":true,"balance":0,"tx_id":"t-2"}"#).unwrap();
+        idem_put(
+            &conn,
+            "ord-1",
+            "mi:m-capped",
+            r#"{"ok":true,"amount":129,"intent_id":"pi_1","state":"created"}"#,
+        )
+        .unwrap();
+        idem_put(
+            &conn,
+            "k-c",
+            "charge:acct-a",
+            r#"{"ok":true,"op_id":"op-settled","state":"pending"}"#,
+        )
+        .unwrap();
+        idem_put(
+            &conn,
+            "k-w",
+            "withdraw:acct-a",
+            r#"{"ok":true,"op_id":"op-open","state":"pending"}"#,
+        )
+        .unwrap();
+
+        migrate(&mut conn).expect("v7 → v8");
+
+        let i = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let n = |sql: &str| -> Option<i64> { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let s = |sql: &str| -> String { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+
+        // Amounts: ×100, and the balance/ledger invariant survives it because both
+        // sides moved together.
+        assert_eq!(i("SELECT balance FROM accounts"), 1_234_500);
+        assert_eq!(i("SELECT amount FROM transactions"), 1_234_500);
+        assert_eq!(i("SELECT balance_after FROM transactions"), 1_234_500);
+        assert_eq!(i("SELECT amount FROM payment_intents"), 12_900);
+        assert_eq!(i("SELECT amount FROM notification_outbox"), 500);
+        assert_eq!(
+            i("SELECT daily_issue_cap FROM merchants WHERE merchant_id = 'm-capped'"),
+            5_000_000
+        );
+        // An unset cap stays unset: NULL means "the code's default", which is
+        // scaled in merchant.rs, and turning it into 0 would stop the shop billing.
+        assert_eq!(
+            n("SELECT daily_issue_cap FROM merchants WHERE merchant_id = 'm-default'"),
+            None
+        );
+        // Both emerald_ops amount columns, including the one an eye could mistake
+        // for a physical emerald count. The ÷100 to reach the mod is mc.rs's job.
+        assert_eq!(
+            i("SELECT requested_amount FROM emerald_ops WHERE op_id = 'op-settled'"),
+            4_000
+        );
+        assert_eq!(
+            i("SELECT settled_amount FROM emerald_ops WHERE op_id = 'op-settled'"),
+            4_000
+        );
+        assert_eq!(
+            i("SELECT requested_amount FROM emerald_ops WHERE op_id = 'op-open'"),
+            700
+        );
+        assert_eq!(
+            n("SELECT settled_amount FROM emerald_ops WHERE op_id = 'op-open'"),
+            None,
+            "an unsettled op was given an amount it never had"
+        );
+
+        // Controls: counts of things, not amounts of money.
+        assert_eq!(i("SELECT failed_pin_attempts FROM accounts"), 3);
+        assert_eq!(i("SELECT attempts FROM notification_outbox"), 2);
+        assert_eq!(
+            i("SELECT max_open_intents FROM merchants WHERE merchant_id = 'm-capped'"),
+            20
+        );
+
+        // The frozen replies. Rewritten in place — a deleted record would make the
+        // client's retry re-execute, which for a send is paying twice.
+        assert_eq!(
+            i("SELECT json_extract(response_json,'$.balance') FROM idempotency WHERE scope = 'send'"),
+            1_884_600
+        );
+        assert_eq!(
+            i("SELECT json_extract(response_json,'$.balance') FROM idempotency WHERE scope = 'pay'"),
+            0
+        );
+        assert_eq!(
+            s("SELECT json_extract(response_json,'$.tx_id') FROM idempotency WHERE scope = 'send'"),
+            "t-1",
+            "the rest of a frozen reply was disturbed"
+        );
+        // The merchant reply is scaled AND renamed, because /merchant/v1 no longer
+        // has an `amount`: a replay still answering the old key would hand the one
+        // third party involved a number in a unit the live API rejects.
+        assert_eq!(
+            i("SELECT json_extract(response_json,'$.amount_minor') FROM idempotency WHERE scope = 'mi:m-capped'"),
+            12_900
+        );
+        assert_eq!(
+            n("SELECT json_extract(response_json,'$.amount') FROM idempotency WHERE scope = 'mi:m-capped'"),
+            None,
+            "the old key survived alongside the new one"
+        );
+        assert_eq!(
+            s("SELECT json_extract(response_json,'$.intent_id') FROM idempotency WHERE scope = 'mi:m-capped'"),
+            "pi_1"
+        );
+        // Charge and withdraw records carry no amount, so they are left exactly as
+        // they were rather than rewritten for the sake of uniformity — an op_id is
+        // the one thing in there, and it is what a retry is answered with.
+        for (key, scope, op) in [
+            ("k-c", "charge:acct-a", "op-settled"),
+            ("k-w", "withdraw:acct-a", "op-open"),
+        ] {
+            let stored = idem_get(&conn, key, scope).unwrap().expect("record survives");
+            assert_eq!(
+                stored,
+                format!(r#"{{"ok":true,"op_id":"{op}","state":"pending"}}"#),
+                "{scope} was rewritten"
+            );
+        }
     }
 
     #[test]

@@ -172,13 +172,16 @@ function MerchantPortal({ open, onClose }) {
 
   function doLimits(m) {
     const open = parseInt(limits.max_open_intents, 10);
-    const cap = parseInt(limits.daily_issue_cap, 10);
+    // この入力欄は（プレースホルダ・案内文と同じく）整数エメで打たせる。
+    // daily_issue_cap はサーバ側では minor なので、送信直前にだけ ×100 する
+    // — ここを忘れると、加盟店が意図した上限の 1/100 がサーバへ通ってしまう。
+    const capEme = parseInt(limits.daily_issue_cap, 10);
     askPin({
       title: "PIN で確認", sub: m.name + " の発行上限を変更", cta: "変更する",
       run: async (pin) => {
         const r = await MoyMoy.merchantSetLimits(m.merchant_id, pin, {
           max_open_intents: Number.isFinite(open) ? open : undefined,
-          daily_issue_cap: Number.isFinite(cap) ? cap : undefined,
+          daily_issue_cap: Number.isFinite(capEme) ? capEme * 100 : undefined,
         });
         if (r.ok) setLimits({ max_open_intents: "", daily_issue_cap: "" });
         return r;
@@ -386,8 +389,11 @@ function MerchantPortal({ open, onClose }) {
                 <div className="h-section">発行上限の変更</div>
                 <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11,
                   color: "var(--ink-soft)", lineHeight: 1.7 }}>
-                  空欄の項目は変えません。上限は最大 {formatEme(500)} 件 /
-                  {" " + formatEme(2000000)} エメまでで、それを超える値は自動的に丸められます。
+                  {/* max_open_intents は件数 (単位なし) であって金額ではないので
+                      formatEme を通さない — 通すと minor 扱いされ「5.00」になる。
+                      daily_issue_cap は金額 (minor) なので formatEme を通す。 */}
+                  空欄の項目は変えません。上限は最大 500 件 /
+                  {" " + formatEme(200000000)} エメまでで、それを超える値は自動的に丸められます。
                 </div>
                 <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                   <div>
@@ -399,10 +405,13 @@ function MerchantPortal({ open, onClose }) {
                   </div>
                   <div>
                     <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>24時間の発行上限</div>
+                    {/* current.daily_issue_cap は minor。この欄はエメで打たせるので、
+                        プレースホルダも ÷100 してエメで見せる — 生の minor を出すと
+                        「変更しない」つもりで打ち直した値が100倍になる。 */}
                     <input value={limits.daily_issue_cap} inputMode="numeric"
                       aria-label="24時間の発行上限（エメ。空欄なら変更しません）"
                       onChange={(e) => setLimits({ ...limits, daily_issue_cap: e.target.value.replace(/[^0-9]/g, "") })}
-                      placeholder={String(current.daily_issue_cap)} style={fieldStyle} />
+                      placeholder={String(Math.floor(current.daily_issue_cap / 100))} style={fieldStyle} />
                   </div>
                 </div>
                 <button

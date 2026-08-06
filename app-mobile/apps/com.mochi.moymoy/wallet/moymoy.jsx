@@ -8,16 +8,28 @@
 
 const { useState: mmState, useEffect: mmEffect, useRef: mmRef } = React;
 
-/* ─── 通貨ヘルパ ─────────────────────────────────────────────────── */
+/* ─── 通貨ヘルパ ─────────────────────────────────────────────────────
+   サーバは金額を「1/100 エメの整数マイナーユニット (minor)」で返す。
+   formatEme はアプリ内で金額を表示する唯一の整形関数 — ÷100 して小数2桁で
+   表示する。整数の商・余りだけで組み立て、浮動小数を経由しない（丸め誤差を
+   表示直前の一瞬にも持ち込まないため）。 */
 function formatEme(n) {
   const neg = n < 0;
-  const s = Math.abs(Math.round(n)).toLocaleString("en-US");
+  const abs = Math.round(Math.abs(n));
+  const whole = Math.trunc(abs / 100);
+  const cents = abs % 100;
+  const s = whole.toLocaleString("en-US") + "." + String(cents).padStart(2, "0");
   return (neg ? "−" : "") + s;
 }
-// 9エメ = 1ブロック (Minecraft)
+// 9エメ = 1ブロック (Minecraft)。n は 1/100 エメ単位 (minor) の整数。
 function toBlocks(n) {
-  const b = Math.floor(Math.abs(n) / 9);
-  return b;
+  const eme = Math.floor(Math.abs(n) / 100);
+  return Math.floor(eme / 9);
+}
+/* ブロック数など、金額ではない整数を桁区切り表示する。formatEme とは別 —
+   minor を経由しない値（物理個数など）をここに通すと ÷100 されて壊れる。 */
+function formatCount(n) {
+  return Math.abs(Math.round(n)).toLocaleString("en-US");
 }
 
 /* ─── エメラルド宝石マーク (ロゴ / 通貨記号) ───────────────────────── */
@@ -44,8 +56,12 @@ function EmeGem({ size = 24, style, id = "eg" }) {
 
 /* ─── 通貨表示  ◈ 12,480 エメ ───────────────────────────────────── */
 function Eme({ amount, size = 40, weight = 800, gem = true, suffix = true, color, sign = false, style }) {
+  // 符号の出所は1箇所に決める: sign が立つときは Eme 自身が "+"/"−" を付け、
+  // formatEme には絶対値を渡す。formatEme も負数に自前で "−" を付けるので、
+  // 渡したままにすると "−−5.00" のような二重符号になる（旧実装のバグ）。
+  // sign が立たないときは、これまでどおり formatEme 自身の符号処理に任せる。
   const neg = amount < 0;
-  const txt = (sign ? (neg ? "−" : "+") : "") + formatEme(amount);
+  const txt = sign ? (neg ? "−" : "+") + formatEme(Math.abs(amount)) : formatEme(amount);
   return (
     <span style={{ display: "inline-flex", alignItems: "baseline", gap: size * 0.16,
       color: color || "inherit", lineHeight: 1, ...style }}>
@@ -351,7 +367,7 @@ function MoyHome({ balance, txns, profile, onTab }) {
           <div className="eyebrow" style={{ color: "var(--moy-deep)" }}>利用可能残高</div>
           <Eme amount={balance} size={46} color="var(--ink)" />
           <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)",
-            letterSpacing: "0.04em", marginTop: 4 }}>≈ {formatEme(toBlocks(balance))} エメラルドブロック</div>
+            letterSpacing: "0.04em", marginTop: 4 }}>≈ {formatCount(toBlocks(balance))} エメラルドブロック</div>
         </div>
       </div>
 
@@ -429,6 +445,6 @@ function TxnRow({ t, last }) {
 }
 
 Object.assign(window, {
-  formatEme, toBlocks, EmeGem, Eme, EmeraldBlockBg, MoyMoyCard,
+  formatEme, formatCount, toBlocks, EmeGem, Eme, EmeraldBlockBg, MoyMoyCard,
   playMoyChime, CompleteOverlay, MoyBottomNav, MoyHeader, MoyHome, TxnRow,
 });

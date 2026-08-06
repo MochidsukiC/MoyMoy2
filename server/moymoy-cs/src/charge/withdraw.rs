@@ -68,9 +68,9 @@ impl ChargeCoordinator {
             .await
     }
 
-    /// Begin a withdrawal: debit `amount` エメ, record a pending `emerald_ops` row
-    /// (idempotent on `(account_id, idem_key)`), ask the mod on `attester_id` to
-    /// grant the emeralds to `mc_uuid`, and return a pollable op
+    /// Begin a withdrawal: debit `amount` (minor units), record a pending
+    /// `emerald_ops` row (idempotent on `(account_id, idem_key)`), ask the mod on
+    /// `attester_id` to grant the emeralds to `mc_uuid`, and return a pollable op
     /// (`GET /wallet/op`). The mirror of [`begin_charge`](Self::begin_charge),
     /// with the order of the two halves reversed — see the module docs.
     ///
@@ -190,7 +190,7 @@ impl ChargeCoordinator {
                 amount,
                 "begin_withdraw",
             )
-            .await
+            .await?
             .unwrap_or_else(|| "pending".to_string());
         Ok(json!({ "ok": true, "op_id": op_id, "state": state }))
     }
@@ -230,8 +230,10 @@ impl ChargeCoordinator {
 /// somebody's assets.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WithdrawSettlement {
-    /// The mod reported granting this many エメ worth of emeralds. Any shortfall
-    /// against the reserve is refunded, because the ack proves it was not paid.
+    /// What the mod reported granting, in MINOR UNITS — the ack states a count of
+    /// emeralds and `ack_amount` converts it, so this compares against
+    /// `requested_amount` directly. Any shortfall against the reserve is refunded,
+    /// because the ack proves it was not paid.
     Granted(i64),
     /// Nothing was granted, and that is established — the mod said so, or the op
     /// provably never reached it. The whole reserve goes back.
@@ -566,60 +568,63 @@ mod tests {
     #[tokio::test]
     async fn begin_withdraw_debits_first_and_leaves_a_pollable_op() {
         let (pool, coord) = coordinator();
-        fund(&pool, 100);
+        fund(&pool, 10_000);
 
         let v = coord
-            .begin_withdraw("k1", "acct-a", UUID, "mc1", 40)
+            .begin_withdraw("k1", "acct-a", UUID, "mc1", 4_000)
             .await
             .unwrap();
         assert_eq!(v["ok"], json!(true));
         // The tunnel is down, so nothing was sent and the op waits for
         // reconciliation — with the eme already debited, which is the point.
         assert_eq!(v["state"], "pending");
-        assert_eq!(balance_of(&pool), 60);
-        assert_eq!(txns(&pool), vec![("withdraw".to_string(), -40)]);
+        assert_eq!(balance_of(&pool), 6_000);
+        assert_eq!(txns(&pool), vec![("withdraw".to_string(), -4_000)]);
         let op_id = v["op_id"].as_str().unwrap().to_string();
         assert_eq!(state_of(&pool, &op_id), "pending");
 
         // A retry of the same key replays that op instead of debiting again.
         let again = coord
-            .begin_withdraw("k1", "acct-a", UUID, "mc1", 40)
+            .begin_withdraw("k1", "acct-a", UUID, "mc1", 4_000)
             .await
             .unwrap();
         assert_eq!(again["op_id"], json!(op_id));
         assert_eq!(again["duplicate"], json!(true));
-        assert_eq!(balance_of(&pool), 60);
+        assert_eq!(balance_of(&pool), 6_000);
         assert_eq!(txns(&pool).len(), 1);
     }
 
     #[tokio::test]
     async fn a_withdrawal_that_cannot_proceed_writes_nothing_at_all() {
         let (pool, coord) = coordinator();
-        fund(&pool, 100);
+        fund(&pool, 10_000);
 
         let short = coord
-            .begin_withdraw("k-short", "acct-a", UUID, "mc1", 101)
+            .begin_withdraw("k-short", "acct-a", UUID, "mc1", 10_100)
             .await
             .unwrap();
         assert_eq!(short["ok"], json!(false));
         assert_eq!(short["error"], "insufficient");
-        assert_eq!(short["balance"], json!(100));
+        assert_eq!(short["balance"], json!(10_000));
 
         // A bad destination is refused BEFORE the debit, unlike a charge (which
         // creates the op first) — nothing is owed back because nothing was taken.
         let bad_uuid = coord
-            .begin_withdraw("k-uuid", "acct-a", "not-a-uuid", "mc1", 10)
+            .begin_withdraw("k-uuid", "acct-a", "not-a-uuid", "mc1", 1_000)
             .await
             .unwrap();
         assert_eq!(bad_uuid["error"], "bad_uuid");
 
+        // One minor unit over the bound is still over it: the ceiling is on the
+        // ledger amount, and a withdrawal is refused before anything asks whether
+        // that amount is a whole number of emeralds.
         let over = coord
             .begin_withdraw("k-max", "acct-a", UUID, "mc1", wallet::MAX_WITHDRAW_PER_OP + 1)
             .await
             .unwrap();
         assert_eq!(over["error"], "bad_amount");
 
-        assert_eq!(balance_of(&pool), 100);
+        assert_eq!(balance_of(&pool), 10_000);
         assert!(txns(&pool).is_empty());
         // No idempotency record either: the user must be able to top up and reuse
         // the very same key.
@@ -635,15 +640,17 @@ mod tests {
     fn a_granted_ack_settles_without_moving_the_balance_again() {
         let (pool, _coord) = coordinator();
         fund(&pool, 0); // the 10 エメ are already reserved by the op below
-        insert_withdraw(&pool, "op-w", "sent", 10, false);
+        insert_withdraw(&pool, "op-w", "sent", 1_000, false);
 
+        // 10 emeralds, which is the 1,000 minor units the op reserved: the ack
+        // speaks the mod's unit and the ledger records its own.
         withdraw_ack(
             &pool,
             json!({ "op_id": "op-w", "status": "ok", "granted": 10 }),
         );
 
         assert_eq!(state_of(&pool, "op-w"), "settled");
-        assert_eq!(settled_of(&pool, "op-w"), Some(10));
+        assert_eq!(settled_of(&pool, "op-w"), Some(1_000));
         // The debit stands: the player has the emeralds.
         assert_eq!(balance_of(&pool), 0);
         assert!(txns(&pool).is_empty());
@@ -653,19 +660,21 @@ mod tests {
     fn a_partial_grant_refunds_only_the_shortfall() {
         let (pool, _coord) = coordinator();
         fund(&pool, 0);
-        insert_withdraw(&pool, "op-w", "sent", 10, false);
+        insert_withdraw(&pool, "op-w", "sent", 1_000, false);
 
         // Shouldn't happen, but the ack states exactly what was paid, so the rest
-        // is provably unpaid and goes back.
+        // is provably unpaid and goes back. 4 emeralds of the 10 reserved ⇒ 400
+        // minor settled, 600 refunded — the shortfall is computed AFTER the two
+        // sides are in the same unit, which is the arithmetic this pins.
         withdraw_ack(
             &pool,
             json!({ "op_id": "op-w", "status": "duplicate", "granted": 4 }),
         );
 
         assert_eq!(state_of(&pool, "op-w"), "settled");
-        assert_eq!(settled_of(&pool, "op-w"), Some(4));
-        assert_eq!(balance_of(&pool), 6);
-        assert_eq!(txns(&pool), vec![("withdraw".to_string(), 6)]);
+        assert_eq!(settled_of(&pool, "op-w"), Some(400));
+        assert_eq!(balance_of(&pool), 600);
+        assert_eq!(txns(&pool), vec![("withdraw".to_string(), 600)]);
     }
 
     #[test]
@@ -675,7 +684,7 @@ mod tests {
         // not idempotent mints eme on every repeat.
         let (pool, _coord) = coordinator();
         fund(&pool, 0);
-        insert_withdraw(&pool, "op-w", "sent", 10, false);
+        insert_withdraw(&pool, "op-w", "sent", 1_000, false);
 
         let ack = json!({ "op_id": "op-w", "status": "player_offline", "granted": 0 });
         for _ in 0..5 {
@@ -684,17 +693,17 @@ mod tests {
 
         assert_eq!(state_of(&pool, "op-w"), "failed");
         assert_eq!(settled_of(&pool, "op-w"), Some(0));
-        assert_eq!(balance_of(&pool), 10);
-        assert_eq!(txns(&pool), vec![("withdraw".to_string(), 10)]);
+        assert_eq!(balance_of(&pool), 1_000);
+        assert_eq!(txns(&pool), vec![("withdraw".to_string(), 1_000)]);
     }
 
     #[test]
     fn an_unprovable_ack_parks_the_op_and_never_refunds() {
         let (pool, _coord) = coordinator();
         fund(&pool, 0);
-        insert_withdraw(&pool, "op-unknown", "sent", 10, false);
-        insert_withdraw(&pool, "op-internal", "sent", 10, false);
-        insert_withdraw(&pool, "op-novel", "sent", 10, false);
+        insert_withdraw(&pool, "op-unknown", "sent", 1_000, false);
+        insert_withdraw(&pool, "op-internal", "sent", 1_000, false);
+        insert_withdraw(&pool, "op-novel", "sent", 1_000, false);
 
         // `unknown` = the mod claimed the op but cannot prove it paid (its crash
         // window). `internal_error` = it died inside the handler. A status this
@@ -727,9 +736,9 @@ mod tests {
         // payout the player is holding — emeralds and eme both.
         let (pool, _coord) = coordinator();
         fund(&pool, 0);
-        insert_withdraw(&pool, "op-missing", "sent", 10, false);
-        insert_withdraw(&pool, "op-fractional", "sent", 10, false);
-        insert_withdraw(&pool, "op-float", "sent", 10, false);
+        insert_withdraw(&pool, "op-missing", "sent", 1_000, false);
+        insert_withdraw(&pool, "op-fractional", "sent", 1_000, false);
+        insert_withdraw(&pool, "op-float", "sent", 1_000, false);
 
         withdraw_ack(&pool, json!({ "op_id": "op-missing", "status": "ok" }));
         withdraw_ack(
@@ -745,7 +754,7 @@ mod tests {
         assert_eq!(state_of(&pool, "op-missing"), "stuck");
         assert_eq!(state_of(&pool, "op-fractional"), "stuck");
         assert_eq!(state_of(&pool, "op-float"), "settled");
-        assert_eq!(settled_of(&pool, "op-float"), Some(10));
+        assert_eq!(settled_of(&pool, "op-float"), Some(1_000));
         assert_eq!(balance_of(&pool), 0);
         assert!(txns(&pool).is_empty());
     }
@@ -754,7 +763,7 @@ mod tests {
     fn a_parked_withdrawal_can_still_settle_but_can_never_auto_refund() {
         let (pool, _coord) = coordinator();
         fund(&pool, 0);
-        insert_withdraw(&pool, "op-w", "stuck", 10, false);
+        insert_withdraw(&pool, "op-w", "stuck", 1_000, false);
 
         // A failure ack arriving late must NOT refund: `stuck` means the payout may
         // already be in the player's inventory, and paying the eme back too would
@@ -781,15 +790,15 @@ mod tests {
     async fn the_dead_letter_pass_refunds_undelivered_withdrawals_once_and_parks_delivered_ones() {
         let (pool, coord) = coordinator();
         fund(&pool, 0); // 10 + 7 エメ are reserved by the two withdrawals below
-        insert_withdraw(&pool, "w-pending", "pending", 10, true);
-        insert_withdraw(&pool, "w-sent", "sent", 7, true);
+        insert_withdraw(&pool, "w-pending", "pending", 1_000, true);
+        insert_withdraw(&pool, "w-sent", "sent", 700, true);
         insert_full_op(
             &pool,
             "c-pending",
             Some("mc1"),
             "charge",
             "pending",
-            10,
+            1_000,
             now_ms() - DEAD_LETTER_MS - 1_000,
         );
         insert_full_op(
@@ -798,11 +807,11 @@ mod tests {
             Some("mc1"),
             "charge",
             "sent",
-            10,
+            1_000,
             now_ms() - DEAD_LETTER_MS - 1_000,
         );
         // A fresh withdrawal is not overdue and must be left alone.
-        insert_withdraw(&pool, "w-fresh", "pending", 5, false);
+        insert_withdraw(&pool, "w-fresh", "pending", 500, false);
 
         // Twice: an ageing op is revisited on every cycle, so the refund has to be
         // a one-off, not a per-pass event.
@@ -821,8 +830,8 @@ mod tests {
         // no-op that leaves it where it was).
         assert_eq!(state_of(&pool, "w-fresh"), "pending");
 
-        assert_eq!(balance_of(&pool), 10);
-        assert_eq!(txns(&pool), vec![("withdraw".to_string(), 10)]);
+        assert_eq!(balance_of(&pool), 1_000);
+        assert_eq!(txns(&pool), vec![("withdraw".to_string(), 1_000)]);
     }
 
     #[tokio::test]
@@ -832,19 +841,19 @@ mod tests {
         // path where that would be easiest to get wrong.
         let (pool, coord) = coordinator();
         fund(&pool, 0);
-        insert_full_op(&pool, "w-null-pending", None, "withdraw", "pending", 10, now_ms());
-        insert_full_op(&pool, "w-null-sent", None, "withdraw", "sent", 7, now_ms());
+        insert_full_op(&pool, "w-null-pending", None, "withdraw", "pending", 1_000, now_ms());
+        insert_full_op(&pool, "w-null-sent", None, "withdraw", "sent", 700, now_ms());
         // A direction nothing knows how to drive: escalated, never guessed at, and
         // never refunded (an unknown direction says nothing about what was
         // reserved).
-        insert_full_op(&pool, "w-alien", Some("mc1"), "transmute", "pending", 3, now_ms());
+        insert_full_op(&pool, "w-alien", Some("mc1"), "transmute", "pending", 300, now_ms());
 
         coord.reconcile().await;
 
         assert_eq!(state_of(&pool, "w-null-pending"), "failed");
         assert_eq!(state_of(&pool, "w-null-sent"), "stuck");
         assert_eq!(state_of(&pool, "w-alien"), "stuck");
-        assert_eq!(balance_of(&pool), 10);
-        assert_eq!(txns(&pool), vec![("withdraw".to_string(), 10)]);
+        assert_eq!(balance_of(&pool), 1_000);
+        assert_eq!(txns(&pool), vec![("withdraw".to_string(), 1_000)]);
     }
 }

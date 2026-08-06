@@ -142,13 +142,18 @@ struct PendingOp {
     state: String,
 }
 
-/// Player inventory snapshot for the charge screen (9 eme = 1 block).
+/// Player inventory snapshot for the charge screen (9 emeralds = 1 block).
 ///
 /// `reachable`/`online` keep the three real outcomes distinct instead of
 /// collapsing them to "0 emeralds": `reachable=false` ⇒ the mod never answered
 /// (offline / server doesn't host moymoy / MC connector down); `online=false` ⇒
 /// the mod answered but the UUID isn't a live player there (a UUID mismatch shows
 /// up here, NOT as a genuine zero balance).
+///
+/// **`emeralds` and `blocks` are item counts; `chargeable` is money.** They are
+/// the same numbers in different units and are served side by side, so the field
+/// that is an amount is in minor units like every other amount and the two that
+/// are stacks of items are not.
 #[derive(Debug)]
 pub struct Inventory {
     pub reachable: bool,
@@ -156,6 +161,21 @@ pub struct Inventory {
     pub emeralds: i64,
     pub blocks: i64,
     pub chargeable: i64,
+}
+
+/// What an inventory of `emeralds` loose emeralds and `blocks` emerald blocks is
+/// worth, in minor units.
+///
+/// Saturating rather than checked: this is the number on a charge screen, and a
+/// mod reporting an impossible inventory is a display problem, not a settlement
+/// one — nothing is credited from here, and what a charge actually moves is
+/// bounded by the request and by the mod's own ack. Wrapping would show a
+/// negative balance instead.
+fn chargeable_minor(emeralds: i64, blocks: i64) -> i64 {
+    blocks
+        .saturating_mul(9)
+        .saturating_add(emeralds)
+        .saturating_mul(crate::mc::MINOR_PER_EMERALD)
 }
 
 /// Drives emerald charges over the backend's cs tunnel. Holds the SQLite pool
@@ -195,7 +215,7 @@ impl ChargeCoordinator {
                 online,
                 emeralds,
                 blocks,
-                chargeable: emeralds + blocks * 9,
+                chargeable: chargeable_minor(emeralds, blocks),
             }),
             // No round-trip: keep it distinct from a real zero so the UI can say
             // WHY (character offline / not in-game / MC-side not set up).
@@ -364,7 +384,7 @@ impl ChargeCoordinator {
                 amount,
                 "begin_charge",
             )
-            .await
+            .await?
             .unwrap_or_else(|| "pending".to_string());
         Ok(json!({ "ok": true, "op_id": op_id, "state": state }))
     }
@@ -390,6 +410,14 @@ impl ChargeCoordinator {
     /// * ambiguous → `sent`, which the dead-letter pass escalates to `stuck` for
     ///   manual review rather than writing consumed emeralds off or refunding a
     ///   payout that may have landed
+    ///
+    /// `Err` is the fourth, and it is NOT one of those transitions: `amount` could
+    /// not be expressed as a number of emeralds, so nothing was built and nothing
+    /// was sent (`crate::mc::to_physical`). It surfaces rather than being folded
+    /// into `None`, because "nothing happened this time" and "nothing can ever
+    /// happen for this amount" want different answers — the first is a retry, the
+    /// second is a `500` the caller sees and an op the dead-letter pass terminates
+    /// on the safe side, exactly as it terminates one that never left.
     #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
@@ -400,20 +428,20 @@ impl ChargeCoordinator {
         idem_key: &str,
         amount: i64,
         origin: &str,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, ApiError> {
         let outcome = match direction {
             OpDirection::Charge => {
                 self.mc
                     .send_charge(attester_id, uuid, op_id, idem_key, amount)
-                    .await
+                    .await?
             }
             OpDirection::Withdraw => {
                 self.mc
                     .send_withdraw(attester_id, uuid, op_id, idem_key, amount)
-                    .await
+                    .await?
             }
         };
-        match outcome {
+        Ok(match outcome {
             ChargeOutcome::Acked(ack) => Some(self.settle_now(direction, op_id, ack).await),
             ChargeOutcome::ServerUnreachable | ChargeOutcome::NotSent => None,
             ChargeOutcome::Ambiguous(msg) => {
@@ -422,7 +450,7 @@ impl ChargeCoordinator {
                 self.set_state(op_id, "sent").await;
                 Some("sent".to_string())
             }
-        }
+        })
     }
 
     /// Apply the mod's ack to the ledger and read back the op's resulting state,
@@ -588,9 +616,12 @@ impl ChargeCoordinator {
             };
             match Uuid::parse_str(&op.mc_uuid) {
                 // The resulting state is written to the ledger by `drive` itself;
-                // reconciliation reports to nobody, so it is discarded here.
+                // reconciliation reports to nobody, so it is discarded here — but
+                // an amount that cannot go on the wire is logged rather than
+                // dropped, because every future pass will fail on it identically
+                // and the op is only ever closed by the dead-letter pass.
                 Ok(uuid) => {
-                    let _ = self
+                    if let Err(e) = self
                         .drive(
                             direction,
                             attester_id,
@@ -600,7 +631,13 @@ impl ChargeCoordinator {
                             op.amount,
                             "reconcile",
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::error!(op_id = %op.op_id, direction = direction.as_str(), error = %e,
+                            "reconcile: this op's amount cannot be expressed on the wire, so nothing \
+                             was sent — it stays open for the dead-letter pass (which is safe: an op \
+                             that never left consumed and granted nothing)");
+                    }
                 }
                 Err(e) => {
                     // A persisted mc_uuid that fails to parse can never succeed;
@@ -688,26 +725,36 @@ impl ChargeCoordinator {
     }
 }
 
-/// Read a mod-reported amount off an ack.
+/// Read a mod-reported amount off an ack **and convert it into the ledger's minor
+/// units**.
+///
+/// The mod counts emeralds; everything past this function counts minor units. Both
+/// settlers go through here — the charge one for `settled`, the withdraw one for
+/// `granted` — which is what lets them compare the result against
+/// `requested_amount` (already minor) in the same expression. Converting at the
+/// call sites instead would be two chances to forget, on the two statements that
+/// decide how much money moves.
 ///
 /// Integer emerald counts encoded as floats (e.g. `100.0` by Gson/Java defaults)
 /// make `as_i64()` return `None`, so fractionless floats are accepted too; a true
-/// non-integer float is not (it is not a number of emeralds).
+/// non-integer float is not (there is no half emerald).
 ///
 /// `None` means "the mod did not tell us a usable amount" and is deliberately NOT
 /// zero — the two callers cannot afford the same default. See each of them.
 fn ack_amount(ack: &Value, field: &str) -> Option<i64> {
-    ack.get(field).and_then(|v| {
-        v.as_i64().or_else(|| {
-            v.as_f64().and_then(|f| {
-                if f.fract() == 0.0 {
-                    Some(f as i64)
-                } else {
-                    None
-                }
+    ack.get(field)
+        .and_then(|v| {
+            v.as_i64().or_else(|| {
+                v.as_f64().and_then(|f| {
+                    if f.fract() == 0.0 {
+                        Some(f as i64)
+                    } else {
+                        None
+                    }
+                })
             })
         })
-    })
+        .and_then(crate::mc::to_minor)
 }
 
 /// Settle a charge ack into the ledger. `ack` = `{op_id, status, settled}`.
@@ -842,6 +889,45 @@ mod tests {
         assert_ne!(charge_scope("acct-a"), "charge");
     }
 
+    #[test]
+    fn a_mod_reported_amount_arrives_in_the_ledgers_units() {
+        // The mod says "10 emeralds"; the ledger has to hear 1,000 minor units,
+        // because the very next thing both settlers do is compare it against
+        // `requested_amount`. Reading it raw would settle a charge at a hundredth
+        // of what was asked and park every withdrawal as a shortfall.
+        assert_eq!(
+            ack_amount(&json!({ "settled": 10 }), "settled"),
+            Some(1_000)
+        );
+        assert_eq!(
+            ack_amount(&json!({ "granted": 10 }), "granted"),
+            Some(1_000)
+        );
+        // Gson writes integer counts as floats; still emeralds, still converted.
+        assert_eq!(ack_amount(&json!({ "settled": 10.0 }), "settled"), Some(1_000));
+        // Half an emerald is not a count of emeralds, converted or otherwise.
+        assert_eq!(ack_amount(&json!({ "settled": 9.5 }), "settled"), None);
+        assert_eq!(ack_amount(&json!({ "settled": "10" }), "settled"), None);
+        assert_eq!(ack_amount(&json!({}), "settled"), None);
+        // Each direction still reads only its own field.
+        assert_eq!(ack_amount(&json!({ "granted": 10 }), "settled"), None);
+    }
+
+    #[test]
+    fn the_charge_screen_is_shown_money_not_items() {
+        // 9 emeralds per block, then into minor units — the block rate is an
+        // in-world fact and the ×100 is the ledger's, and they compose in that
+        // order.
+        assert_eq!(chargeable_minor(0, 0), 0);
+        assert_eq!(chargeable_minor(7, 0), 700);
+        assert_eq!(chargeable_minor(0, 1), 900);
+        assert_eq!(chargeable_minor(5, 2), (5 + 18) * 100);
+        // A mod reporting an impossible inventory produces a large number, never a
+        // negative one: this is what a charge screen displays, and a wrapped total
+        // would show the player a debt.
+        assert_eq!(chargeable_minor(i64::MAX, i64::MAX), i64::MAX);
+    }
+
     #[tokio::test]
     async fn reconcile_never_redrives_an_op_without_an_attester() {
         let (pool, coord) = coordinator();
@@ -910,7 +996,7 @@ mod tests {
     fn neither_direction_can_settle_the_others_op() {
         let (pool, _coord) = coordinator();
         fund(&pool, 0);
-        insert_withdraw(&pool, "op-w", "sent", 10, false);
+        insert_withdraw(&pool, "op-w", "sent", 1_000, false);
         insert_op(&pool, "op-c", Some("mc1"), "sent");
 
         // A charge settlement on a withdrawal would CREDIT the account the amount

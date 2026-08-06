@@ -2,6 +2,12 @@
 //!
 //! Extracted so both can build the same ledger states without either one
 //! reaching into the other's test module.
+//!
+//! **Every `amount` here is minor units (1/100 エメ)**, because that is what the
+//! ledger columns hold — while the `settled`/`granted` an ack carries is a count
+//! of emeralds, because that is what the mod counts. The tests state both, so a
+//! reserve of `1_000` settled by a `granted: 10` is also an assertion that the
+//! conversion in `crate::mc` happened.
 
 use super::*;
 use crate::db::Pool;
@@ -26,7 +32,7 @@ pub(super) fn coordinator() -> (Pool, ChargeCoordinator) {
 }
 
 pub(super) fn insert_op(pool: &Pool, op_id: &str, attester: Option<&str>, state: &str) {
-    insert_full_op(pool, op_id, attester, "charge", state, 10, now_ms());
+    insert_full_op(pool, op_id, attester, "charge", state, 1_000, now_ms());
 }
 
 /// An `emerald_ops` row exactly as written, for the cases a test needs to

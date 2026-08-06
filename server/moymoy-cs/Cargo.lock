@@ -863,6 +863,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mochi-band-tls"
+version = "0.1.0"
+dependencies = [
+ "mochi-profile",
+ "pem",
+ "rustls",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "mochi-config"
 version = "0.1.0"
 dependencies = [
@@ -879,11 +890,11 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "mochi-band-tls",
  "mochi-config",
  "mochi-hub-enroll-client",
  "mochi-hub-tunnel-client",
  "mochi-profile",
- "pem",
  "reqwest",
  "rustls",
  "serde_json",

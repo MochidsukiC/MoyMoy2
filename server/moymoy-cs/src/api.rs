@@ -69,6 +69,7 @@ use crate::charge::ChargeCoordinator;
 use crate::db::{self, now_ms, Pool};
 use crate::error::ApiError;
 use crate::identity;
+use crate::mc;
 use crate::merchant::{self, RateLimiter};
 use crate::otp::{self, CreateOtp, Mailer, PendingSignup, VerifyOtp};
 use crate::payments;
@@ -1088,6 +1089,7 @@ async fn charge(
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
+    whole_emeralds(req.amount)?;
     if !st.can_charge() {
         return Ok(Json(json!({ "ok": false, "error": "mc_unavailable" })));
     }
@@ -1185,6 +1187,7 @@ async fn withdraw(
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
+    whole_emeralds(req.amount)?;
     if !st.can_charge() {
         return Ok(Json(json!({ "ok": false, "error": "mc_unavailable" })));
     }
@@ -1462,6 +1465,30 @@ async fn link(
     Ok(Json(value))
 }
 
+/// Refuse an amount that is not a whole number of emeralds.
+///
+/// **The one rule that does not apply to the whole wallet.** `/wallet/send` and a
+/// payment approval move a number, so they take any amount down to a single minor
+/// unit; a charge and a withdrawal end with the mod destroying or creating ITEMS,
+/// and there is no such thing as a hundredth of an emerald. So the two directions
+/// that cross into the world — and only those two — require a multiple of
+/// [`mc::MINOR_PER_EMERALD`].
+///
+/// It is refused here, at the edge, rather than left to the mod-facing adapter
+/// (`crate::mc`) that also checks it: this is the caller's mistake and deserves a
+/// `400` naming it, while the same condition reaching the adapter would mean the
+/// backend built the request and is a `500`.
+fn whole_emeralds(amount: i64) -> Result<(), ApiError> {
+    if amount % mc::MINOR_PER_EMERALD != 0 {
+        return Err(ApiError::bad_request(format!(
+            "amount must be a whole number of emeralds: {amount} is not a multiple of \
+             {} (amounts are in 1/100 エメ, and emeralds cannot be split)",
+            mc::MINOR_PER_EMERALD
+        )));
+    }
+    Ok(())
+}
+
 /// Run a blocking DB closure on the blocking pool, mapping pool/join failures to
 /// `ApiError`.
 pub(crate) async fn blocking<T, F>(pool: Pool, f: F) -> Result<T, ApiError>
@@ -1561,6 +1588,21 @@ mod tests {
         )
         .await
         .expect("the gate answers")
+    }
+
+    #[test]
+    fn the_two_in_world_directions_refuse_a_fraction_of_an_emerald() {
+        // 400, not 500 and not a rounded charge: the caller asked for something
+        // that does not exist, and the answer has to say so rather than quietly
+        // consume 10 emeralds for an 10.5-emerald request.
+        for amount in [1, 99, 101, 1_050, riskauth::FRICTIONLESS_SINGLE + 1] {
+            let e = whole_emeralds(amount).expect_err("{amount} was accepted");
+            assert_eq!(e.status, 400, "{amount}");
+            assert_eq!(e.code, "bad_request", "{amount}");
+        }
+        for amount in [100, 1_000, mc::MINOR_PER_EMERALD * 20_736] {
+            assert!(whole_emeralds(amount).is_ok(), "{amount} was refused");
+        }
     }
 
     /// A withdrawal asks for the PIN BEFORE the in-world consent.

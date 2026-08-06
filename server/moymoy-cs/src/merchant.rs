@@ -85,12 +85,18 @@ pub const MAX_MERCHANTS_PER_ACCOUNT: i64 = 3;
 /// risk). Nothing can claw money back once it has been withdrawn to the MC world,
 /// so what is limited instead is the speed at which a shop can ask for money:
 /// how many bills it may have outstanding, and how much it may bill in a day.
+///
+/// `*_INTENTS` are counts of bills; `*_ISSUE_CAP`/`*_ISSUE_CEILING` are amounts
+/// and so are in minor units (1/100 エメ) like everything else — 5,000,000 minor
+/// is 50,000 エメ a day. The v8 unit migration scaled the amounts and left the
+/// counts alone, which is the whole distinction to keep in mind here: the two
+/// kinds of ceiling sit side by side in the same struct and the same request body.
 pub const DEFAULT_MAX_OPEN_INTENTS: i64 = 20;
-pub const DEFAULT_DAILY_ISSUE_CAP: i64 = 50_000;
+pub const DEFAULT_DAILY_ISSUE_CAP: i64 = 5_000_000;
 /// The most the portal will raise those to. A raise costs session + PIN, so this
 /// is the ceiling on what a leaked API key could ever be talked into.
 pub const MAX_OPEN_INTENTS_CEILING: i64 = 500;
-pub const MAX_DAILY_ISSUE_CEILING: i64 = 2_000_000;
+pub const MAX_DAILY_ISSUE_CEILING: i64 = 200_000_000;
 
 /// Rate limits as `(calls, window_ms)`.
 ///
@@ -682,7 +688,11 @@ pub fn set_limits(
     daily_issue_cap: Option<i64>,
 ) -> rusqlite::Result<bool> {
     let open = max_open_intents.map(|v| v.clamp(1, MAX_OPEN_INTENTS_CEILING));
-    let cap = daily_issue_cap.map(|v| v.clamp(1, MAX_DAILY_ISSUE_CEILING));
+    // The floors differ because the units do: one open intent is the smallest
+    // meaningful count, and one エメ (MINOR_PER_EME) is the smallest daily cap
+    // worth having. A floor of `1` here would be a cap of one hundredth of an エメ
+    // a day, which is indistinguishable from a shop that cannot trade at all.
+    let cap = daily_issue_cap.map(|v| v.clamp(crate::wallet::MINOR_PER_EME, MAX_DAILY_ISSUE_CEILING));
     let changed = tx.execute(
         "UPDATE merchants SET max_open_intents = COALESCE(?3, max_open_intents), \
                 daily_issue_cap = COALESCE(?4, daily_issue_cap), updated_unix_ms = ?5 \
@@ -1199,7 +1209,15 @@ pub(crate) async fn portal_list(
 #[derive(Deserialize)]
 pub(crate) struct IntentCreateReq {
     idem_key: String,
-    amount: i64,
+    /// What to bill, in minor units (1/100 エメ) — `1250` is 12.50 エメ.
+    ///
+    /// Optional in the struct only so the old key below can be reported properly;
+    /// [`amount_minor`](IntentCreateReq::amount_minor) refuses a request without
+    /// it.
+    amount_minor: Option<i64>,
+    /// The pre-v8 field, which meant whole エメ. **Accepted by the parser purely
+    /// in order to refuse it** — see [`amount_minor`](IntentCreateReq::amount_minor).
+    amount: Option<i64>,
     description: String,
     order_ref: Option<String>,
     launch_app_id: Option<String>,
@@ -1207,6 +1225,50 @@ pub(crate) struct IntentCreateReq {
     /// stops anyone else from approving, but it never makes them pay.
     payer_hint_handle: Option<String>,
     expires_in_secs: Option<i64>,
+}
+
+impl IntentCreateReq {
+    /// The amount to bill, or the refusal to send instead.
+    ///
+    /// **The rename from `amount` to `amount_minor` is the safety mechanism, not
+    /// cosmetics.** Reusing `amount` with a new meaning would leave a wallet and a
+    /// shop that disagree about the unit unable to notice: an integrator echoing
+    /// the amount back compares its own number against itself, and one that
+    /// derives the expected total from the same order row compares two values that
+    /// came from the same side. Both agree while the customer is billed a hundred
+    /// times too much (shop not upgraded) or a hundredth (wallet not upgraded),
+    /// and the goods ship either way.
+    ///
+    /// A key that only the new unit uses makes the mismatch a `400` at order
+    /// creation — before any money moves, in whichever direction the versions are
+    /// skewed. That is worth more than the compatibility it costs.
+    fn amount_minor(&self) -> Result<i64, (StatusCode, Json<Value>)> {
+        match (self.amount_minor, self.amount) {
+            // Whichever else is present: a caller still sending `amount` is
+            // stating an amount in a unit this API no longer has.
+            (_, Some(amount)) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": "unsupported_amount_unit",
+                    "detail": format!(
+                        "`amount` counted whole エメ and is no longer accepted; send \
+                         `amount_minor` in 1/100 エメ instead (the {amount} you sent would be \
+                         {amount}00 as amount_minor)"
+                    ),
+                })),
+            )),
+            (Some(minor), None) => Ok(minor),
+            (None, None) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": "missing_amount_minor",
+                    "detail": "`amount_minor` (1/100 エメ) is required",
+                })),
+            )),
+        }
+    }
 }
 
 pub(crate) async fn intent_create(
@@ -1217,6 +1279,13 @@ pub(crate) async fn intent_create(
     if req.idem_key.trim().is_empty() {
         return Err(ApiError::bad_request("idem_key required"));
     }
+    // Before the rate limiter and before the idempotency replay: a caller on the
+    // wrong side of the unit change must never reach a frozen success, and an
+    // request this API cannot read has not used up anybody's issuance budget.
+    let amount_minor = match req.amount_minor() {
+        Ok(a) => a,
+        Err(refused) => return Ok(refused),
+    };
     if let Err(retry_after_ms) = st.rate.check(
         &format!("mint:{}", m.merchant.merchant_id),
         RL_INTENT_CREATE.0,
@@ -1250,7 +1319,7 @@ pub(crate) async fn intent_create(
             &m.merchant,
             &NewIntent {
                 idem_key: &req.idem_key,
-                amount: req.amount,
+                amount: amount_minor,
                 description: &req.description,
                 order_ref: req.order_ref.as_deref(),
                 launch_app_id: req.launch_app_id.as_deref(),
@@ -1260,9 +1329,13 @@ pub(crate) async fn intent_create(
         )?;
         let v = match out {
             CreateOutcome::Ok(i) => {
+                // `amount_minor` on the way out as well as in: an integrator that
+                // reads back `amount` gets nothing rather than a number in a unit
+                // it would misread. The reply is frozen for replay, so v8 renames
+                // the key inside the stored records too (schema_v8.sql §5).
                 let v = json!({
                     "ok": true, "intent_id": i.intent_id, "state": i.state,
-                    "amount": i.amount, "expires_unix_ms": i.expires_unix_ms,
+                    "amount_minor": i.amount, "expires_unix_ms": i.expires_unix_ms,
                 });
                 db::idem_put(&tx, &req.idem_key, &scope, &v.to_string())?;
                 v
@@ -1360,6 +1433,53 @@ fn ok_json(v: Value) -> (StatusCode, Json<Value>) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn intent_req(body: serde_json::Value) -> IntentCreateReq {
+        serde_json::from_value(body).expect("the request parses")
+    }
+
+    /// The fail-closed half of the unit migration, from the wire in.
+    ///
+    /// A version skew between this wallet and a shop is invisible to every check
+    /// either side already has — an echoed amount is compared against itself, and
+    /// an expected total derived from the same order row agrees with itself. So
+    /// the KEY carries the unit, and a request in the old dialect is refused
+    /// before an intent exists rather than billed at 100× or 1/100.
+    #[test]
+    fn the_public_api_refuses_an_amount_in_the_old_unit() {
+        let base = serde_json::json!({ "idem_key": "ord-1", "description": "りんご 1個" });
+
+        let mut old = base.clone();
+        old["amount"] = serde_json::json!(129);
+        let (status, body) = intent_req(old).amount_minor().expect_err("`amount` was honoured");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"], json!("unsupported_amount_unit"));
+
+        // Sending both is the same refusal: a shop hedging its bets must not have
+        // the wallet pick a unit for it.
+        let mut both = base.clone();
+        both["amount"] = serde_json::json!(129);
+        both["amount_minor"] = serde_json::json!(12_900);
+        let (status, body) = intent_req(both)
+            .amount_minor()
+            .expect_err("`amount` alongside `amount_minor` was tolerated");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"], json!("unsupported_amount_unit"));
+
+        // Neither is a request this API cannot read at all, and it says which key
+        // it wants rather than defaulting to zero or to some other field.
+        let (status, body) = intent_req(base.clone())
+            .amount_minor()
+            .expect_err("an amount-less request was accepted");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"], json!("missing_amount_minor"));
+
+        // The new dialect goes through untouched — no scaling on the way in, the
+        // number IS the stored amount.
+        let mut new = base;
+        new["amount_minor"] = serde_json::json!(12_900);
+        assert_eq!(intent_req(new).amount_minor().unwrap(), 12_900);
+    }
 
     #[test]
     fn a_bidi_override_never_reaches_the_approval_screen() {

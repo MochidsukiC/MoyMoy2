@@ -53,6 +53,22 @@
 //!   [`ChargeOutcome::Ambiguous`] marks and what reconciliation re-drives. The
 //!   ledger orders the two directions oppositely (consume-first for a charge,
 //!   debit-first for a withdrawal); `charge.rs` explains why.
+//!
+//! ## The unit boundary
+//!
+//! **This module is where money stops being money and becomes items.** The wallet
+//! counts minor units (1/100 エメ, [`crate::wallet::MINOR_PER_EME`]); the mod
+//! counts emeralds, which are indivisible and arrive in a Java `int`. Every
+//! conversion between the two happens here or in the two functions in `charge.rs`
+//! that read the mod's own numbers ([`crate::charge`]'s `ack_amount` and the
+//! inventory's `chargeable`) — nowhere else, and never in a caller that merely
+//! passes an amount along.
+//!
+//! Keeping it to one place is the whole design: a ledger amount that reaches the
+//! wire unconverted asks the mod for a hundred times what was paid for, and the
+//! mod would carry it out. So an amount that cannot be expressed as whole
+//! emeralds is refused here rather than rounded, and a count too large for the
+//! wire is refused rather than truncated — see [`to_physical`].
 
 use std::time::Duration;
 
@@ -63,6 +79,36 @@ use uuid::Uuid;
 use mochi_proto_attest::{public_key_from_b64url, ATTEST_ALG};
 
 use crate::attest::pubkey_url as attest_pubkey_url;
+use crate::error::ApiError;
+use crate::wallet;
+
+/// What one physical emerald is worth in the ledger's minor units.
+///
+/// One emerald is one エメ, and one エメ is [`wallet::MINOR_PER_EME`] minor units.
+/// Named separately from that constant because they are two different facts that
+/// happen to agree — the ledger's subdivision, and the in-world exchange rate —
+/// and only this one is about emeralds. Every physical↔minor conversion in the
+/// backend goes through this name, so a change to the rate has one edit site.
+pub const MINOR_PER_EMERALD: i64 = wallet::MINOR_PER_EME;
+
+/// The most emeralds one withdrawal may ask the mod to materialise: 20,736 =
+/// 2,304 emerald blocks = one full inventory of blocks (36 slots × 64).
+///
+/// The in-world half of [`wallet::MAX_WITHDRAW_PER_OP`], which states the same
+/// bound in the ledger's units and is what actually refuses an oversized request.
+/// This one is the assertion on the way out: it is stated in emeralds because the
+/// reason for it is an inventory's worth of items, and it catches a ledger amount
+/// that reached the wire meaning something other than what it was checked as.
+pub const MAX_WITHDRAW_PHYSICAL: i64 = 20_736;
+
+/// The most emeralds one charge may ask the mod to consume.
+///
+/// The mod's `amount` field is a Java `int`, so anything above `i32::MAX` arrives
+/// as a different — possibly negative — number. This is the round bound below it,
+/// not a policy: [`wallet::MAX_AMOUNT`] (100_000_000_000 minor) converts to
+/// exactly this many emeralds, so a request the wallet accepts is representable
+/// on the wire and one that is not is a bug rather than a large purchase.
+const MAX_CHARGE_PHYSICAL: i64 = 1_000_000_000;
 
 /// Deadline for one charge/withdraw round-trip. Deliberately LONGER than the connector
 /// sidecar's own 30 s mod deadline so the honest `504` it synthesises wins the
@@ -132,11 +178,14 @@ impl McLink {
         self.sender.is_connected()
     }
 
-    /// Ask the mod on `attester_id` to consume `amount` emeralds for `uuid`, and
-    /// read its settlement ack off the response.
+    /// Ask the mod on `attester_id` to consume the emeralds `amount` (minor units)
+    /// is worth for `uuid`, and read its settlement ack off the response.
     ///
     /// `attester_id` is the server the user's signed assertion named — see the
     /// module docs for why the destination is carried rather than looked up.
+    ///
+    /// `Err` means the amount could not be put on the wire at all and NOTHING was
+    /// sent — see [`to_physical`].
     pub async fn send_charge(
         &self,
         attester_id: &str,
@@ -144,20 +193,22 @@ impl McLink {
         op_id: &str,
         idem_key: &str,
         amount: i64,
-    ) -> ChargeOutcome {
+    ) -> Result<ChargeOutcome, ApiError> {
+        let physical = to_physical(amount, MAX_CHARGE_PHYSICAL, "emerald.charge", op_id)?;
         let payload = serde_json::json!({
             "op_id": op_id,
             "idem_key": idem_key,
             "verb": "emerald.charge",
             "target_uuid": uuid.to_string(),
-            "amount": amount,
+            "amount": physical,
         });
-        self.send_op("charge", attester_id, op_id, &payload).await
+        Ok(self.send_op("charge", attester_id, op_id, &payload).await)
     }
 
-    /// Ask the mod on `attester_id` to GRANT `amount` emeralds to `uuid` — the
-    /// other half of the wallet, and the exact mirror of [`send_charge`] on the
-    /// wire (same address, same `op_id` idempotency, same ack-is-the-response).
+    /// Ask the mod on `attester_id` to GRANT `uuid` the emeralds `amount` (minor
+    /// units) is worth — the other half of the wallet, and the exact mirror of
+    /// [`send_charge`] on the wire (same address, same `op_id` idempotency, same
+    /// ack-is-the-response).
     ///
     /// The ack's amount field is `granted`, not `settled`, on purpose: the two
     /// directions must not be able to read each other's acks. See
@@ -169,15 +220,16 @@ impl McLink {
         op_id: &str,
         idem_key: &str,
         amount: i64,
-    ) -> ChargeOutcome {
+    ) -> Result<ChargeOutcome, ApiError> {
+        let physical = to_physical(amount, MAX_WITHDRAW_PHYSICAL, "emerald.withdraw", op_id)?;
         let payload = serde_json::json!({
             "op_id": op_id,
             "idem_key": idem_key,
             "verb": "emerald.withdraw",
             "target_uuid": uuid.to_string(),
-            "amount": amount,
+            "amount": physical,
         });
-        self.send_op("withdraw", attester_id, op_id, &payload).await
+        Ok(self.send_op("withdraw", attester_id, op_id, &payload).await)
     }
 
     /// One request/ack exchange with the mod, shared by both directions so a
@@ -370,6 +422,55 @@ fn is_success(status: u16) -> bool {
     (200..300).contains(&status)
 }
 
+/// Convert a ledger amount (minor units) to the emerald count the wire carries,
+/// refusing anything the mod cannot faithfully act on.
+///
+/// **Neither refusal rounds, clamps or falls back**, because both would be a
+/// silent instruction to move a different number of emeralds than the ledger
+/// recorded — the exact failure this unit boundary exists to prevent. They are
+/// `500`s rather than user-facing refusals because neither is reachable from a
+/// well-formed request: `/wallet/charge` and `/wallet/withdraw` reject a
+/// non-multiple at the boundary, v8 left every stored amount a multiple of
+/// [`MINOR_PER_EMERALD`], and `max_physical` is the mod-side face of a bound the
+/// wallet already enforced. Reaching either means this process built a request it
+/// had no basis for, and the safe thing is to send nothing: the op stays
+/// non-terminal, having provably not been delivered, which is the same position a
+/// down tunnel leaves it in.
+fn to_physical(
+    minor: i64,
+    max_physical: i64,
+    verb: &str,
+    op_id: &str,
+) -> Result<i64, ApiError> {
+    if minor % MINOR_PER_EMERALD != 0 {
+        return Err(ApiError::internal(format!(
+            "{verb} {op_id}: {minor} minor units is not a whole number of emeralds \
+             (emeralds are indivisible, so an amount sent to the mod must be a multiple \
+             of {MINOR_PER_EMERALD}); sending nothing rather than a rounded amount"
+        )));
+    }
+    let physical = minor / MINOR_PER_EMERALD;
+    if !(1..=max_physical).contains(&physical) {
+        return Err(ApiError::internal(format!(
+            "{verb} {op_id}: {minor} minor units is {physical} emeralds, outside the \
+             1..={max_physical} this verb may ask for; sending nothing rather than a \
+             truncated amount"
+        )));
+    }
+    Ok(physical)
+}
+
+/// Convert an emerald count the mod reported into the ledger's minor units.
+///
+/// `None` on overflow — a count no arithmetic can express is not a number of
+/// emeralds, and both callers already treat "no usable amount" as their safe
+/// direction (a charge credits nothing, a withdrawal parks as `stuck` rather than
+/// refunding). Saturating instead would hand a charge settlement the full
+/// requested amount on a garbage ack.
+pub(crate) fn to_minor(physical: i64) -> Option<i64> {
+    physical.checked_mul(MINOR_PER_EMERALD)
+}
+
 /// Classify a failure to complete the exchange, keeping "nothing was written" and
 /// "it was on the wire" apart — the distinction the ledger depends on. Shared by
 /// both directions (the classification is about the transport, not the verb);
@@ -438,6 +539,84 @@ mod tests {
                 ChargeOutcome::NotSent
             ));
         }
+    }
+
+    #[test]
+    fn a_ledger_amount_that_is_not_whole_emeralds_is_never_sent() {
+        // The failure this whole boundary exists to stop: 1,050 minor units is
+        // 10.5 emeralds, and BOTH ways of "handling" it move the wrong number of
+        // items — 10 short-changes the player, 11 mints one. So nothing goes out.
+        for minor in [1, 99, 150, 1_050, -100] {
+            let e = to_physical(minor, MAX_CHARGE_PHYSICAL, "emerald.charge", "op")
+                .expect_err("{minor} was put on the wire");
+            assert_eq!(e.status, 500, "{minor}");
+        }
+        // A whole number of emeralds converts, and converts by division — 1,000
+        // minor units is ten emeralds, not a thousand.
+        assert_eq!(
+            to_physical(1_000, MAX_CHARGE_PHYSICAL, "emerald.charge", "op").unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn a_count_the_wire_cannot_carry_is_refused_rather_than_truncated() {
+        // The mod's field is a Java `int`. A count above it does not arrive large,
+        // it arrives DIFFERENT — so the request is not built at all.
+        let over = (MAX_CHARGE_PHYSICAL + 1) * MINOR_PER_EMERALD;
+        assert_eq!(
+            to_physical(over, MAX_CHARGE_PHYSICAL, "emerald.charge", "op")
+                .expect_err("an unrepresentable count was sent")
+                .status,
+            500
+        );
+        assert!(to_physical(
+            MAX_CHARGE_PHYSICAL * MINOR_PER_EMERALD,
+            MAX_CHARGE_PHYSICAL,
+            "emerald.charge",
+            "op"
+        )
+        .is_ok());
+        // A withdrawal is held to the much tighter in-world bound instead, so an
+        // amount a charge may ask for is not automatically one the mod will be
+        // asked to materialise.
+        assert_eq!(
+            to_physical(
+                (MAX_WITHDRAW_PHYSICAL + 1) * MINOR_PER_EMERALD,
+                MAX_WITHDRAW_PHYSICAL,
+                "emerald.withdraw",
+                "op"
+            )
+            .expect_err("an oversized payout was sent")
+            .status,
+            500
+        );
+    }
+
+    #[test]
+    fn the_two_bounds_are_the_same_bound_in_two_units() {
+        // Each pair is one decision written twice because two subsystems count
+        // differently. If a later edit moves one without the other, the wallet
+        // starts accepting requests the wire refuses (or the reverse), and the
+        // 500 above becomes a routine outcome instead of an impossible one.
+        assert_eq!(
+            wallet::MAX_WITHDRAW_PER_OP,
+            MAX_WITHDRAW_PHYSICAL * MINOR_PER_EMERALD
+        );
+        assert_eq!(
+            wallet::MAX_AMOUNT,
+            MAX_CHARGE_PHYSICAL * MINOR_PER_EMERALD
+        );
+    }
+
+    #[test]
+    fn an_emerald_count_becomes_minor_units_and_overflow_becomes_nothing() {
+        assert_eq!(to_minor(10), Some(1_000));
+        assert_eq!(to_minor(0), Some(0));
+        // Not saturating: a settler handed i64::MAX would clamp it to whatever the
+        // op requested and credit the lot on a garbage ack. `None` is what both
+        // settlers already treat as their safe direction.
+        assert_eq!(to_minor(i64::MAX), None);
     }
 
     #[test]

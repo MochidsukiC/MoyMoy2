@@ -527,10 +527,14 @@
       // The charge binding covers the idem_key and the amount, not the
       // challenge — so the modal's reason can state the amount the user is about
       // to approve, and an assertion for a different amount will not verify.
+      // amount は minor (1/100 エメ)。署名対象のハッシュは minor の生値を
+      // そのまま使う（chargeRequestHash に変換を挟まない）が、ユーザーに
+      // 見せる同意文言は ÷100 して「エメ」で言う — 署名される値とユーザーが
+      // 見る額を一致させるため。
       const a = await attest(
         "charge",
         () => chargeRequestHash(idem, amount),
-        amount + " エメのチャージ"
+        (amount / 100).toFixed(2) + " エメのチャージ"
       );
       if (!a.ok) return { ok: false, error: a.error };
       return postJson("/wallet/charge", { idem_key: idem, amount, assertion: a.assertion });
@@ -560,10 +564,12 @@
       const first = await postJson("/wallet/withdraw", { idem_key: idem, amount, pin, otp });
       if (first.ok || first.error !== "attestation_required") return first;
 
+      // charge と同じ理由: amount (minor) はハッシュへは無変換で渡し、
+      // 同意文言だけ ÷100 して表示する。
       const a = await attest(
         "withdraw",
         () => withdrawRequestHash(idem, amount),
-        amount + " エメの出金"
+        (amount / 100).toFixed(2) + " エメの出金"
       );
       if (!a.ok) return { ok: false, error: a.error };
       return postJson("/wallet/withdraw", { idem_key: idem, amount, pin, otp, assertion: a.assertion });

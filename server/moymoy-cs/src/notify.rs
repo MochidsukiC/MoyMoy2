@@ -252,7 +252,11 @@ async fn deliver(client: &reqwest::Client, token: &str, job: &Job) -> bool {
                 "id": Uuid::new_v4().to_string(),
                 "app_id": APP_ID,
                 "title": "入金",
-                "body": format!("{}: {} +{} エメ", job.holder, job.label, job.amount),
+                // `job.amount` is minor units, so it is rendered rather than
+                // printed: the raw integer would announce every deposit at a
+                // hundred times its value.
+                "body": format!("{}: {} +{} エメ", job.holder, job.label,
+                                crate::wallet::format_eme(job.amount)),
                 "ts_unix_ms": now_ms(),
                 "action_uri": ACTION_URI,
                 "category": "wallet",

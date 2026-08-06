@@ -112,7 +112,11 @@ pub fn pubkey_url() -> String {
 /// assertion the user approved to confirm a character can never be spent as one
 /// that authorizes a consume. The amount is in the binding because the consent
 /// modal states it — an assertion approved for 100 エメ does not verify against a
-/// request for 10000.
+/// request for 10,000.
+///
+/// `amount` is the request's own value, in minor units, and is **not** converted
+/// here. Hashing anything else would break the binding: the app signs what it
+/// posted, so the binding has to be computed over the same number.
 pub fn charge_request_hash(idem_key: &str, amount: i64) -> String {
     request_hash("moymoy.charge.v1", &[idem_key, &amount.to_string()])
 }
@@ -124,7 +128,8 @@ pub fn charge_request_hash(idem_key: &str, amount: i64) -> String {
 /// the two never verify as each other. That separation is the whole point here:
 /// the operations run in opposite directions, and an assertion the user approved
 /// to consume 100 エメ worth of emeralds must not authorize paying 100 エメ back
-/// out (nor the reverse).
+/// out (nor the reverse). `amount` is in minor units and unconverted, for the
+/// same reason as [`charge_request_hash`].
 pub fn withdraw_request_hash(idem_key: &str, amount: i64) -> String {
     request_hash("moymoy.withdraw.v1", &[idem_key, &amount.to_string()])
 }

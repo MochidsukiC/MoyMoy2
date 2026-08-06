@@ -10,11 +10,26 @@ use uuid::Uuid;
 use crate::db::now_ms;
 use crate::identity::{self, Account};
 
-/// Largest single transfer/charge accepted (defensive bound).
-pub const MAX_AMOUNT: i64 = 1_000_000_000;
+/// Minor units in one エメ.
+///
+/// **Every amount in this crate is an integer count of these** — the columns, the
+/// `/wallet/*` wire, the constants below — so a balance of `1_550` is 15.50 エメ.
+/// The only exceptions are the physical emerald counts the mod reports, which are
+/// items rather than money and are converted at the one boundary that touches
+/// them ([`crate::mc`]).
+///
+/// A wallet whose smallest unit is a whole エメ cannot price anything below one,
+/// which is what v8 exists to fix; the number is the ledger's own subdivision and
+/// is deliberately NOT the same fact as the emerald exchange rate
+/// ([`crate::mc::MINOR_PER_EMERALD`]), even though the two agree today.
+pub const MINOR_PER_EME: i64 = 100;
 
-/// Largest single withdrawal accepted: 20,736 エメ = 2,304 emerald blocks = one
-/// full inventory of blocks (36 slots × 64).
+/// Largest single transfer/charge accepted, in minor units (defensive bound).
+pub const MAX_AMOUNT: i64 = 100_000_000_000;
+
+/// Largest single withdrawal accepted, in minor units — the ledger-side face of
+/// [`crate::mc::MAX_WITHDRAW_PHYSICAL`], which states the same bound as the count
+/// of emeralds it really is (one full inventory of emerald blocks).
 ///
 /// Far below [`MAX_AMOUNT`] on purpose, and it is not a wallet concern but an
 /// in-world one: a withdrawal ends with the mod materialising items for a player,
@@ -22,12 +37,38 @@ pub const MAX_AMOUNT: i64 = 1_000_000_000;
 /// Minecraft server (and leave the drop on the ground). Bounding it here means a
 /// large payout is several ops the player pulls at their own pace, each of which
 /// settles independently.
-pub const MAX_WITHDRAW_PER_OP: i64 = 20_736;
+///
+/// **Two constants, one bound.** This one refuses an oversized request (it is
+/// what `/wallet/withdraw` and [`reserve_withdraw`] compare against); the
+/// mod-facing one asserts the converted count before it goes on the wire. They
+/// are separate because they are in different units — a single constant would
+/// have to be one or the other, and whichever side did not own it would silently
+/// be out by a factor of 100. `a_withdrawal_bound_means_the_same_thing_in_both_units`
+/// pins them together.
+pub const MAX_WITHDRAW_PER_OP: i64 = 2_073_600;
 
 /// Label on the credit that gives a withdrawal's reserve back. Deliberately a
 /// `withdraw` txn like the debit it undoes, so the withdraw filter shows the pair
 /// together — a refund hidden under `charge` would read as income.
 const WITHDRAW_REFUND_LABEL: &str = "出金の取消（返金）";
+
+/// Render a minor-unit amount the way a person reads it: `1_550` ⇒ `"15.50"`.
+///
+/// For anything a human sees and this process writes — the deposit notification
+/// body, the admin CLI's report. Printing the raw integer would state every
+/// amount at a hundred times its value, which on a refund report is the kind of
+/// number somebody acts on.
+///
+/// The sign is carried on the whole part (`-1_550` ⇒ `"-15.50"`), which naive
+/// `/` and `%` would render as `-15.-50`.
+pub fn format_eme(minor: i64) -> String {
+    let sign = if minor < 0 { "-" } else { "" };
+    // `unsigned_abs` rather than `abs`: i64::MIN has no positive counterpart and
+    // `abs` would panic on it.
+    let abs = minor.unsigned_abs();
+    let unit = MINOR_PER_EME as u64;
+    format!("{sign}{}.{:02}", abs / unit, abs % unit)
+}
 
 /// Cosmetic card face (design: holder / number / expiry).
 #[derive(Debug, Serialize)]
@@ -186,8 +227,8 @@ pub fn history(
     Ok(rows)
 }
 
-/// Atomic transfer of `amount` エメ from `from_id` to `to_id`, inside the
-/// caller's transaction. Records a debit on the sender (`kind`: send|pay,
+/// Atomic transfer of `amount` (minor units) from `from_id` to `to_id`, inside
+/// the caller's transaction. Records a debit on the sender (`kind`: send|pay,
 /// `sender_label`) and a `receive` credit on the recipient. Both accounts must
 /// already exist (a missing side ⇒ `UnknownTarget`) — accounts are created only
 /// via `/auth/register`, never implicitly by a transfer.
@@ -394,8 +435,9 @@ fn queue_deposit_notification(
     Ok(())
 }
 
-/// Debit `amount` エメ for a withdrawal, inside the caller's transaction —
-/// the mirror image of [`credit_charge`], and the FIRST half of a withdrawal.
+/// Debit `amount` (minor units) for a withdrawal, inside the caller's
+/// transaction — the mirror image of [`credit_charge`], and the FIRST half of a
+/// withdrawal.
 ///
 /// Reserve-first is not a style choice: granting emeralds before the debit would
 /// mean a failed debit leaves emeralds that no eme paid for (in-world inflation),
@@ -590,7 +632,7 @@ mod tests {
     use super::*;
     use crate::db::PooledConn;
 
-    /// One account holding `balance` エメ, on its own in-memory DB. The pooled
+    /// One account holding `balance` minor units, on its own in-memory DB. The pooled
     /// handle keeps the pool (and therefore the `:memory:` database) alive.
     fn account_with(balance: i64) -> PooledConn {
         let pool = crate::db::open_memory().expect("in-memory pool");
@@ -621,6 +663,45 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
+    }
+
+    #[test]
+    fn a_transfer_can_move_a_single_minor_unit() {
+        // The point of the whole unit change: a wallet whose smallest movement is
+        // one エメ cannot price anything below one. Sending money moves a number
+        // and has no reason to round — only the two directions that end in
+        // physical emeralds do (see `api::whole_emeralds`).
+        let mut conn = account_with(100);
+        conn.execute(
+            "INSERT INTO accounts (account_id, handle, handle_lower, display_name, balance, \
+               created_unix_ms, updated_unix_ms) \
+             VALUES ('acct-b', 'bob', 'bob', 'Bob', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let r = transfer(&tx, "acct-a", "acct-b", 1, "send", "@bob へ送金").unwrap();
+        assert!(matches!(r, TxResult::Ok { .. }), "{r:?}");
+        // …and zero is still nothing to send, so the floor is one unit, not none.
+        let z = transfer(&tx, "acct-a", "acct-b", 0, "send", "@bob へ送金").unwrap();
+        assert!(matches!(z, TxResult::BadAmount), "{z:?}");
+        tx.commit().unwrap();
+        assert_eq!(balance_of(&conn), 99);
+    }
+
+    #[test]
+    fn an_amount_is_rendered_as_eme_and_hundredths() {
+        assert_eq!(format_eme(0), "0.00");
+        assert_eq!(format_eme(1), "0.01");
+        assert_eq!(format_eme(1_550), "15.50");
+        assert_eq!(format_eme(100), "1.00");
+        // The sign belongs to the whole amount, not to the fraction.
+        assert_eq!(format_eme(-1_550), "-15.50");
+        assert_eq!(format_eme(-1), "-0.01");
+        // i64::MIN has no positive counterpart; rendering it must not panic.
+        assert!(format_eme(i64::MIN).starts_with('-'));
     }
 
     #[test]

@@ -360,6 +360,11 @@ pub fn payer_view(conn: &Connection, intent: &Intent, now: i64) -> rusqlite::Res
 
 /// The face of an intent for the merchant that owns it. Carries `payer_ref` once
 /// paid — a pseudonym stable within this shop and uncorrelatable outside it.
+///
+/// The amount goes out as `amount_minor`, matching what `/merchant/v1` now
+/// accepts — this and `intent_create`'s reply are the two places a third party
+/// reads an amount from this wallet, and both name the unit rather than assuming
+/// the reader shares it. See `merchant::IntentCreateReq::amount_minor`.
 pub fn merchant_view(m: &MerchantRow, intent: &Intent, now: i64) -> Result<Value, ApiError> {
     let payer_ref = match (&intent.payer_account_id, &m.payer_ref_salt) {
         (Some(payer), Some(salt)) => Some(merchant::payer_ref(salt, payer)?),
@@ -370,7 +375,7 @@ pub fn merchant_view(m: &MerchantRow, intent: &Intent, now: i64) -> Result<Value
     Ok(json!({
         "intent_id": intent.intent_id,
         "merchant_id": intent.merchant_id,
-        "amount": intent.amount,
+        "amount_minor": intent.amount,
         "description": intent.description,
         "order_ref": intent.order_ref,
         "state": intent.effective_state(now),
@@ -1007,9 +1012,17 @@ mod tests {
         .unwrap()
     }
 
+    /// What [`stepup_fixture`] funds its payer with.
+    ///
+    /// Derived from the threshold it has to clear rather than written as a
+    /// literal: amounts are minor units now, so a fixed number that used to
+    /// cover the top band is a fixture that quietly starts testing
+    /// "insufficient" instead of the second factor it was written for.
+    const STEPUP_BALANCE: i64 = riskauth::STEPUP_SINGLE * 2;
+
     /// An intent past the step-up threshold, on a wallet that can pay for it.
     fn stepup_fixture(email: Option<&str>) -> (Pool, String, i64) {
-        let (pool, _, m) = fixture(300, 100_000);
+        let (pool, _, m) = fixture(300, STEPUP_BALANCE);
         if let Some(e) = email {
             verify_email(&pool, e);
         }
@@ -1249,7 +1262,7 @@ mod tests {
         let v = approve_stepup(&pool, &intent_id, PIN, Some(&code));
 
         assert_eq!(v["ok"], json!(true), "{v}");
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000 - amount);
+        assert_eq!(balance_of(&pool, "acct-a"), STEPUP_BALANCE - amount);
         assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
         // Consumed, so it cannot be spent again.
         assert_eq!(live_stepup_codes(&pool), 0, "the code survived its use");
@@ -1264,7 +1277,7 @@ mod tests {
         let v = approve_stepup(&pool, &intent_id, PIN, None);
         assert_eq!(v["error"], json!("otp_unavailable"), "{v}");
         assert_eq!(v["required"], json!("pin_otp"));
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
+        assert_eq!(balance_of(&pool, "acct-a"), STEPUP_BALANCE);
         // …and it costs no PIN attempt: the request was never going to be enough
         // whatever PIN it carried.
         assert_eq!(failed_attempts(&pool), 0);
@@ -1285,7 +1298,7 @@ mod tests {
         let v = approve_stepup(&pool, &intent_id, PIN, Some(wrong));
 
         assert_eq!(v["error"], json!("invalid_code"), "{v}");
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
+        assert_eq!(balance_of(&pool, "acct-a"), STEPUP_BALANCE);
         assert_eq!(state_of(&pool, &intent_id), STATE_CREATED);
         // The PIN was right; a wrong code has its own counter and must not eat
         // into the PIN's, or a fumbled code would walk somebody into a lockout.
@@ -1316,7 +1329,7 @@ mod tests {
         assert_eq!(live_stepup_codes(&pool), 0);
         let v = approve_stepup(&pool, &intent_id, PIN, Some(&real));
         assert_eq!(v["error"], json!("invalid_code"), "{v}");
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
+        assert_eq!(balance_of(&pool, "acct-a"), STEPUP_BALANCE);
     }
 
     #[test]
@@ -1341,7 +1354,7 @@ mod tests {
         };
         let v = approve_stepup(&pool, &intent_id, PIN, Some(&code));
         assert_eq!(v["error"], json!("invalid_code"), "{v}");
-        assert_eq!(balance_of(&pool, "acct-a"), 100_000);
+        assert_eq!(balance_of(&pool, "acct-a"), STEPUP_BALANCE);
     }
 
     #[test]

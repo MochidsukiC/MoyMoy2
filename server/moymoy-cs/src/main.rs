@@ -303,7 +303,11 @@ usage: moymoy-cs admin <command>
             RefundOutcome::Ok { tx_id, amount } => {
                 let payer = payer.unwrap_or_default();
                 let shop_account = shop.as_ref().map(|m| m.account_id.as_str()).unwrap_or("?");
-                println!("refunded {amount} エメ");
+                // Every amount below is minor units (1/100 エメ) and is rendered,
+                // not printed: this report is what an operator reads to decide
+                // whether a refund did what they meant, and a raw integer states
+                // it at a hundred times its value.
+                println!("refunded {} エメ", wallet::format_eme(amount));
                 println!("  intent      {intent_id}");
                 println!(
                     "  merchant    {} {} (account {shop_account})",
@@ -318,8 +322,8 @@ usage: moymoy-cs admin <command>
                 println!("  intent state {} -> {} (refunded)", before.state, before.state);
                 println!(
                     "  balances    merchant {} エメ / payer {} エメ",
-                    wallet::balance(&conn, shop_account)?,
-                    wallet::balance(&conn, &payer)?,
+                    wallet::format_eme(wallet::balance(&conn, shop_account)?),
+                    wallet::format_eme(wallet::balance(&conn, &payer)?),
                 );
                 Ok(())
             }
@@ -335,11 +339,12 @@ usage: moymoy-cs admin <command>
                 before.refund_tx_id.as_deref().unwrap_or("?")
             ),
             RefundOutcome::MerchantShort { balance } => anyhow::bail!(
-                "merchant `{}` holds {balance} エメ but owes {} — merchant revenue is NOT escrowed \
+                "merchant `{}` holds {} エメ but owes {} — merchant revenue is NOT escrowed \
                  (DEV.md: accepted risk), so a shop that withdrew its takings to the MC world \
                  leaves nothing to reverse. Nothing was moved; retry if it is funded again.",
                 before.merchant_id,
-                before.amount
+                wallet::format_eme(balance),
+                wallet::format_eme(before.amount)
             ),
         }
     }
