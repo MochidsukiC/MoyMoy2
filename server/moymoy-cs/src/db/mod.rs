@@ -54,8 +54,12 @@ const SCHEMA_V10: &str = include_str!("schema_v10.sql");
 /// cleared a second factor, so `riskauth`'s outflow window can start there rather
 /// than counting movements the holder has already authenticated.
 const SCHEMA_V11: &str = include_str!("schema_v11.sql");
+/// The v12 delta: `payment_intents.escrow_parked_unix_ms` — the no-report
+/// deadline parks a payment for a human instead of refunding it on a timer, and
+/// the release sweep's partial index excludes what it has parked.
+const SCHEMA_V12: &str = include_str!("schema_v12.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -204,8 +208,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 11;
         tracing::info!("sqlite migrated to schema v11 (step-up resets the outflow window)");
     }
-    // Future: `if version < 12 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V12)?;
-    //          tx.pragma_update(None, "user_version", 12)?; tx.commit()?; version = 12; }`
+    if version < 12 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V12)?;
+        tx.pragma_update(None, "user_version", 12)?;
+        tx.commit()?;
+        version = 12;
+        tracing::info!("sqlite migrated to schema v12 (an unreported payment is parked, not refunded)");
+    }
+    // Future: `if version < 13 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V13)?;
+    //          tx.pragma_update(None, "user_version", 13)?; tx.commit()?; version = 13; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }
@@ -876,6 +888,82 @@ mod tests {
         assert_eq!(verified, None, "an account was credited with a verification it never made");
         // The v8 rescale is still intact after three more migrations ran on it.
         assert_eq!(balance, 5000);
+    }
+
+    /// v12 adds the park column and REBUILDS the sweep's partial index around it.
+    ///
+    /// The index is the half that would fail silently. A partial index's predicate
+    /// cannot be altered, so it has to be dropped and recreated; if that were
+    /// missed, everything would still work and the sweep would simply re-scan
+    /// every parked row forever.
+    #[test]
+    fn migration_v12_parks_by_column_and_narrows_the_sweep_index() {
+        let mut conn = v8_db();
+        insert_account(&conn, "acct-a");
+        conn.execute(
+            "INSERT INTO merchants (merchant_id, account_id, name, created_unix_ms) \
+             VALUES ('m1', 'acct-a', '鉱石商会', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO payment_intents (intent_id, merchant_id, amount, description, state, \
+               idem_key, created_unix_ms, updated_unix_ms, expires_unix_ms) \
+             VALUES ('pi_old', 'm1', 12900, 'りんご 1個', 'paid', 'ord-1', 1, 1, 9)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).expect("v8 → v12");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        // Nothing is parked by the migration: no deadline has run out on a payment
+        // that predates the mechanism.
+        let parked: Option<i64> = conn
+            .query_row(
+                "SELECT escrow_parked_unix_ms FROM payment_intents WHERE intent_id = 'pi_old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked, None);
+
+        // The index exists exactly once and excludes parked rows.
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' \
+                   AND name = 'idx_intents_release_due'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("escrow_parked_unix_ms IS NULL"),
+            "the sweep index still admits parked rows: {sql}"
+        );
+        let copies: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                   AND name = 'idx_intents_release_due'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(copies, 1);
+
+        // v9's backfill survived three migrations landing on top of it.
+        let released: Option<i64> = conn
+            .query_row(
+                "SELECT released_unix_ms FROM payment_intents WHERE intent_id = 'pi_old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(released.is_some(), "v9's backfill was undone");
     }
 
     #[test]

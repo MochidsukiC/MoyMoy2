@@ -140,6 +140,14 @@ pub struct Intent {
     /// exists for a movement made against the buyer, so it lives beside the amount
     /// it explains rather than only in a log that rotates away.
     pub fulfil_reason: Option<String>,
+    /// When the no-report deadline ran out and the sweep set this intent aside
+    /// for a person to decide (v12).
+    ///
+    /// **Written INSTEAD of moving money, and never together with
+    /// `released_unix_ms`.** A parked intent is unresolved on purpose: its money
+    /// is still in escrow, and the operator path that can move it
+    /// ([`force_refund`]) works precisely because nothing here was closed.
+    pub escrow_parked_unix_ms: Option<i64>,
     /// When escrow paid out. Doubles as the sweep's exactly-once claim.
     pub released_unix_ms: Option<i64>,
     /// The escrow → merchant ledger row, if that half moved anything.
@@ -166,7 +174,8 @@ const INTENT_COLS: &str = "intent_id, merchant_id, amount, description, order_re
      payer_account_id, payer_hint_account_id, launch_app_id, tx_id, refunded_unix_ms, \
      refund_tx_id, created_unix_ms, expires_unix_ms, \
      escrowed_unix_ms, release_due_unix_ms, escrow_deadline_unix_ms, fulfilled_unix_ms, \
-     fulfilled_amount, fulfil_reason, released_unix_ms, release_tx_id, escrow_refund_tx_id";
+     fulfilled_amount, fulfil_reason, escrow_parked_unix_ms, released_unix_ms, release_tx_id, \
+     escrow_refund_tx_id";
 
 fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
     Ok(Intent {
@@ -190,9 +199,10 @@ fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
         fulfilled_unix_ms: r.get(17)?,
         fulfilled_amount: r.get(18)?,
         fulfil_reason: r.get(19)?,
-        released_unix_ms: r.get(20)?,
-        release_tx_id: r.get(21)?,
-        escrow_refund_tx_id: r.get(22)?,
+        escrow_parked_unix_ms: r.get(20)?,
+        released_unix_ms: r.get(21)?,
+        release_tx_id: r.get(22)?,
+        escrow_refund_tx_id: r.get(23)?,
     })
 }
 
@@ -299,6 +309,7 @@ pub fn create(
         fulfilled_unix_ms: None,
         fulfilled_amount: None,
         fulfil_reason: None,
+        escrow_parked_unix_ms: None,
         released_unix_ms: None,
         release_tx_id: None,
         escrow_refund_tx_id: None,
@@ -626,14 +637,18 @@ const ESCROW_REFUND_LABEL_PREFIX: &str = "未履行分の返金";
 /// | the intent | end |
 /// |---|---|
 /// | reported, and the gate has elapsed | pay the shop what it reported, return the rest |
-/// | NOT reported, and the deadline has passed | return everything to the buyer |
+/// | NOT reported, and the deadline has passed | **park it for a person; move nothing** |
 /// | anything else | left alone |
 ///
-/// The second is the shop's silence running out. It is the only path here that
-/// decides a question rather than carrying out an answer: nobody said whether the
-/// goods went out, and after [`ESCROW_DEADLINE_MS`] the wallet stops holding the
-/// buyer's money on the chance that they did. That is why it is the one branch
-/// that warns — see [`release_one`].
+/// The second end moves no money at all, and that is the decision it embodies:
+/// **silence is not evidence.** A shop that has not reported has not said the
+/// goods stayed put — it has said nothing — so refunding on a timer would decide
+/// the question with no evidence, in a system where the shop-side delivery retry
+/// is deliberately unbounded during an outage. This repository already answers
+/// the same question the same way for emeralds: an ungrantable payout goes to
+/// `stuck` and is never auto-refunded (`charge.rs`, R008), because "we do not
+/// know" is its own outcome. It is the one branch that warns — see
+/// [`release_one`].
 ///
 /// **One row per transaction, not one bulk UPDATE.** `expire_pass` can be a
 /// single statement because expiring an intent owes nobody anything; a release
@@ -653,9 +668,14 @@ pub fn release_pass(conn: &mut Connection, now: i64) -> rusqlite::Result<usize> 
         // `release_due_unix_ms` orders the result because both deadlines are a
         // fixed offset from `escrowed_unix_ms`, which makes it oldest-first for
         // either end — and it is the indexed column, so the order is free.
+        // `escrow_parked_unix_ms IS NULL` matches the partial index's predicate
+        // (v12) AND stops the sweep re-parking what it has already parked — a
+        // warning repeated every 30 seconds until a human acts is a log nobody can
+        // read.
         let mut stmt = conn.prepare(
             "SELECT intent_id FROM payment_intents \
              WHERE released_unix_ms IS NULL AND escrowed_unix_ms IS NOT NULL \
+               AND escrow_parked_unix_ms IS NULL \
                AND ( (fulfilled_unix_ms IS NOT NULL AND release_due_unix_ms <= ?1) \
                   OR (fulfilled_unix_ms IS NULL AND escrow_deadline_unix_ms <= ?1) ) \
              ORDER BY release_due_unix_ms ASC LIMIT 50",
@@ -694,9 +714,10 @@ pub fn release_pass(conn: &mut Connection, now: i64) -> rusqlite::Result<usize> 
 /// transaction, never from the selection that queued it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReleaseEnd {
-    /// The shop reported, and the gate elapsed.
+    /// The shop reported, and the gate elapsed. Money moves.
     Reported,
-    /// The shop never reported, and [`ESCROW_DEADLINE_MS`] passed.
+    /// The shop never reported, and [`ESCROW_DEADLINE_MS`] passed. **Nothing
+    /// moves** — the intent is parked for a person.
     Unreported,
 }
 
@@ -751,24 +772,50 @@ fn release_one(conn: &mut Connection, intent_id: &str, now: i64) -> rusqlite::Re
     // ends carry DIFFERENT conditions, so each claims on its own — a row that
     // slipped from one end to the other between the scan and here fails its claim
     // and is picked up by the next pass under the end it now belongs to.
-    let claimed = match end {
-        ReleaseEnd::Reported => tx.execute(
-            "UPDATE payment_intents SET released_unix_ms = ?2, updated_unix_ms = ?2 \
+    //
+    // They also write DIFFERENT columns. The unreported end sets
+    // `escrow_parked_unix_ms` and leaves `released_unix_ms` NULL, because parking
+    // is not a resolution: the money is still in escrow and an operator still has
+    // to be able to move it. Stamping it released would close the row to
+    // `force_refund` — the one route that can.
+    if let ReleaseEnd::Unreported = end {
+        // `fulfilled_unix_ms IS NULL` is part of THIS claim, so a report landing
+        // between the read above and this statement wins: the UPDATE matches
+        // nothing, and the next pass releases it properly instead of parking a
+        // delivery that did happen.
+        let parked = tx.execute(
+            "UPDATE payment_intents SET escrow_parked_unix_ms = ?2, updated_unix_ms = ?2 \
              WHERE intent_id = ?1 AND released_unix_ms IS NULL AND escrowed_unix_ms IS NOT NULL \
-               AND fulfilled_unix_ms IS NOT NULL AND release_due_unix_ms <= ?2",
-            params![intent_id, now],
-        )?,
-        // `fulfilled_unix_ms IS NULL` is part of THIS claim, which is what stops a
-        // report that lands mid-transaction from being overtaken: if the shop
-        // reported first, this UPDATE matches nothing and the money is not returned
-        // out from under a delivery that did happen.
-        ReleaseEnd::Unreported => tx.execute(
-            "UPDATE payment_intents SET released_unix_ms = ?2, updated_unix_ms = ?2 \
-             WHERE intent_id = ?1 AND released_unix_ms IS NULL AND escrowed_unix_ms IS NOT NULL \
+               AND escrow_parked_unix_ms IS NULL \
                AND fulfilled_unix_ms IS NULL AND escrow_deadline_unix_ms <= ?2",
             params![intent_id, now],
-        )?,
-    };
+        )?;
+        if parked == 0 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.commit()?;
+        // **A warning, not an info line.** Reaching here means a shop went silent
+        // for six hours on an order a customer had already paid for. Nothing has
+        // been decided and nobody has been paid — which is the point — but that
+        // also means the money sits until a person acts, and this line is the only
+        // thing that says so.
+        tracing::warn!(
+            intent_id, amount = intent.amount, merchant = %m.merchant_id, payer,
+            deadline_ms = ESCROW_DEADLINE_MS,
+            "escrow deadline passed with no fulfilment report — the payment is PARKED, not \
+             refunded: nobody has said whether the goods went out, so the money stays in escrow \
+             for an operator to decide (`moymoy-cs admin refund` returns it to the buyer)"
+        );
+        return Ok(true);
+    }
+
+    let claimed = tx.execute(
+        "UPDATE payment_intents SET released_unix_ms = ?2, updated_unix_ms = ?2 \
+         WHERE intent_id = ?1 AND released_unix_ms IS NULL AND escrowed_unix_ms IS NOT NULL \
+           AND fulfilled_unix_ms IS NOT NULL AND release_due_unix_ms <= ?2",
+        params![intent_id, now],
+    )?;
     if claimed == 0 {
         tx.commit()?;
         return Ok(false);
@@ -778,14 +825,7 @@ fn release_one(conn: &mut Connection, intent_id: &str, now: i64) -> rusqlite::Re
     // fulfilment endpoint already refuses anything outside the range; clamping
     // here as well means a row edited by any other route still cannot pay out more
     // than escrow received for it.
-    //
-    // On the unreported end there is no reported figure at all, and `0` is the
-    // only defensible one: nobody has said the goods went out, and paying a shop
-    // that never answered would be deciding they did on its behalf.
-    let owed = match end {
-        ReleaseEnd::Reported => intent.fulfilled_amount.unwrap_or(0).clamp(0, intent.amount),
-        ReleaseEnd::Unreported => 0,
-    };
+    let owed = intent.fulfilled_amount.unwrap_or(0).clamp(0, intent.amount);
     let refund = intent.amount - owed;
     let escrow = wallet::escrow_account_id();
 
@@ -831,24 +871,7 @@ fn release_one(conn: &mut Connection, intent_id: &str, now: i64) -> rusqlite::Re
         params![intent_id, release_tx_id, escrow_refund_tx_id],
     )?;
     tx.commit()?;
-    match end {
-        ReleaseEnd::Reported => {
-            tracing::info!(intent_id, owed, refund, merchant = %m.merchant_id, "escrow released")
-        }
-        // **A warning, not an info line.** Reaching here means a shop went silent
-        // for six hours on an order a customer had already paid for. The money is
-        // back with the buyer, so nobody is out of pocket — but the shop is about
-        // to find revenue missing with no record of asking for it, and the only
-        // place that says why is this line. An operator has to see it before the
-        // shop does.
-        ReleaseEnd::Unreported => tracing::warn!(
-            intent_id, refund, merchant = %m.merchant_id,
-            deadline_ms = ESCROW_DEADLINE_MS,
-            "escrow deadline passed with no fulfilment report — the whole payment has been \
-             returned to the buyer. The shop was never paid for this order and did not say \
-             whether the goods went out; if they did, the buyer now has both"
-        ),
-    }
+    tracing::info!(intent_id, owed, refund, merchant = %m.merchant_id, "escrow released");
     Ok(true)
 }
 
@@ -912,6 +935,13 @@ pub fn payer_view(conn: &Connection, intent: &Intent, now: i64) -> rusqlite::Res
 /// `paid` intent can be any of these, and to the shop they are three different
 /// situations: money it cannot have yet, money on its way, and money it has.
 pub fn escrow_stage(intent: &Intent) -> &'static str {
+    // Parked outranks everything except released, and is reported as its own
+    // stage rather than folded into `held`. Both mean "escrow has the money", but
+    // only one of them is waiting for a person — a shop shown `held` for a payment
+    // that is actually stuck has no way to learn why it never arrived.
+    if intent.escrow_parked_unix_ms.is_some() && intent.released_unix_ms.is_none() {
+        return "parked";
+    }
     match (
         intent.escrowed_unix_ms,
         intent.fulfilled_unix_ms,
@@ -951,6 +981,9 @@ fn escrow_view(intent: &Intent) -> Value {
         // read by the sales page, which is where the explanation is actually
         // wanted.
         "fulfil_reason": intent.fulfil_reason,
+        // Non-null means the deadline ran out with no report and a person has to
+        // decide. The money is still here; nothing was refunded.
+        "parked_unix_ms": intent.escrow_parked_unix_ms,
         "released_unix_ms": intent.released_unix_ms,
     })
 }
@@ -1365,6 +1398,12 @@ pub fn force_refund(
     // predicate matter: `escrowed_unix_ms IS NOT NULL` says escrow ever received
     // it (the pre-v9 rows the migration stamped released did not), and
     // `released_unix_ms IS NULL` says escrow has not passed it on.
+    //
+    // **A PARKED intent satisfies both**, which is deliberate and load-bearing:
+    // parking writes `escrow_parked_unix_ms` and leaves `released_unix_ms` alone
+    // precisely so this path still reaches it. This is the only route by which a
+    // parked payment can be returned to the buyer, so a future change that starts
+    // treating parked rows as closed would strand them.
     let escrowed = intent.escrowed_unix_ms.is_some() && intent.released_unix_ms.is_none();
     let source = if escrowed {
         wallet::escrow_account_id()
@@ -3055,16 +3094,19 @@ mod tests {
     }
 
     #[test]
-    fn no_amount_of_time_alone_ever_pays_an_unreporting_shop() {
-        // The distinction that makes escrow worth having, and the half of it that
-        // survived the no-report deadline (3-1b).
+    fn no_amount_of_time_alone_ever_decides_who_gets_the_money() {
+        // The distinction that makes escrow worth having, in its strongest form.
         //
-        // This used to assert that time released NOTHING, which stopped being true
-        // when the deadline branch landed — an unreported payment does now leave
-        // escrow after six hours. What must never change is WHERE it goes: waiting
-        // is not evidence that goods were delivered, so however long a shop stays
-        // silent, the clock alone can only ever return the money to the buyer.
-        // A timer-only hold — the design escrow replaced — pays the shop instead.
+        // It has been narrowed twice and is now back to the whole claim. Before
+        // the deadline existed it read "time releases nothing". 3-1b weakened it
+        // to "time never pays the SHOP", because the deadline refunded the buyer.
+        // Parking restores it: a clock is not evidence about anything, so however
+        // long a shop stays silent, elapsed time on its own moves the money
+        // NEITHER way. What it produces is a question for a person.
+        //
+        // A timer-only hold — the design escrow replaced — pays the shop.
+        // Refund-on-timer — the design B replaced — pays the buyer. Both decide a
+        // question nobody answered.
         let (pool, intent_id, m) = fixture(300, 1_000);
         assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
 
@@ -3079,9 +3121,16 @@ mod tests {
             0,
             "waiting long enough paid a shop that never said it delivered anything"
         );
-        assert_eq!(balance_of(&pool, "acct-a"), 1_000);
-        assert_eq!(escrow_balance(&pool), 0);
-        assert_eq!(intent_of(&pool, &intent_id).release_tx_id, None);
+        assert_eq!(
+            balance_of(&pool, "acct-a"),
+            700,
+            "waiting long enough refunded a buyer whose goods may well have arrived"
+        );
+        assert_eq!(escrow_balance(&pool), 300, "the money left escrow on a clock");
+        let i = intent_of(&pool, &intent_id);
+        assert_eq!(i.release_tx_id, None);
+        assert_eq!(i.escrow_refund_tx_id, None);
+        assert_eq!(escrow_stage(&i), "parked");
     }
 
     /// A partial fulfilment splits the escrowed money two ways, and both ways
@@ -3128,27 +3177,91 @@ mod tests {
 
     // ── the no-report deadline ──────────────────────────────────────────────
 
-    /// A shop's silence runs out, and the buyer gets their money back.
+    /// A shop's silence runs out, and the sweep decides NOTHING.
+    ///
+    /// **Silence is not evidence.** The shop has not said the goods stayed put —
+    /// it has said nothing — and the shop-side retry is deliberately unbounded
+    /// during an infrastructure outage, so a delivery can still succeed hours
+    /// after this fires. Refunding on the timer would have handed the buyer the
+    /// goods and the money. Escrow keeps it and asks for a person, which is the
+    /// answer `emerald_ops` already gives an unprovable payout (`stuck`, R008).
     #[test]
-    fn a_payment_no_one_ever_reported_on_is_returned_to_the_buyer() {
+    fn a_payment_no_one_ever_reported_on_is_parked_not_refunded() {
         let (pool, intent_id, m) = fixture(300, 1_000);
         assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
         assert_eq!(escrow_balance(&pool), 300);
 
         assert_eq!(sweep_after_deadline(&pool), 1);
 
-        assert_eq!(balance_of(&pool, "acct-a"), 1_000, "the buyer was not made whole");
+        // Not one エメ moved, in either direction.
+        assert_eq!(escrow_balance(&pool), 300, "the deadline moved the money");
+        assert_eq!(balance_of(&pool, "acct-a"), 700, "the buyer was refunded on a timer");
         assert_eq!(balance_of(&pool, &m.account_id), 0, "a silent shop was paid");
-        assert_eq!(escrow_balance(&pool), 0);
 
         let i = intent_of(&pool, &intent_id);
-        assert_eq!(escrow_stage(&i), "released");
-        // No payout row, because nothing was paid out; the return has one.
+        assert!(i.escrow_parked_unix_ms.is_some(), "the intent was not parked");
+        // NOT released: parking is not a resolution, and a released row is closed
+        // to the operator path that has to be able to move this money.
+        assert_eq!(i.released_unix_ms, None, "a parked intent was marked resolved");
         assert_eq!(i.release_tx_id, None);
-        assert!(i.escrow_refund_tx_id.is_some(), "no ledger row for the return");
+        assert_eq!(i.escrow_refund_tx_id, None);
+        // Reported as its own stage, so a shop is not shown `held` for a payment
+        // that is actually waiting on a human.
+        assert_eq!(escrow_stage(&i), "parked");
         // The order itself is untouched — `paid` is still what happened.
         assert_eq!(state_of(&pool, &intent_id), STATE_PAID);
         assert_eq!(i.fulfilled_unix_ms, None);
+    }
+
+    /// The way out of park: an operator returns it, from escrow.
+    ///
+    /// Parked money that nobody can move would be worse than refunding it. This
+    /// is the route, and it works only because parking leaves
+    /// `released_unix_ms` NULL.
+    #[test]
+    fn an_operator_can_return_a_parked_payment_from_escrow() {
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        assert_eq!(sweep_after_deadline(&pool), 1);
+
+        let mut conn = pool.get().unwrap();
+        let out = force_refund(&mut conn, &intent_id, "shop never reported").unwrap();
+        assert!(matches!(out, RefundOutcome::Ok { amount: 300, .. }), "{out:?}");
+        drop(conn);
+
+        assert_eq!(balance_of(&pool, "acct-a"), 1_000);
+        assert_eq!(escrow_balance(&pool), 0);
+        // Taken from escrow, where the money actually was — not from a shop that
+        // was never paid.
+        assert_eq!(balance_of(&pool, &m.account_id), 0);
+    }
+
+    #[test]
+    fn a_parked_payment_is_still_counted_as_held_against_its_shop() {
+        // The money has not gone anywhere, so both places that ask "what is
+        // suspended for this shop" must keep saying so: the sales page total, and
+        // the refusal to close a shop with money outstanding.
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        assert_eq!(sweep_after_deadline(&pool), 1);
+
+        let page = {
+            let conn = pool.get().unwrap();
+            sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms()).unwrap()
+        };
+        assert_eq!(page["held_count"], json!(1));
+        assert_eq!(page["held_total_minor"], json!(300));
+        assert_eq!(page["sales"][0]["escrow"]["stage"], json!("parked"));
+        assert!(page["sales"][0]["escrow"]["parked_unix_ms"].is_i64());
+
+        assert_eq!(
+            close_shop(&pool, &m.merchant_id),
+            merchant::CloseOutcome::HasEscrowedFunds {
+                count: 1,
+                total: 300
+            }
+        );
+        let _ = intent_id;
     }
 
     /// The gate and the deadline are different clocks, and the sweep respects
@@ -3211,20 +3324,25 @@ mod tests {
     }
 
     #[test]
-    fn the_deadline_returns_the_money_once_however_many_times_the_sweep_runs() {
+    fn the_deadline_parks_once_however_many_times_the_sweep_runs() {
+        // The sweep revisits every 30 seconds for the life of the process, and a
+        // parked intent stays parked until a person acts. Re-parking would move no
+        // money — but it would re-emit the warning on every tick, and a line that
+        // repeats forever is a line nobody reads. The `escrow_parked_unix_ms IS
+        // NULL` filter is what stops it, in the selection AND in the claim.
         let (pool, intent_id, _) = fixture(300, 1_000);
         assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
 
-        let mut releases = 0;
+        let mut acted = 0;
         for _ in 0..10 {
-            releases += sweep_after_deadline(&pool);
+            acted += sweep_after_deadline(&pool);
         }
-        assert_eq!(releases, 1, "the deadline refunded the same payment more than once");
-        assert_eq!(balance_of(&pool, "acct-a"), 1_000);
-        assert_eq!(escrow_balance(&pool), 0);
+        assert_eq!(acted, 1, "the sweep parked the same payment more than once");
 
-        // One ledger row for the return, not ten.
-        let refunds: i64 = pool
+        // Ten passes, and the ledger never moved.
+        assert_eq!(escrow_balance(&pool), 300);
+        assert_eq!(balance_of(&pool, "acct-a"), 700);
+        let rows: i64 = pool
             .get()
             .unwrap()
             .query_row(
@@ -3234,7 +3352,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(refunds, 1);
+        assert_eq!(rows, 0);
+        // …and the stamp is the first pass's, not the tenth's.
+        assert!(intent_of(&pool, &intent_id).escrow_parked_unix_ms.is_some());
     }
 
     /// The counterpart, and the reason escrow exists: while the money is held, a
