@@ -1,6 +1,6 @@
 {
   "id": "com.mochi.moymoy",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "schema_version": 1,
   "name": {
     "default": "MoyMoy",
@@ -21,9 +21,9 @@
     "utilities"
   ],
   "bundle": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.6.0/com.mochi.moymoy-0.6.0.tar",
-    "sha256": "7a6fe4019cf5074469629fecc154cc09f26fde79a78ce7d526d1894298124ec2",
-    "size": 267264,
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.7.0/com.mochi.moymoy-0.7.0.tar",
+    "sha256": "604c5d6f62e74fe0df5b80b24c0ae84cdce9358c91ae65b419f56c37f3fb2129",
+    "size": 283136,
     "format": "tar"
   },
   "runtime": {
@@ -33,7 +33,7 @@
     }
   },
   "icon": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.6.0/com.mochi.moymoy-0.6.0.png",
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.7.0/com.mochi.moymoy-0.7.0.png",
     "sha256": "cfd2d10d05f14df3ef79adbbc68c3447670b150634746d7076ea5090f409e988",
     "size_px": 512,
     "format": "png"
