@@ -14,21 +14,53 @@
 //!
 //! ## Thresholds
 //!
+//! **"In the window" is not a plain rolling day.** It is everything that has left
+//! the account since it last cleared an emailed code, and at most the last 24
+//! hours — see the section below.
+//!
 //! | | requirement |
 //! |---|---|
-//! | ≤ 200 エメ, ≤ 1,000 エメ in 24h, familiar device | none |
+//! | ≤ 200 エメ, ≤ 1,000 エメ in the window, familiar device | none |
 //! | anything above that | PIN |
-//! | > 5,000 エメ once, > 10,000 エメ in 24h, or an unfamiliar device | PIN + email OTP |
+//! | > 10,000 エメ once, > 100,000 エメ in the window, or an unfamiliar device | PIN + email OTP |
 //!
 //! The constants below state those same numbers in the ledger's minor units
 //! (1/100 エメ), which is what every amount reaching this module is counted in —
-//! so `FRICTIONLESS_SINGLE` is 20,000, not 200. **They are the ×100 of what they
-//! always were, not a re-tuning**: the v8 unit migration deliberately changed no
-//! policy, so the bands a user meets are exactly the ones in the table.
+//! so `FRICTIONLESS_SINGLE` is 20,000, not 200.
+//!
+//! The two step-up numbers were raised (from 5,000 / 10,000 エメ) after a real
+//! account met the daily one legitimately and was then asked for a code on every
+//! movement it made. The frictionless pair is untouched: the complaint was about
+//! codes, and the PIN band was not part of it.
 //!
 //! Constants, not configuration: a wallet whose spending limits can be moved by
 //! an environment variable has limits set by whoever can edit the launcher.
 //! DEV.md records the numbers for operational review.
+//!
+//! ## The window restarts when a second factor is produced
+//!
+//! Counting a movement the holder has already answered a code for, as evidence
+//! that they might not be the holder, is double-counting rather than caution. The
+//! symptom was unmistakable: once an account passed the daily threshold, every
+//! later movement was asked for a code — down to one of a single エメ — because
+//! the movements it had already authenticated stayed in the total.
+//!
+//! So a successful code moves the window's start to that moment
+//! (`accounts.stepup_verified_unix_ms`, schema v11), and the total is counted from
+//! `max(now - 24h, that)`. The day stays as a ceiling: a verification three days
+//! ago must not open a three-day window.
+//!
+//! Two details that are decisions rather than accidents:
+//!
+//! * **The stamp happens when the code verifies, not when the money moves.** The
+//!   movement that required the code therefore falls inside its own new window —
+//!   clearing a code for a 15,000 エメ withdrawal leaves 15,000 counted, not 0.
+//!   Stamping after the transfer would let one code carry that 15,000 and a
+//!   further 100,000 behind it.
+//! * **A PIN does not reset it.** What justifies the reset is the SECOND factor,
+//!   which the holder of a stolen session cannot produce. A PIN travels with the
+//!   session it is typed into, so resetting on one would let the thing being
+//!   guarded clear its own guard.
 //!
 //! ## The second factor fails closed
 //!
@@ -51,12 +83,12 @@ use crate::otp::{self, VerifyOtp};
 
 /// Single-movement ceiling below which nothing is asked (200 エメ).
 pub const FRICTIONLESS_SINGLE: i64 = 20_000;
-/// Rolling 24h outflow below which nothing is asked (1,000 エメ).
+/// Windowed outflow below which nothing is asked (1,000 エメ).
 pub const FRICTIONLESS_DAILY: i64 = 100_000;
-/// Single movement above which a second factor is required (5,000 エメ).
-pub const STEPUP_SINGLE: i64 = 500_000;
-/// Rolling 24h outflow above which a second factor is required (10,000 エメ).
-pub const STEPUP_DAILY: i64 = 1_000_000;
+/// Single movement above which a second factor is required (10,000 エメ).
+pub const STEPUP_SINGLE: i64 = 1_000_000;
+/// Windowed outflow above which a second factor is required (100,000 エメ).
+pub const STEPUP_DAILY: i64 = 10_000_000;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -160,19 +192,65 @@ pub fn device_trust(
     }
 }
 
-/// Everything that has left this account in the last 24 hours, as a positive
+/// When the outflow total starts counting from: the later of a day ago and this
+/// account's last successful second factor.
+///
+/// The `max` is what keeps the reset from becoming a loophole in the other
+/// direction — without it, an account that cleared a code three days ago would be
+/// assessed on three days of movement.
+fn window_start(conn: &Connection, account_id: &str, now: i64) -> rusqlite::Result<i64> {
+    let verified: Option<i64> = conn
+        .query_row(
+            "SELECT stepup_verified_unix_ms FROM accounts WHERE account_id = ?1",
+            [account_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    // A missing account row reads as "never verified" rather than erroring: this
+    // only ever widens what is counted, and the account's existence is the
+    // caller's problem, checked where it can be answered properly.
+    Ok(verified.unwrap_or(i64::MIN).max(now - DAY_MS))
+}
+
+/// Everything that has left this account inside the current window, as a positive
 /// number.
 ///
 /// Read off the ledger rather than from a counter, so it covers sends, payments
 /// and withdrawal reserves alike — including any outflow a future feature adds,
 /// which is the point of putting the question here instead of in each endpoint.
-pub fn outflow_24h(conn: &Connection, account_id: &str, now: i64) -> rusqlite::Result<i64> {
+/// **No `kind` filter, deliberately**: "what has left the account" is the
+/// question, and a filter would answer a narrower one every time a new kind of
+/// debit appeared.
+///
+/// The bound is `>=`, not `>`, and that matters at exactly one place: the
+/// movement that a code was just cleared for is stamped and settled in the same
+/// millisecond, and it belongs inside its own new window (see the module docs).
+pub fn outflow_in_window(conn: &Connection, account_id: &str, now: i64) -> rusqlite::Result<i64> {
+    let since = window_start(conn, account_id, now)?;
     conn.query_row(
         "SELECT COALESCE(-SUM(amount), 0) FROM transactions \
-         WHERE account_id = ?1 AND amount < 0 AND ts_unix_ms > ?2",
-        params![account_id, now - DAY_MS],
+         WHERE account_id = ?1 AND amount < 0 AND ts_unix_ms >= ?2",
+        params![account_id, since],
         |r| r.get(0),
     )
+}
+
+/// Record that this account has just produced a second factor, restarting its
+/// outflow window.
+///
+/// Called from inside the transaction that consumes the code, so "the code was
+/// spent" and "the window restarted" cannot come apart.
+fn mark_stepup_verified(
+    conn: &Connection,
+    account_id: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE accounts SET stepup_verified_unix_ms = ?2 WHERE account_id = ?1",
+        params![account_id, now],
+    )?;
+    Ok(())
 }
 
 /// Decide what this movement has to be authenticated with.
@@ -200,7 +278,7 @@ pub fn assess_for(
     amount: i64,
     now: i64,
 ) -> rusqlite::Result<Requirement> {
-    let spent = outflow_24h(conn, account_id, now)?;
+    let spent = outflow_in_window(conn, account_id, now)?;
     let device = device_trust(conn, account_id, phone_id)?;
     Ok(assess(amount, spent, device))
 }
@@ -434,21 +512,37 @@ pub fn step_up(
     if let Some((email_lower, code)) = otp_check {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let verdict = otp::verify(&tx, PURPOSE_STEPUP, &email_lower, &code)?;
+        // A code issued to a different account is not a code for this one,
+        // however valid it is in its own right.
+        let accepted = matches!(
+            &verdict,
+            VerifyOtp::Ok { account_id: a, .. } if a.as_deref() == Some(account_id)
+        );
+        if accepted {
+            // Inside the SAME transaction that consumed the code, and only on the
+            // accepted path. The code is gone after this commits, so if the stamp
+            // were a separate write that failed, the account would have spent its
+            // second factor and got nothing for it — and would be asked for
+            // another one immediately.
+            //
+            // Reached only from here, which is what keeps the reset tied to the
+            // SECOND factor: a movement cleared on the PIN alone never enters this
+            // block. See the module docs for why that distinction is the whole
+            // justification.
+            mark_stepup_verified(&tx, account_id, now)?;
+        }
+        // Committed on BOTH outcomes — see the note above about the attempt
+        // counter being the only thing bounding guesses.
         tx.commit()?;
-        match verdict {
-            // A code issued to a different account is not a code for this one,
-            // however valid it is in its own right.
-            VerifyOtp::Ok { account_id: a, .. } if a.as_deref() == Some(account_id) => {}
-            _ => {
-                // The PIN was right — only the code was wrong, and the code now
-                // carries that failure on its own counter. Give the PIN attempt
-                // back, or five mistyped codes would lock somebody out of their
-                // account rather than just out of that code.
-                auth::clear_pin_failures(conn, account_id, epoch)?;
-                return Ok(StepUp::Refused(
-                    json!({ "ok": false, "error": "invalid_code" }),
-                ));
-            }
+        if !accepted {
+            // The PIN was right — only the code was wrong, and the code now
+            // carries that failure on its own counter. Give the PIN attempt
+            // back, or five mistyped codes would lock somebody out of their
+            // account rather than just out of that code.
+            auth::clear_pin_failures(conn, account_id, epoch)?;
+            return Ok(StepUp::Refused(
+                json!({ "ok": false, "error": "invalid_code" }),
+            ));
         }
     }
 
@@ -842,6 +936,114 @@ mod tests {
         // Credits are not outflow, and a debit older than the window has aged out.
         row("charge", 9_000, now - 1_000);
         row("send", -7_000, now - DAY_MS - 1);
-        assert_eq!(outflow_24h(&conn, "acct-a", now).unwrap(), 450);
+        assert_eq!(outflow_in_window(&conn, "acct-a", now).unwrap(), 450);
+    }
+
+    /// One account, seeded and driven through the window helpers directly.
+    fn windowed_account(verified_at: Option<i64>) -> (crate::db::Pool, i64) {
+        let pool = crate::db::open_memory().unwrap();
+        let now = 10 * DAY_MS;
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (account_id, stepup_verified_unix_ms, created_unix_ms, \
+                   updated_unix_ms) VALUES ('acct-a', ?1, 0, 0)",
+                [verified_at],
+            )
+            .unwrap();
+        }
+        (pool, now)
+    }
+
+    fn debit(pool: &crate::db::Pool, amount: i64, ts: i64) {
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO transactions (id, account_id, kind, label, amount, balance_after, \
+                   ts_unix_ms) VALUES (?1, 'acct-a', 'send', 'x', ?2, 0, ?3)",
+                params![format!("t{ts}-{amount}"), -amount, ts],
+            )
+            .unwrap();
+    }
+
+    fn outflow(pool: &crate::db::Pool, now: i64) -> i64 {
+        outflow_in_window(&pool.get().unwrap(), "acct-a", now).unwrap()
+    }
+
+    /// The complaint that prompted the change, with the numbers from the real
+    /// account: 33,964 エメ out in a day, then a payment of any size.
+    ///
+    /// Under the old ceiling (10,000 エメ) this account was past the daily
+    /// threshold and every later movement — including a single エメ — was asked
+    /// for an emailed code.
+    #[test]
+    fn the_outflow_that_prompted_this_change_no_longer_demands_a_code() {
+        const OBSERVED: i64 = 3_396_467; // minor units, measured in production
+        let f = DeviceTrust::Familiar;
+
+        // A one-エメ payment on top of it asks for nothing more than a PIN…
+        assert_eq!(assess(100, OBSERVED, f), Requirement::Pin);
+        // …and neither does a substantial one.
+        assert_eq!(assess(500_000, OBSERVED, f), Requirement::Pin);
+        // The band still exists: a movement past the single ceiling, or a total
+        // past the daily one, still asks for the code.
+        assert_eq!(assess(STEPUP_SINGLE + 1, OBSERVED, f), Requirement::PinAndOtp);
+        assert_eq!(
+            assess(STEPUP_DAILY - OBSERVED + 1, OBSERVED, f),
+            Requirement::PinAndOtp
+        );
+    }
+
+    #[test]
+    fn a_verification_drops_what_came_before_it_from_the_total() {
+        let (pool, now) = windowed_account(None);
+        debit(&pool, 300, now - 5_000);
+        debit(&pool, 700, now - 3_000);
+        assert_eq!(outflow(&pool, now), 1_000);
+
+        // The code clears at `now - 2_000`: everything before it has been answered
+        // for and stops counting.
+        {
+            let conn = pool.get().unwrap();
+            mark_stepup_verified(&conn, "acct-a", now - 2_000).unwrap();
+        }
+        assert_eq!(outflow(&pool, now), 0);
+
+        // Movements after it count again, from zero.
+        debit(&pool, 250, now - 1_000);
+        assert_eq!(outflow(&pool, now), 250);
+    }
+
+    #[test]
+    fn the_movement_that_required_the_code_stays_inside_its_own_new_window() {
+        // The reason the stamp happens at verification and not after the transfer.
+        // The two land in the same millisecond, and the movement belongs to the
+        // window its own code opened — otherwise one code would carry the
+        // movement it authorized AND a further full allowance behind it.
+        let (pool, now) = windowed_account(None);
+        {
+            let conn = pool.get().unwrap();
+            mark_stepup_verified(&conn, "acct-a", now).unwrap();
+        }
+        debit(&pool, 1_500_000, now); // settled in the same millisecond
+        assert_eq!(outflow(&pool, now), 1_500_000);
+    }
+
+    #[test]
+    fn an_old_verification_cannot_widen_the_window_past_a_day() {
+        // Without the `max`, a code cleared three days ago would have the account
+        // assessed on three days of movement.
+        let (pool, now) = windowed_account(Some(10 * DAY_MS - 3 * DAY_MS));
+        debit(&pool, 900, now - 2 * DAY_MS); // older than a day: aged out
+        debit(&pool, 400, now - 1_000); // inside the day: counted
+        assert_eq!(outflow(&pool, now), 400);
+    }
+
+    #[test]
+    fn an_account_that_has_never_verified_is_counted_over_the_plain_day() {
+        let (pool, now) = windowed_account(None);
+        debit(&pool, 900, now - DAY_MS - 1); // outside
+        debit(&pool, 400, now - 1_000); // inside
+        assert_eq!(outflow(&pool, now), 400);
     }
 }

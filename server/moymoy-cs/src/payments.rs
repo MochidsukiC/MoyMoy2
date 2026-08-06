@@ -1650,6 +1650,93 @@ mod tests {
             .unwrap()
     }
 
+    fn stepup_verified_at(pool: &Pool) -> Option<i64> {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT stepup_verified_unix_ms FROM accounts WHERE account_id = 'acct-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn windowed_outflow(pool: &Pool) -> i64 {
+        riskauth::outflow_in_window(&pool.get().unwrap(), "acct-a", now_ms()).unwrap()
+    }
+
+    /// Clearing an emailed code restarts the account's outflow window.
+    ///
+    /// Without it, the payment just authenticated stays in the total, and the
+    /// NEXT one — however small — meets that same total and is asked for another
+    /// code. That is the defect this exists to remove, and it was live.
+    #[test]
+    fn clearing_a_code_restarts_the_outflow_window() {
+        let (pool, intent_id, amount) = stepup_fixture(Some("stepup-window@disc.mnn"));
+        assert_eq!(stepup_verified_at(&pool), None, "the fixture starts unverified");
+
+        let code = issue_stepup_code(&pool, "stepup-window@disc.mnn");
+        let v = approve_stepup(&pool, &intent_id, PIN, Some(&code));
+        assert_eq!(v["ok"], json!(true), "{v}");
+
+        let verified = stepup_verified_at(&pool).expect("the window was not restarted");
+        let paid_at: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ts_unix_ms FROM transactions WHERE account_id = 'acct-a' \
+                   AND kind = 'pay' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Stamped when the code cleared, which is BEFORE the transfer — so the
+        // payment it authorized falls inside its own new window instead of the
+        // next one starting from zero.
+        assert!(
+            verified <= paid_at,
+            "the stamp ({verified}) came after the movement ({paid_at}) it authorized"
+        );
+        assert_eq!(
+            windowed_outflow(&pool),
+            amount,
+            "the authorized movement fell outside its own window"
+        );
+    }
+
+    /// A PIN is not a second factor, and restarts nothing.
+    ///
+    /// What justifies the reset is the holder producing something a stolen session
+    /// cannot. A PIN travels with the session it is typed into, so resetting on
+    /// one would let the thing being guarded clear its own guard.
+    #[test]
+    fn a_pin_only_approval_leaves_the_window_alone() {
+        let (pool, intent_id, _) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        assert_eq!(
+            stepup_verified_at(&pool),
+            None,
+            "a PIN restarted the outflow window"
+        );
+        // …and the movement still counts, which is the point of it not resetting.
+        assert_eq!(windowed_outflow(&pool), 300);
+    }
+
+    #[test]
+    fn a_wrong_code_leaves_the_window_where_it_was() {
+        let (pool, intent_id, _) = stepup_fixture(Some("stepup-badwin@disc.mnn"));
+        let real = issue_stepup_code(&pool, "stepup-badwin@disc.mnn");
+        let wrong = if real == "000000" { "111111" } else { "000000" };
+
+        let v = approve_stepup(&pool, &intent_id, PIN, Some(wrong));
+        assert_eq!(v["error"], json!("invalid_code"), "{v}");
+        assert_eq!(
+            stepup_verified_at(&pool),
+            None,
+            "a rejected code restarted the window"
+        );
+    }
+
     fn state_of(pool: &Pool, intent_id: &str) -> String {
         get(&pool.get().unwrap(), intent_id)
             .unwrap()

@@ -50,8 +50,12 @@ const SCHEMA_V9: &str = include_str!("schema_v9.sql");
 /// The v10 delta: `payment_intents.fulfil_reason` — the shop's own account of why
 /// a fulfilment fell short, kept for as long as the movement it explains.
 const SCHEMA_V10: &str = include_str!("schema_v10.sql");
+/// The v11 delta: `accounts.stepup_verified_unix_ms` — when this account last
+/// cleared a second factor, so `riskauth`'s outflow window can start there rather
+/// than counting movements the holder has already authenticated.
+const SCHEMA_V11: &str = include_str!("schema_v11.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -192,8 +196,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 10;
         tracing::info!("sqlite migrated to schema v10 (fulfilment reasons are kept)");
     }
-    // Future: `if version < 11 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V11)?;
-    //          tx.pragma_update(None, "user_version", 11)?; tx.commit()?; version = 11; }`
+    if version < 11 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V11)?;
+        tx.pragma_update(None, "user_version", 11)?;
+        tx.commit()?;
+        version = 11;
+        tracing::info!("sqlite migrated to schema v11 (step-up resets the outflow window)");
+    }
+    // Future: `if version < 12 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V12)?;
+    //          tx.pragma_update(None, "user_version", 12)?; tx.commit()?; version = 12; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }
@@ -829,6 +841,41 @@ mod tests {
         // v9's work is still intact after v10 ran on top of it.
         assert_eq!(amount, 12900);
         assert!(released.is_some(), "v9's backfill was undone");
+    }
+
+    /// v11 gives every existing account a NULL verification time.
+    ///
+    /// NULL is the only honest default: nobody has cleared a second factor under
+    /// a mechanism that did not exist. A timestamp — even the migration's own —
+    /// would silently forgive whatever those accounts had already spent, which is
+    /// the reverse of what the column is for.
+    #[test]
+    fn migration_v11_starts_every_account_unverified() {
+        let mut conn = v8_db();
+        insert_account(&conn, "acct-a");
+        conn.execute(
+            "UPDATE accounts SET balance = 5000 WHERE account_id = 'acct-a'",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).expect("v8 → v11");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        let (verified, balance): (Option<i64>, i64) = conn
+            .query_row(
+                "SELECT stepup_verified_unix_ms, balance FROM accounts WHERE account_id = 'acct-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(verified, None, "an account was credited with a verification it never made");
+        // The v8 rescale is still intact after three more migrations ran on it.
+        assert_eq!(balance, 5000);
     }
 
     #[test]

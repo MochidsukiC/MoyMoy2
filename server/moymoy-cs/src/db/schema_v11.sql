@@ -1,0 +1,27 @@
+-- MoyMoy schema v11 — when this account last proved itself with a second factor.
+--
+-- The rolling 24-hour outflow window (`riskauth`) counted every movement in the
+-- last day, including the ones the account holder had ALREADY answered an emailed
+-- code for. So a 5,000 エメ payment cleared with a code left those 5,000 in the
+-- total, and the next movement — a 1 エメ one — met the same total and asked for
+-- another code. In practice that meant an account past the daily threshold was
+-- asked for a code on every single payment, whatever its size.
+--
+-- Counting a movement the holder has already authenticated as evidence that they
+-- might not be the holder is double-counting, not caution: the second factor was
+-- produced, and the question it answers has been answered. This column records
+-- WHEN, so the window can start from there instead.
+--
+-- The window is still bounded at 24 hours — `max(now - 24h, this)` — so a
+-- verification from three days ago does not open a three-day window.
+--
+-- **Why a column and not a query over `moymoy_otps`.** A code is consumed and
+-- deleted on use (that is what makes it single-use), so the OTP table holds no
+-- record that a verification ever happened. The fact has to be written down
+-- somewhere durable at the moment it is true, and the account is what it is a
+-- fact about.
+--
+-- NULL means "has never cleared a second factor", which is every account today
+-- and every account that only ever moves small amounts. `riskauth` reads NULL as
+-- "no reset", i.e. the plain 24-hour window it has always used.
+ALTER TABLE accounts ADD COLUMN stepup_verified_unix_ms INTEGER;
