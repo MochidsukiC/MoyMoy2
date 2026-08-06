@@ -1,34 +1,57 @@
 {
   "id": "com.mochi.moymoy",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "schema_version": 1,
-  "name": { "default": "MoyMoy", "ja": "モイモイ" },
+  "name": {
+    "default": "MoyMoy",
+    "ja": "モイモイ"
+  },
   "description": {
     "default": "In-Minecraft emerald wallet for MochiOS — check your balance, send エメ to friends, pay merchants, charge from the emeralds in your inventory, and withdraw エメ back out as emeralds.",
     "ja": "MochiOS のゲーム内エメラルド決済ウォレット。残高確認、フレンドへの送金、加盟店での支払い、インベントリのエメラルドからのチャージ、エメラルドでの出金ができます。"
   },
-  "author": { "name": "Mochidsuki", "url": "https://houlab.jp", "support_email": "dev@houlab.jp" },
+  "author": {
+    "name": "Mochidsuki",
+    "url": "https://houlab.jp",
+    "support_email": "dev@houlab.jp"
+  },
   "license": "Proprietary",
-  "categories": ["finance", "utilities"],
+  "categories": [
+    "finance",
+    "utilities"
+  ],
   "bundle": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.5.2/com.mochi.moymoy-0.5.2.tar",
-    "sha256": "d733b0a1d3f18902c7ec7594eb3418e0744a7d65081926b6bcdef8add3eba2f4",
-    "size": 259072,
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.6.0/com.mochi.moymoy-0.6.0.tar",
+    "sha256": "7a6fe4019cf5074469629fecc154cc09f26fde79a78ce7d526d1894298124ec2",
+    "size": 267264,
     "format": "tar"
   },
-  "runtime": { "kind": "js", "foreground": { "entry": "index.html" } },
+  "runtime": {
+    "kind": "js",
+    "foreground": {
+      "entry": "index.html"
+    }
+  },
   "icon": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.5.2/com.mochi.moymoy-0.5.2.png",
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.6.0/com.mochi.moymoy-0.6.0.png",
     "sha256": "cfd2d10d05f14df3ef79adbbc68c3447670b150634746d7076ea5090f409e988",
     "size_px": 512,
     "format": "png"
   },
-  "allowed_origins": ["https://moymoy.cs.mnn"],
+  "allowed_origins": [
+    "https://moymoy.cs.mnn"
+  ],
   "allowed_services": [],
   "requires": {
     "permissions": [],
-    "mochi_services": ["phone_state.read", "attestation.request", "apps.launch"],
+    "mochi_services": [
+      "phone_state.read",
+      "attestation.request",
+      "apps.launch"
+    ],
     "min_runtime_version": "0.1.0"
   },
-  "supported_platforms": ["mc"]
+  "supported_platforms": [
+    "mc"
+  ]
 }
