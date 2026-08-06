@@ -9,7 +9,7 @@ MochiOS2.0 プラットフォーム向けの電子マネー / ウォレット / 
 
 ## プロジェクト仕様書
 
-- **目的**: MochiOS Mobile 上で動く電子マネー/ウォレットアプリ。通貨単位は整数「エメ」、1エメラルド=1エメ。
+- **目的**: MochiOS Mobile 上で動く電子マネー/ウォレットアプリ。通貨単位は「エメ」（小数2桁、台帳は 1/100 エメの整数マイナーユニット。§金額の単位）。MC mod との wire は引き続き物理エメラルドの個数（1エメラルド=1エメ）。
 - **構成（3コンポーネント）**:
   - `server/moymoy-cs/` — Rust+axum バックエンド → `moymoy.cs.mnn`。**トンネル内蔵型SDK**(`mochi-hub-cs-sdk` の `CsTunnel::start`)。ウォレットの唯一の権威。SQLite 永続化。**MC mod 無しでも完全動作**。
   - `app-mobile/apps/com.mochi.moymoy/` — HTML/JS バンドル。`fetch("https://moymoy.cs.mnn/...")`。デザイン「MochiOS Mobile.html」駆動。
@@ -23,7 +23,7 @@ MochiOS2.0 プラットフォーム向けの電子マネー / ウォレット / 
 ## 現在の仕様（デザイン「MochiOS Mobile.html」駆動で確定）
 
 デザインは 電子マネー×クレジットカード風のエメラルド決済アプリ。タブは **home / send(送る) / pay(支払う) / charge(チャージ、内部にチャージ/出金セグメント) / history(履歴)**。ボトムナビ5タブ・ホームのクイックアクション3つは不変。
-通貨は整数「エメ」、**9エメ = 1エメラルドブロック**（Minecraft）。
+通貨は「エメ」（小数2桁、§金額の単位）、**9エメラルド = 1エメラルドブロック**（Minecraft、物理個数の換算）。
 取引種別 `kind`: `pay`(支払い) / `send`(送金) / `receive`(受取) / `charge`(チャージ) / `withdraw`(出金、引落は負・返金は正)。各取引 `{id, kind, label, amount(符号付), ts}`。
 **請求/承認(request/approve)機能はデザインに無い** → 実装しない。
 
@@ -31,7 +31,7 @@ UIフロー:
 - **home**: 利用可能残高 + カード(holder/number/expiry) + クイックアクション(pay/send/charge) + 最近の取引4件。
 - **send**: フレンド(プレイヤー)選択 → 金額 → 確認 → 完了。残高減・相手は receive。
 - **pay**: 近くの加盟店選択 → 金額 → 確認 → 完了、というデザイン当初の直接送金フローは v6 で廃止（`/wallet/pay` 削除、§EC決済）。決済は加盟店が発行する PaymentIntent の承認画面に置き換わった（実装済み、§EC決済）。
-- **charge**: チャージ/出金セグメント切替。チャージはインベントリ(手持ちエメラルド + ブロック、9エメ=1ブロック)を換算 → 金額 → 確認 → 完了、エメラルド消費し残高加算。出金は金額 → 着金先キャラクター確認 → 完了、残高減で mod がエメラルド付与（§出金整合）。いずれも**MC mod 依存**。
+- **charge**: チャージ/出金セグメント切替。チャージはインベントリ(手持ちエメラルド + ブロック、9エメラルド=1ブロック)を換算 → 金額 → 確認 → 完了、エメラルド消費し残高加算。出金は金額 → 着金先キャラクター確認 → 完了、残高減で mod がエメラルド付与（§出金整合）。いずれも**MC mod 依存**。
 - **history**: 全取引リスト(フィルタ: すべて/支払い/送金/チャージ/出金)。
 
 ### アカウントモデル（v2・独立アカウント + PIN）
@@ -44,7 +44,7 @@ UIフロー:
 - **メール検証 / 2FA / リカバリ（v4、送信基盤は v7 で更新）**: **MNN メール（`@*.mnn`）限定**。送信は `mochi-hub-mailer` の `MnnMailSender` で、認証には launcher が起動時に注入する**このプロセス自身の identity token**（`MOCHI_SVC_IDENTITY_TOKEN`）を使う。旧・共有シークレットの `MOCHI_MAIL_SERVICE_BEARER` は廃止済み（運用者による手動設定は不要）。`MOYMOY_CS_TUNNEL`（既定 `true`）が有効な通常起動では、この identity token が無いとトンネル確立自体が boot 時に fail するため、**launcher 経由の通常運用では常に有効**。トークンが無い状態は `MOYMOY_CS_TUNNEL=0` のループバックのみスモーク等に限られ、そこでは**開設にメール＋OTP必須**の代わりに handle+PIN へ degrade する（`MOYMOY_DEV_OTP_LOG=1` でコードをログ出力するローカル検証モードも同様に degrade 側）。メール有効時はログイン PIN＋メール2FA、PIN 忘れはメール OTP で再設定。OTP は 6桁・SHA-256(+`MOYMOY_OTP_PEPPER`)保存・10分・5回上限・単回・再送クールダウン（`moymoy_otps`）。IPvM ゲートウェイ `/mail/otp-deliver` 経由で相手の in-world メールアプリへ配送、外部SMTPは使わない。`valid_email` は `local@<単一ラベル>.mnn` のみ受理。
 
 ### バックエンド HTTP API
-全レスポンス `{ok:bool, ...}`。ウォレット系は `X-MoyMoy-Session` でセッション認証（無効は 401）。
+全レスポンス `{ok:bool, ...}`。ウォレット系は `X-MoyMoy-Session` でセッション認証（無効は 401）。金額フィールド（`amount` 等）は全経路で 1/100 エメの整数マイナーユニット建て（§金額の単位）。`/wallet/charge`・`/wallet/withdraw` はエメラルドとの往来があるため `%100 != 0` を `bad_amount`（400）で拒否するが、`/wallet/send`・EC決済承認には端数検査が無く 1 マイナーユニット（0.01エメ）から通る。
 - `GET /healthz` / `GET /wallet/status` → `{ok, app:"moymoy", can_charge}`（公開）／ `GET /auth/config` → `{ok, email_enabled}`
 - `POST /auth/register {handle, display_name, pin, email?, phone_id?}` → メール有効時 `{ok, pending:"verify_email", email}`／無効時 `{ok, session, account}` ／ `POST /auth/register/verify {email, code}` → `{ok, session, account}`
 - `POST /auth/login {handle, pin, phone_id?}` → 2FA 時 `{ok, pending:"2fa", email}`／それ以外 `{ok, session, account}` ／ `POST /auth/login/verify {handle, code}` → `{ok, session, account}`
@@ -61,14 +61,15 @@ UIフロー:
 - `POST /wallet/link {mochi_account_id}` → 入金通知の送り先デバイス登録（session, §入金通知）
 - `POST /wallet/_dev/credit {handle, amount}` → dev 専用クレジット（`MOYMOY_DEV_CREDIT=1` ゲート）
 - **EC決済（MoyMoy Pay、v6）**: `GET /wallet/payment/intent?intent_id=`（承認画面が表示する唯一の情報源）／ `POST /wallet/payment/approve {intent_id, pin}`（常に PIN 必須）／ `POST /wallet/payment/decline {intent_id}`（PIN不要）。`POST /wallet/pay` は廃止（下記§EC決済）
-- **加盟店 API（v6）**: `/merchant/v1/*`（`Authorization: Bearer moy_sk_…`、intent の作成・照会・取消）／ `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・閉店・上限変更・一覧）。詳細は§EC決済
+- **加盟店 API（v6）**: `/merchant/v1/*`（`Authorization: Bearer moy_sk_…`、intent の作成・照会・取消）／ `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・閉店・上限変更・一覧）。詳細は§EC決済。`/merchant/v1` の金額フィールドは **`amount_minor`**（v8）。旧 `amount` キーは `unsupported_amount_unit`、両方無しは `missing_amount_minor`（いずれも400、レート制限・冪等リプレイより前段で弾く）。改名自体が安全機構——キーを使い回すと片側のデプロイ遅延時に単位ズレが検知されずに通ってしまうため（§金額の単位）
 
 ### SQLite スキーマ
-`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until, **email, email_lower(UNIQUE), email_verified**) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires, **mochi_account_id**（v7、入金通知の送り先デバイス。セッション行に持たせ1端末複数口座・1口座複数端末の「最後勝ち」を回避）) / `moymoy_otps`(otp_id, purpose=signup|login2fa|recovery, email_lower, account_id, code_hash, payload_json, attempts, expires) / `transactions`(kind に `withdraw` 追加、引落は負・返金は正) / `merchants`（**v6拡張**: owner_account_id, name_skeleton(UTS#39 confusable skeleton の部分UNIQUE), status=active|disabled|deleted, api_key_hash/prefix/created/last_used, listed(既定0), payer_ref_salt, max_open_intents, daily_issue_cap） / `payment_intents`（**v6新規**: intent_id='pi_'+128bit CSPRNG, merchant_id, amount, description, order_ref, state=created|paid|declined|canceled|expired, payer_account_id, payer_hint_account_id, launch_app_id, tx_id, refunded_unix_ms, refund_tx_id, idem_key, expires_unix_ms） / `notification_outbox`（**v7新規**: outbox_id, account_id=着金先, kind, label, amount, created_unix_ms, attempts, next_attempt_unix_ms。§入金通知） / `idempotency`(PK=idem_key,scope。出金は scope=`withdraw:<account_id>`、決済は scope=`mi:<merchant_id>` で加盟店ごとに分離) / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, attester_id=同意されたサーバー(再送先を固定するルーティング情報。所有の証明ではない), direction=charge|withdraw, state=pending|sent|settled|failed|stuck, …)。出金は既存カラムに新しい値が増えるのみで**マイグレーション不要**（`kind`/`direction` に CHECK 制約なし）。マイグレーションは user_version ステッパ（v1 baseline `schema.sql` → v2 独立アカウント → v3 1キャラ1口座 → v4 メール/OTP → v5 `account_mc_links` を DROP しキャラクター所有の証明をリクエスト毎の Hub 署名 attestation へ移行 → v6 merchants 拡張 + payment_intents 新設 + デモ加盟店(m1..m5)を listed=0 に降格 → v7 `moymoy_sessions.mochi_account_id` 追加 + `notification_outbox` 新設、各 `db/schema_vN.sql`）。詳細は `server/moymoy-cs/src/db/`。
+`accounts`(account_id=MoyMoy口座UUID, handle, handle_lower, display_name, pin_hash, balance, holder, card_number, card_expiry, is_merchant, failed_pin_attempts, locked_until, **email, email_lower(UNIQUE), email_verified**) / `moymoy_sessions`(session_id, account_id, token_hash, phone_id, expires, **mochi_account_id**（v7、入金通知の送り先デバイス。セッション行に持たせ1端末複数口座・1口座複数端末の「最後勝ち」を回避）) / `moymoy_otps`(otp_id, purpose=signup|login2fa|recovery, email_lower, account_id, code_hash, payload_json, attempts, expires) / `transactions`(kind に `withdraw` 追加、引落は負・返金は正) / `merchants`（**v6拡張**: owner_account_id, name_skeleton(UTS#39 confusable skeleton の部分UNIQUE), status=active|disabled|deleted, api_key_hash/prefix/created/last_used, listed(既定0), payer_ref_salt, max_open_intents, daily_issue_cap） / `payment_intents`（**v6新規**: intent_id='pi_'+128bit CSPRNG, merchant_id, amount, description, order_ref, state=created|paid|declined|canceled|expired, payer_account_id, payer_hint_account_id, launch_app_id, tx_id, refunded_unix_ms, refund_tx_id, idem_key, expires_unix_ms） / `notification_outbox`（**v7新規**: outbox_id, account_id=着金先, kind, label, amount, created_unix_ms, attempts, next_attempt_unix_ms。§入金通知） / `idempotency`(PK=idem_key,scope。出金は scope=`withdraw:<account_id>`、決済は scope=`mi:<merchant_id>` で加盟店ごとに分離) / `emerald_ops`(op_id, account_id=着金先, mc_uuid=消費キャラ, attester_id=同意されたサーバー(再送先を固定するルーティング情報。所有の証明ではない), direction=charge|withdraw, state=pending|sent|settled|failed|stuck, …)。出金は既存カラムに新しい値が増えるのみで**マイグレーション不要**（`kind`/`direction` に CHECK 制約なし）。マイグレーションは user_version ステッパ（v1 baseline `schema.sql` → v2 独立アカウント → v3 1キャラ1口座 → v4 メール/OTP → v5 `account_mc_links` を DROP しキャラクター所有の証明をリクエスト毎の Hub 署名 attestation へ移行 → v6 merchants 拡張 + payment_intents 新設 + デモ加盟店(m1..m5)を listed=0 に降格 → v7 `moymoy_sessions.mochi_account_id` 追加 + `notification_outbox` 新設 → v8 金額列を 1/100 エメの整数マイナーユニットへスケール（`accounts.balance` / `transactions.amount`・`balance_after` / `payment_intents.amount` / `notification_outbox.amount` / `merchants.daily_issue_cap` / `emerald_ops.requested_amount`・`settled_amount`。件数系列（`max_open_intents` 等）・`*_unix_ms` は対象外、§金額の単位）、各 `db/schema_vN.sql`）。詳細は `server/moymoy-cs/src/db/`。
 
 ### コマンドバス verb（backend→mod / mod→backend ack）
-- `emerald.charge {op_id, idem_key, target_uuid, amount}` → mod 消費(インベントリのエメラルド+ブロック) → ack `{op_id, status, settled:consumed}`
-- `emerald.withdraw {op_id, idem_key, target_uuid, amount}` → mod がエメラルド付与(`amount/9`ブロック+`amount%9`エメ、満杯時は足元ドロップ) → ack `{op_id, status, granted}`（`settled` とは別名。status: `ok`/`duplicate`(再付与せず同額を再ack)/`unknown`(claim済みだが付与を証明できず`stuck`・返金なし)/`player_offline`/`bad_request`/`unauthorized`/`internal_error`）
+mod との wire は台帳と異なり**物理エメラルドの個数**建て（Java `int`。§金額の単位のアダプタが変換）。
+- `emerald.charge {op_id, idem_key, target_uuid, amount}`（amount=物理エメラルド個数） → mod 消費(インベントリのエメラルド+ブロック) → ack `{op_id, status, settled:consumed}`
+- `emerald.withdraw {op_id, idem_key, target_uuid, amount}`（amount=物理エメラルド個数） → mod がエメラルド付与(`amount/9`ブロック+`amount%9`個、満杯時は足元ドロップ) → ack `{op_id, status, granted}`（`settled` とは別名。status: `ok`/`duplicate`(再付与せず同額を再ack)/`unknown`(claim済みだが付与を証明できず`stuck`・返金なし)/`player_offline`/`bad_request`/`unauthorized`/`internal_error`）
 - `inventory.query {req_id, target_uuid}` → mod が手持ちを返答 `{req_id, emeralds, blocks}`（charge画面のインベントリ表示用。任意）
 
 ### 出金整合とattestation（§出金整合、チャージの逆方向）
@@ -76,7 +77,7 @@ UIフロー:
 - 確定的失敗（`player_offline` 等・付与なし）は同一トランザクション内で即返金。付与されたか**不明**（`unknown`）な場合は返金しない（返金するとエメラルドと残高の両取りになる）ため `stuck` にして手動レビュー（R008 と同じ規律）。返金は state を非終端から動かした当のトランザクション内でのみ行い、UPDATE の変更行数でガードして reconcile と ack の同時到達による二重返金を構造的に防ぐ。
 - `reconcile` の dead-letter は方向別: チャージの一括 UPDATE には `direction='charge'` の絞りが入り、出金は1行ずつ処理（未送達 `pending` → 返金して `failed` ／曖昧な `sent` → 返金なしで `stuck`）。再送は台帳の `direction` で verb を分岐（出金 op をチャージとして再送するとプレイヤーのエメラルドを逆に没収するため必須）。
 - **認可**: `AttestPurpose::Withdraw`（purpose 文字列 `"withdraw"`）と request-hash ドメイン `moymoy.withdraw.v1` を新設。ドメイン分離＋challenge の purpose バインドにより、チャージ用 assertion で出金はできず逆も不可。
-- **上限**: 1操作あたり 20,736 エメ（=2,304 エメラルドブロック=インベントリ1個分）を backend と mod が独立に強制（無制限だと mod 側で数百万スタックが生成されサーバースレッドを固めるため）。
+- **上限**: 1操作あたり 20,736 エメ（=2,304 エメラルドブロック=インベントリ1個分）を backend（`MAX_WITHDRAW_PER_OP`、マイナーユニット建て）と mod（`MAX_WITHDRAW_PHYSICAL`、物理個数建て）が単位の異なる別々の定数として独立に強制（無制限だと mod 側で数百万スタックが生成されサーバースレッドを固めるため）。
 - **mod 側冪等**: `grants` コンパウンド（`op_id → -1`=claim済み未確定／`≥0`=確定付与額）で管理。チャージ用の `ops` は不変・後方互換。claim → ディスクへ同期フラッシュ → 付与 → 確定記録 → フラッシュ、の二相（付与は無から生成するため記録前クラッシュ＋リプレイでの二重生成を防ぐ必須要件）。判定〜claim〜付与〜確定は1回の `server.submit` 内で完結させ、同一 op の同時実行が両方とも「未 claim」を観測することを構造的に不可能にしている。
 - **不変条件の変更**: 従来「ウォレットから価値が外へ出る経路は無い」が成立していたが、出金ではこれは成立しない。代わりに ①出金は必ずセッション本人の操作、②金額と `idem_key` に束縛されたユーザー同意付き assertion を要する、③`AttestedFacts::account_id` は依然として認可に読まれない、④attester（サーバー運営者）は他人の残高を動かす手段を持たず宛先キャラを名乗れるのみ、が担保される。新たな信頼境界は「ユーザーが出金先 MC サーバーを信用する」こと。
 
@@ -104,7 +105,7 @@ OS 依存（決定、未照合）: MochiOS の `os.apps.launch` / `os.apps.takeL
 ### リスクベース段階認証（riskauth、v6）
 機能別に PIN を撒かず、資金流出の唯一の関門にする。`/wallet/send`・`/wallet/withdraw`・決済承認 (`/wallet/payment/approve`) が同じ関門 (`riskauth::step_up`) を通る。`/wallet/charge` は資金流入なので対象外。
 
-3段階の閾値（コード定数、環境変数化はしない。実運用で調整する前提）:
+3段階の閾値（コード定数、環境変数化はしない。実運用で調整する前提。値はエメ単位——コード内部の定数はマイナーユニット建てのため見た目は ×100 されているが、v8 の単位移行は閾値そのものを変えていない、§金額の単位）:
 - 単発 **200 エメ以下**かつ 24h 累計流出 **1,000 エメ以下**かつ端末一致 → **認証なし**
 - それ以外 → **PIN**
 - 単発 **5,000 エメ超**、または 24h 累計流出 **10,000 エメ超**、または**端末不一致** → **PIN + メール OTP**
@@ -132,6 +133,23 @@ PIN 検証は「短いトランザクションで失敗カウンタを先に書�
 
 MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowlist を廃止し、`app.<name>` identity と notification.app_id の末尾ドットラベル一致の構造束縛＋action_uri 束縛＋送信者別レート制限（120件/60秒、band対象外）に置換したとされる（決定・未照合、mail の `MAIL_CALLER_SET` 撤廃と同型の設計）。
 
+### 金額の単位（v8、本番適用済）
+台帳の金額は**1/100 エメの整数マイナーユニット**。整数のみで浮動小数は使わない（残高は和であり、二進浮動小数は十進小数を正確に足せないため）。×100 された列は上記 SQLite スキーマの v8 移行を参照。
+
+**mod との wire は引き続きエメラルドの個数**（mod の `amount` は Java `int` のため、マイナーユニットを流すとオーバーフローする——これは方針ではなく wire の制約）。変換は mod 対向のアダプタに集約されている：
+- `mc.rs` の `to_physical`（`send_charge`/`send_withdraw` が使用） — minor → 物理（÷100）。`%100` と範囲を検査し、**丸めも切り詰めもせず** 500 で落とす。
+- `charge.rs` の `ack_amount` — 物理 → minor（×100）。mod の報告を取り込む**唯一**の関数。
+- `charge.rs` の `chargeable_minor` — 物理 → minor。
+
+`MINOR_PER_EMERALD`（mod 側の物理換算用）と `MINOR_PER_EME`（台帳の通貨定義）は**別定数**（今日時点の値は一致しているが、将来の乖離に備えて意図的に分離）。
+
+`emerald_ops.requested_amount`/`settled_amount` の2列も ×100 している。`settled_amount` は `credit_charge` の `credited`（台帳の値）をそのまま保持しており、物理個数のまま残すと**スキーマ内で単位が違う唯一の列**になるため。安全性の根拠は「変換点を全部数え上げたこと」ではなく「**変換を `ack_amount` の内側に集約したこと**」——呼び出し側で変換する実装だったら `charge/withdraw.rs` の `settled_amount` 書き込みが物理個数のまま残り、settled 行だけ単位がズレていた。
+
+**単位の検査**: `api.rs` の `whole_emeralds()` — チャージ・出金は `%100 != 0` を **400** で拒否（エメラルドは不可分）。送金・決済承認には `%100` 検査が**無く**、1 マイナーユニット（0.01エメ）から通る。
+
+### デプロイの制約
+**MoyMoy と PiggleShop2 は同時にしかデプロイできない**。`attest` の署名ハッシュと `amount_minor` 契約が、MoyMoy サーバー・MoyMoy アプリ・PiggleShop2 サーバー・PiggleShop2 クライアントの4成果物に跨るため。**Minecraft サーバーと mod は停止も変更も不要**（wire 契約は変わらない）。現在のアプリバージョン: **0.6.0**。**アプリの GitHub リリースはアプリストア公開より前に作る必要がある**——インストーラは manifest の `bundle.url` を見て直接 GitHub から取得し、ローカルのリポジトリは見ない（`MochiOS2.0/mobile/cef-host/src/app_install.rs:188-189`）。
+
 ---
 
 ## 問題 / 課題
@@ -153,6 +171,9 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 - MochiOS2.0 の DEV.md への今回の通知認可再設計（`ALLOWED_PUSH_SENDERS` 廃止等）の記録は、同リポジトリに別セッションの未コミット変更が存在するため保留中（コミット済みコードの doc コメントには記載済み）。
 - v0.5.1 の manifest bundle sha256/size が GitHub 実資産と不一致だった（ストアインストールが整合性検証で失敗していた可能性）。v0.5.2 で解消済み（sha256 = `d733b0a1…`、259072 bytes、manifest と一致検証済み）。
 - 加盟店の `launch_app_id` は intent 作成時の自己申告で、その app_id が本当にその加盟店のものかを moymoy-cs は検証できない。承認画面での OS 由来 `from` との不一致警告は実装済みだが、これは表示レベルの注意喚起であり、`launch_app_id` の真正性を moymoy-cs 側で検証する仕組みではない。
+- `schema_v6.sql`/`schema_v7.sql` のカラムコメントに `-- エメ` が残っている。適用済みマイグレーションは書き換えない方針によるもので、当時の記述としては正しい。単位の現在値は §金額の単位（v8）の記述が正。
+- `clippy -D warnings` が3件失敗する（`PooledConn` 未使用 / `identity::Account` のフィールド未読 / `CreateOutcome` の `large_enum_variant`）。いずれも単位移行（v8）以前から存在する既存警告。
+- `merchants.daily_issue_cap` / `max_open_intents` / `notification_outbox` は本番に実データが無いため、v8 移行の指紋比較では正しさを検証できていない。担保はコード側のテストのみ（`db::tests::migration_v8_scales_amounts_and_leaves_counts_alone`）。
 - **CodeX 再レビュー（反映済）**: v2 再設計に recursive-codex-reviewer を実施。妥当指摘を反映 — backend `382acc2`（冪等の複合PK化で二重決済防止 / `user_version` を tx 内へ移しマイグレーション原子化 / 握り潰しログ化 ほか）、frontend `ffb40c8`（`me()` を ok/expired/unknown で識別し一時エラーで口座を消さない / アンマウントガード / 401 即時処理 ほか）。
 - **承認ゲート保留（共有層に跨る設計課題・未着手）**: 着手前に設計案の承認が必要。
   - **R008**: `reconcile` の op TTL / dead-letter。`sent` の消費済みエメラルドを安全に失効させる escalate フロー（単純 TTL は消費済み無クレジット化の危険）。
