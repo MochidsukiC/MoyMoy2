@@ -1,0 +1,23 @@
+-- MoyMoy schema v10 — a fulfilment report keeps the words that explain it.
+--
+-- v9 gave a shop a way to say how much of an order it delivered
+-- (`fulfilled_amount`), and the release sweep returns the difference to the
+-- buyer. What was missing is WHY that difference exists. The merchant API has
+-- always accepted a `reason` alongside the amount; until now it only reached the
+-- process log, which rotates away while the payment it explains stays in the
+-- ledger for good.
+--
+-- **This string is the only account of a movement that went against the buyer.**
+-- When 300 was paid and 100 came back, the shop's own words are the only record
+-- of what happened to the other 200 — not a debugging aid, but the explanation an
+-- operator (or the shop owner, on the sales page) needs months later. An
+-- explanation of a ledger movement should live as long as the movement.
+--
+-- Nullable, because a fully fulfilled order has nothing to explain: requiring it
+-- would only teach integrators to send a placeholder. Length and content are
+-- bounded in code (`merchant::MAX_FULFIL_REASON_CHARS`, and the same
+-- `sanitize_text` guard every other merchant-supplied string passes) — a column
+-- an API key can write without a ceiling is a way to fill a disk with one
+-- credential, and one that can carry invisible characters is a way to render
+-- something other than what was said on the page that displays it.
+ALTER TABLE payment_intents ADD COLUMN fulfil_reason TEXT;

@@ -64,6 +64,12 @@ pub const MAX_NAME_CHARS: usize = 32;
 pub const MAX_SUB_CHARS: usize = 48;
 pub const MAX_DESCRIPTION_CHARS: usize = 120;
 pub const MAX_ORDER_REF_CHARS: usize = 64;
+/// Why a fulfilment fell short (v10). Matched to [`MAX_DESCRIPTION_CHARS`] rather
+/// than picked afresh: it is shown in the same place and at the same size as the
+/// description of the order it explains, so one line against one line is the
+/// shape the sales page wants. Bounded at all because a column an API key can
+/// write without a ceiling is a way to fill a disk with one credential.
+pub const MAX_FULFIL_REASON_CHARS: usize = 120;
 /// Combining marks allowed on one base character. Enough for any real script,
 /// far below what it takes to push a glyph out of its own line.
 const MAX_COMBINING_PER_BASE: usize = 3;
@@ -1240,6 +1246,65 @@ pub(crate) async fn portal_list(
     Ok(Json(json!({ "ok": true, "merchants": list })))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct PortalSalesQuery {
+    merchant_id: String,
+    limit: Option<i64>,
+}
+
+/// What has been paid to one of this account's shops, and how much of it MoyMoy
+/// is still holding.
+///
+/// ## Why the portal and not `/merchant/v1`
+///
+/// Two reasons, and the first is an invariant. DEV.md states that nothing
+/// reachable with a merchant API key can move money; putting a revenue view there
+/// would not break that literally, but it would make the API key the credential
+/// that answers "how much am I owed" — and the next natural request after that is
+/// an endpoint to do something about it. The portal is already where a shop's
+/// money-adjacent decisions live (its ceilings, its key, its closure), and they
+/// are there because a session belongs to a PERSON while an API key belongs to a
+/// deployment.
+///
+/// The second is plainer: the owner is the one who wants this, and in the portal
+/// it can sit next to the account balance the released money actually landed in.
+///
+/// **Session, no PIN** — the same treatment `portal_list` gets, which already
+/// shows API key prefixes and last-used times. It moves nothing and reveals
+/// nothing the owner cannot see elsewhere, and asking for a PIN to read is how
+/// people are taught to type their PIN into whatever asks (the reasoning
+/// `payments::decline` spells out).
+pub(crate) async fn portal_sales(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Query(q): Query<PortalSalesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let value = blocking(st.pool, move |conn| {
+        // Ownership decides visibility, and a shop that is not this account's
+        // reads as one that does not exist — the discipline every other
+        // shop-scoped read here uses, so this cannot confirm another owner's
+        // merchant_id.
+        let owned = get(conn, &q.merchant_id)?
+            .filter(|m| m.owner_account_id.as_deref() == Some(acct.account_id.as_str()));
+        let Some(m) = owned else {
+            return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_merchant" }));
+        };
+        let page = payments::sales_page(
+            conn,
+            &m,
+            q.limit.unwrap_or(payments::SALES_DEFAULT_LIMIT),
+            now_ms(),
+        )?;
+        let mut page = page;
+        if let Some(obj) = page.as_object_mut() {
+            obj.insert("ok".to_string(), json!(true));
+        }
+        Ok(page)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
 // ── merchant API (Bearer moy_sk_…) ───────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1525,6 +1590,16 @@ pub(crate) async fn intent_fulfill(
                     "amount_minor": amount,
                     "detail": "fulfilled_amount_minor must be between 0 and the amount the \
                                customer approved",
+                }),
+            ),
+            // Refused, not trimmed. The stored explanation has to be what the shop
+            // actually said — a silently shortened one is neither its words nor
+            // visibly not its words.
+            payments::FulfillOutcome::BadReason(e) => (
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "ok": false, "error": "bad_reason", "reason_code": e.code(),
+                    "max_chars": MAX_FULFIL_REASON_CHARS,
                 }),
             ),
         })

@@ -47,8 +47,11 @@ const SCHEMA_V8: &str = include_str!("schema_v8.sql");
 /// refund from. Adds the escrow lifecycle columns to `payment_intents`, and
 /// closes every pre-v9 `paid` row so the release sweep cannot pay it again.
 const SCHEMA_V9: &str = include_str!("schema_v9.sql");
+/// The v10 delta: `payment_intents.fulfil_reason` — the shop's own account of why
+/// a fulfilment fell short, kept for as long as the movement it explains.
+const SCHEMA_V10: &str = include_str!("schema_v10.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -181,8 +184,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 9;
         tracing::info!("sqlite migrated to schema v9 (merchant revenue held in escrow)");
     }
-    // Future: `if version < 10 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V10)?;
-    //          tx.pragma_update(None, "user_version", 10)?; tx.commit()?; version = 10; }`
+    if version < 10 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V10)?;
+        tx.pragma_update(None, "user_version", 10)?;
+        tx.commit()?;
+        version = 10;
+        tracing::info!("sqlite migrated to schema v10 (fulfilment reasons are kept)");
+    }
+    // Future: `if version < 11 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V11)?;
+    //          tx.pragma_update(None, "user_version", 11)?; tx.commit()?; version = 11; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }
@@ -772,6 +783,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(released("pi_paid"), before);
+    }
+
+    /// v10 adds a column and touches nothing else.
+    ///
+    /// A pure `ADD COLUMN` has one way to go wrong that matters here: arriving
+    /// with a default that claims something. `fulfil_reason` starts NULL on every
+    /// existing row, which is the truth — those reports were made before there was
+    /// anywhere to put an explanation, and inventing `''` would make "gave no
+    /// reason" and "gave an empty one" the same.
+    #[test]
+    fn migration_v10_adds_the_reason_column_without_disturbing_anything() {
+        let mut conn = v8_db();
+        insert_account(&conn, "acct-a");
+        conn.execute(
+            "INSERT INTO merchants (merchant_id, account_id, name, created_unix_ms) \
+             VALUES ('m1', 'acct-a', '鉱石商会', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO payment_intents (intent_id, merchant_id, amount, description, state, \
+               idem_key, created_unix_ms, updated_unix_ms, expires_unix_ms) \
+             VALUES ('pi_old', 'm1', 12900, 'りんご 1個', 'paid', 'ord-1', 1, 1, 9)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn).expect("v8 → v10");
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        let (reason, amount, released): (Option<String>, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT fulfil_reason, amount, released_unix_ms FROM payment_intents \
+                 WHERE intent_id = 'pi_old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, None, "an explanation was invented for an old report");
+        // v9's work is still intact after v10 ran on top of it.
+        assert_eq!(amount, 12900);
+        assert!(released.is_some(), "v9's backfill was undone");
     }
 
     #[test]

@@ -134,6 +134,12 @@ pub struct Intent {
     /// What the merchant is owed, in minor units. Never above [`Intent::amount`];
     /// the difference goes back to the payer.
     pub fulfilled_amount: Option<i64>,
+    /// The shop's own account of why it fell short (v10), sanitized and bounded
+    /// like every other merchant-supplied string. `None` when it gave none, which
+    /// a fully fulfilled order has no reason to. It is the only explanation that
+    /// exists for a movement made against the buyer, so it lives beside the amount
+    /// it explains rather than only in a log that rotates away.
+    pub fulfil_reason: Option<String>,
     /// When escrow paid out. Doubles as the sweep's exactly-once claim.
     pub released_unix_ms: Option<i64>,
     /// The escrow → merchant ledger row, if that half moved anything.
@@ -160,7 +166,7 @@ const INTENT_COLS: &str = "intent_id, merchant_id, amount, description, order_re
      payer_account_id, payer_hint_account_id, launch_app_id, tx_id, refunded_unix_ms, \
      refund_tx_id, created_unix_ms, expires_unix_ms, \
      escrowed_unix_ms, release_due_unix_ms, escrow_deadline_unix_ms, fulfilled_unix_ms, \
-     fulfilled_amount, released_unix_ms, release_tx_id, escrow_refund_tx_id";
+     fulfilled_amount, fulfil_reason, released_unix_ms, release_tx_id, escrow_refund_tx_id";
 
 fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
     Ok(Intent {
@@ -183,9 +189,10 @@ fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
         escrow_deadline_unix_ms: r.get(16)?,
         fulfilled_unix_ms: r.get(17)?,
         fulfilled_amount: r.get(18)?,
-        released_unix_ms: r.get(19)?,
-        release_tx_id: r.get(20)?,
-        escrow_refund_tx_id: r.get(21)?,
+        fulfil_reason: r.get(19)?,
+        released_unix_ms: r.get(20)?,
+        release_tx_id: r.get(21)?,
+        escrow_refund_tx_id: r.get(22)?,
     })
 }
 
@@ -291,6 +298,7 @@ pub fn create(
         escrow_deadline_unix_ms: None,
         fulfilled_unix_ms: None,
         fulfilled_amount: None,
+        fulfil_reason: None,
         released_unix_ms: None,
         release_tx_id: None,
         escrow_refund_tx_id: None,
@@ -392,6 +400,11 @@ pub enum FulfillOutcome {
     NotHeld { stage: &'static str },
     /// Outside `0..=amount`.
     AmountOutOfRange { amount: i64 },
+    /// The explanation was too long, or carried characters that do not render as
+    /// themselves. Refused rather than truncated or stripped: the record has to
+    /// say what the shop said, and a shortened string is neither what it said nor
+    /// obviously not.
+    BadReason(TextReject),
 }
 
 /// Record how much of a paid, escrowed order the merchant actually delivered.
@@ -465,17 +478,38 @@ pub fn fulfill(
             amount: intent.amount,
         });
     }
+    // Vetted like every other merchant-supplied string, and for the same reason:
+    // the sales page renders it, so a bidi override in here would let a leaked API
+    // key put words on a screen its owner reads as MoyMoy's. Absent and blank both
+    // mean "no explanation given" — the `order_ref` pattern in `create` — because
+    // a fully fulfilled order has nothing to explain and requiring one would only
+    // teach integrators to send a placeholder.
+    let reason = match reason.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match merchant::sanitize_text(s, merchant::MAX_FULFIL_REASON_CHARS) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tx.commit()?;
+                return Ok(FulfillOutcome::BadReason(e));
+            }
+        },
+        None => None,
+    };
 
     // THE claim, in the shape `force_refund` uses: `fulfilled_unix_ms IS NULL` is
     // part of the UPDATE, so two reports arriving together produce one. The state
     // conditions are repeated from the checks above because those read the row
     // and this writes it — between them is where a concurrent release would land.
+    //
+    // The amount and the reason are set by the SAME statement. Writing the reason
+    // separately would make a row with a shortfall and no explanation reachable —
+    // which is exactly the state this column exists to prevent, and the one that
+    // would appear whenever the second write was the one that failed.
     let claimed = tx.execute(
         "UPDATE payment_intents SET fulfilled_unix_ms = ?3, fulfilled_amount = ?4, \
-                updated_unix_ms = ?3 \
+                fulfil_reason = ?6, updated_unix_ms = ?3 \
          WHERE intent_id = ?1 AND merchant_id = ?2 AND fulfilled_unix_ms IS NULL \
            AND state = ?5 AND escrowed_unix_ms IS NOT NULL AND released_unix_ms IS NULL",
-        params![intent_id, merchant_id, now, fulfilled_amount, STATE_PAID],
+        params![intent_id, merchant_id, now, fulfilled_amount, STATE_PAID, reason],
     )?;
     if claimed == 0 {
         tx.commit()?;
@@ -486,18 +520,95 @@ pub fn fulfill(
     tx.commit()?;
 
     let refund_amount = intent.amount - fulfilled_amount;
-    // The shop's own words for why it under-delivered. Logged rather than stored:
-    // no column holds it, and inventing one for a string nothing reads would be a
-    // migration for a log line. If the sales page is to show it, it needs a column.
+    // Logged as well as stored — the row is the record, this is the operational
+    // trace that says when it arrived.
     tracing::info!(
         intent_id, merchant_id, fulfilled_amount, refund_amount,
-        reason = reason.unwrap_or(""),
+        reason = reason.as_deref().unwrap_or(""),
         "merchant reported an order fulfilled"
     );
     Ok(FulfillOutcome::Ok {
         fulfilled_amount,
         refund_amount,
     })
+}
+
+// ── the shop's own sales history (portal, session-authenticated) ─────────────
+
+/// Rows one sales page returns when the caller does not say, and the ceiling it
+/// will not go past whatever the caller says. The same clamp
+/// [`crate::wallet::history`] uses, for the same reason: a page is a page.
+pub const SALES_DEFAULT_LIMIT: i64 = 50;
+pub const SALES_MAX_LIMIT: i64 = 200;
+
+/// Everything a shop's owner sees about what has been paid to it.
+///
+/// ## `held_total_minor` is DERIVED, not a balance
+///
+/// It is `SUM(amount)` over this merchant's escrowed-and-unreleased intents, read
+/// fresh on every call. There is deliberately no "pending balance" column, and
+/// adding one would be a mistake worth naming: the money it would describe really
+/// exists, in the escrow account, and a second number tracking the same thing is
+/// a number that can disagree with it. This repository's precedent is the same —
+/// `reserve_withdraw` does not add a "reserved" column, it moves the eme and lets
+/// the `emerald_ops` row hold the claim.
+///
+/// It also cannot be answered from the escrow account's balance, because that one
+/// account holds every shop's held money in a single pot. `merchant::close` makes
+/// the same judgement for the same reason, and both count intents.
+pub fn sales_page(
+    conn: &Connection,
+    m: &MerchantRow,
+    limit: i64,
+    now: i64,
+) -> Result<Value, ApiError> {
+    let limit = limit.clamp(1, SALES_MAX_LIMIT);
+    // One more than asked for, purely to answer "is there more?". A page that
+    // silently stops reads as "this is everything", which is how a shop concludes
+    // it was paid less than it was.
+    let rows: Vec<Intent> = {
+        // `rowid DESC` breaks ties, because `created_unix_ms` is milliseconds and a
+        // busy shop issues several bills inside one. Without it the order of a tie
+        // group is unspecified, so the page reshuffles between reloads and — worse
+        // — WHICH row falls off the end at the limit is arbitrary, which quietly
+        // undermines the `truncated` flag below. rowid follows insertion, so it
+        // agrees with "newest first" rather than being an arbitrary tiebreak on a
+        // random id. The plan still drives the primary ordering off
+        // `idx_intents_merchant_time`; only the tie groups are sorted.
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {INTENT_COLS} FROM payment_intents WHERE merchant_id = ?1 \
+             ORDER BY created_unix_ms DESC, rowid DESC LIMIT ?2"
+        ))?;
+        let v = stmt
+            .query_map(params![m.merchant_id, limit + 1], row_to_intent)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        v
+    };
+    let truncated = rows.len() as i64 > limit;
+    let sales = rows
+        .iter()
+        .take(limit as usize)
+        .map(|i| merchant_view(m, i, now))
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    // Counted from the intents, not from any balance — see the note above.
+    let (held_count, held_total): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payment_intents \
+         WHERE merchant_id = ?1 AND escrowed_unix_ms IS NOT NULL AND released_unix_ms IS NULL",
+        [&m.merchant_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
+    Ok(json!({
+        "merchant_id": m.merchant_id,
+        "name": m.name,
+        "held_count": held_count,
+        "held_total_minor": held_total,
+        "limit": limit,
+        // Stated rather than implied: the caller can ask for more.
+        "truncated": truncated,
+        "sales": sales,
+    }))
 }
 
 // ── escrow release ───────────────────────────────────────────────────────────
@@ -752,6 +863,10 @@ fn escrow_view(intent: &Intent) -> Value {
         // Both `null` until the shop reports; afterwards they sum to `amount_minor`.
         "fulfilled_amount_minor": intent.fulfilled_amount,
         "refunded_amount_minor": intent.fulfilled_amount.map(|f| intent.amount - f.clamp(0, intent.amount)),
+        // The shop's own words, echoed back so it can see what was recorded — and
+        // read by the sales page, which is where the explanation is actually
+        // wanted.
+        "fulfil_reason": intent.fulfil_reason,
         "released_unix_ms": intent.released_unix_ms,
     })
 }
@@ -2535,6 +2650,176 @@ mod tests {
             }
         );
         assert_eq!(balance_of(&pool, "acct-m"), 300);
+    }
+
+    fn report_with(
+        pool: &Pool,
+        merchant_id: &str,
+        intent_id: &str,
+        amount: i64,
+        reason: Option<&str>,
+    ) -> FulfillOutcome {
+        let mut conn = pool.get().unwrap();
+        fulfill(&mut conn, merchant_id, intent_id, amount, reason).unwrap()
+    }
+
+    /// The shop's explanation is stored beside the amount it explains.
+    #[test]
+    fn a_shortfall_keeps_the_words_that_explain_it() {
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        report_with(
+            &pool,
+            &m.merchant_id,
+            &intent_id,
+            200,
+            Some("2 of 3 lines undeliverable"),
+        );
+
+        let i = intent_of(&pool, &intent_id);
+        assert_eq!(i.fulfilled_amount, Some(200));
+        assert_eq!(i.fulfil_reason.as_deref(), Some("2 of 3 lines undeliverable"));
+        // …and it outlives the release, because it explains a movement that is now
+        // in the ledger for good.
+        assert_eq!(sweep_after_gate(&pool), 1);
+        assert_eq!(
+            intent_of(&pool, &intent_id).fulfil_reason.as_deref(),
+            Some("2 of 3 lines undeliverable")
+        );
+    }
+
+    #[test]
+    fn an_explanation_is_optional_but_never_half_written() {
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        // A full delivery has nothing to explain, and blank means the same as
+        // absent — requiring one would only produce placeholder strings.
+        report_with(&pool, &m.merchant_id, &intent_id, 300, Some("   "));
+        let i = intent_of(&pool, &intent_id);
+        assert_eq!(i.fulfilled_amount, Some(300));
+        assert_eq!(i.fulfil_reason, None);
+    }
+
+    #[test]
+    fn an_unusable_explanation_is_refused_and_records_nothing() {
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        let long = "あ".repeat(merchant::MAX_FULFIL_REASON_CHARS + 1);
+        assert_eq!(
+            report_with(&pool, &m.merchant_id, &intent_id, 200, Some(&long)),
+            FulfillOutcome::BadReason(merchant::TextReject::TooLong)
+        );
+        // A bidi override would let a leaked key put words on the sales page its
+        // owner reads as MoyMoy's — the guard every merchant string passes.
+        assert_eq!(
+            report_with(&pool, &m.merchant_id, &intent_id, 200, Some("在庫\u{202E}切れ")),
+            FulfillOutcome::BadReason(merchant::TextReject::Invisible)
+        );
+
+        // **Refused means nothing happened**: not the amount, not the claim. The
+        // shop can fix its string and report properly.
+        let i = intent_of(&pool, &intent_id);
+        assert_eq!(i.fulfilled_unix_ms, None);
+        assert_eq!(i.fulfilled_amount, None);
+        assert_eq!(i.fulfil_reason, None);
+        assert!(matches!(
+            report_with(&pool, &m.merchant_id, &intent_id, 200, Some("在庫切れ")),
+            FulfillOutcome::Ok { .. }
+        ));
+        assert_eq!(
+            intent_of(&pool, &intent_id).fulfil_reason.as_deref(),
+            Some("在庫切れ")
+        );
+    }
+
+    // ── the sales page ──────────────────────────────────────────────────────
+
+    #[test]
+    fn the_sales_page_shows_what_is_held_and_what_has_landed() {
+        let (pool, first, m) = fixture(300, 10_000);
+        // Three sales at different points in their lives.
+        let (held, partial) = {
+            let mut conn = pool.get().unwrap();
+            (
+                new_intent(&mut conn, &m, 500, None, 600),
+                new_intent(&mut conn, &m, 400, None, 600),
+            )
+        };
+        approve_and_release(&pool, &first, 300); // done: the shop has this
+        assert_eq!(do_approve(&pool, &held, PIN)["ok"], json!(true)); // held
+        assert_eq!(do_approve(&pool, &partial, PIN)["ok"], json!(true));
+        report_with(&pool, &m.merchant_id, &partial, 100, Some("在庫切れ"));
+
+        let page = {
+            let conn = pool.get().unwrap();
+            sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms()).unwrap()
+        };
+
+        // Held = escrowed and not yet released, whatever stage they are at: the
+        // reported-but-not-released one counts too, because the money is still
+        // MoyMoy's until the sweep moves it.
+        assert_eq!(page["held_count"], json!(2));
+        assert_eq!(page["held_total_minor"], json!(900));
+        assert_eq!(page["truncated"], json!(false));
+
+        let sales = page["sales"].as_array().unwrap();
+        assert_eq!(sales.len(), 3, "{page:#}");
+        // Newest first.
+        assert_eq!(sales[0]["intent_id"], json!(partial));
+        assert_eq!(sales[2]["intent_id"], json!(first));
+
+        // The stage judgement is `escrow_stage`'s, not a second copy of it.
+        assert_eq!(sales[0]["escrow"]["stage"], json!("fulfilled"));
+        assert_eq!(sales[1]["escrow"]["stage"], json!("held"));
+        assert_eq!(sales[2]["escrow"]["stage"], json!("released"));
+
+        // The three money figures a shop needs, and the words behind the gap.
+        assert_eq!(sales[0]["amount_minor"], json!(400));
+        assert_eq!(sales[0]["escrow"]["fulfilled_amount_minor"], json!(100));
+        assert_eq!(sales[0]["escrow"]["refunded_amount_minor"], json!(300));
+        assert_eq!(sales[0]["escrow"]["fulfil_reason"], json!("在庫切れ"));
+        // The customer stays behind the per-shop pseudonym.
+        assert!(sales[0]["payer_ref"].is_string());
+    }
+
+    #[test]
+    fn a_truncated_sales_page_says_so() {
+        // Silently stopping reads as "this is everything", which is how a shop
+        // concludes it was paid less than it was.
+        let (pool, _first, m) = fixture(300, 10_000);
+        {
+            let mut conn = pool.get().unwrap();
+            for _ in 0..4 {
+                new_intent(&mut conn, &m, 100, None, 600);
+            }
+        }
+        let conn = pool.get().unwrap();
+
+        let page = sales_page(&conn, &m, 2, now_ms()).unwrap();
+        assert_eq!(page["sales"].as_array().unwrap().len(), 2);
+        assert_eq!(page["limit"], json!(2));
+        assert_eq!(page["truncated"], json!(true));
+
+        // Asking for everything there is says so too.
+        let all = sales_page(&conn, &m, 50, now_ms()).unwrap();
+        assert_eq!(all["sales"].as_array().unwrap().len(), 5);
+        assert_eq!(all["truncated"], json!(false));
+
+        // The ceiling is the wallet's, not the caller's.
+        let huge = sales_page(&conn, &m, 10_000, now_ms()).unwrap();
+        assert_eq!(huge["limit"], json!(SALES_MAX_LIMIT));
+    }
+
+    #[test]
+    fn a_held_total_of_nothing_is_zero_not_missing() {
+        // COALESCE, not an absent key: a page that omits the figure when a shop
+        // has never traded is a page the UI has to special-case.
+        let (pool, _intent_id, m) = fixture(300, 1_000);
+        let conn = pool.get().unwrap();
+        let page = sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms()).unwrap();
+        assert_eq!(page["held_count"], json!(0));
+        assert_eq!(page["held_total_minor"], json!(0));
     }
 
     /// **THE test for the sweep.** It runs every 30 seconds for the life of the

@@ -43,6 +43,7 @@
 //!   POST /merchant/portal/limits   {merchant_id, pin, …}           (auth + PIN)
 //!   POST /merchant/portal/close    {merchant_id, pin}              (auth + PIN)
 //!   GET  /merchant/portal/list                                     (auth)
+//!   GET  /merchant/portal/sales?merchant_id=&limit=                (auth)
 //!   POST /merchant/v1/intent/create {…}                            (API key)
 //!   GET  /merchant/v1/intent?intent_id=                            (API key)
 //!   POST /merchant/v1/intent/fulfill {intent_id, fulfilled_amount_minor, reason?} (API key)
@@ -159,6 +160,7 @@ pub fn router(state: AppState) -> Router {
         .route("/merchant/portal/limits", post(merchant::portal_set_limits))
         .route("/merchant/portal/close", post(merchant::portal_close))
         .route("/merchant/portal/list", get(merchant::portal_list))
+        .route("/merchant/portal/sales", get(merchant::portal_sales))
         // Merchant API (Bearer moy_sk_…): intents only, never a balance.
         .route("/merchant/v1/intent/create", post(merchant::intent_create))
         .route("/merchant/v1/intent", get(merchant::intent_get))
