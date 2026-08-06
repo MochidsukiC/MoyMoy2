@@ -371,6 +371,135 @@ pub fn expire_pass(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
     )
 }
 
+// ── fulfilment report (merchant API key) ─────────────────────────────────────
+
+/// Outcome of a merchant reporting how much of an order it actually delivered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FulfillOutcome {
+    Ok {
+        fulfilled_amount: i64,
+        refund_amount: i64,
+    },
+    /// No such intent — or one belonging to another shop, which reads the same on
+    /// purpose (the discipline `cancel` and `op_status` use, so this cannot be
+    /// turned into an oracle for other shops' order flow).
+    UnknownIntent,
+    /// Reported before, and a fulfilment is stated once. `state` is what the
+    /// earlier report said, so a retrying integrator can see it agrees.
+    AlreadyFulfilled { fulfilled_amount: Option<i64> },
+    /// Nothing is being held for this intent, so there is nothing to report on:
+    /// it was never paid, or its money has already left escrow.
+    NotHeld { stage: &'static str },
+    /// Outside `0..=amount`.
+    AmountOutOfRange { amount: i64 },
+}
+
+/// Record how much of a paid, escrowed order the merchant actually delivered.
+///
+/// ## This does not move money, and it cannot move money UP
+///
+/// **The invariant that `/merchant/v1/*` can move no funds is intact.** It is
+/// worth being explicit, because an endpoint that takes an amount from an API key
+/// holder looks at first glance like the thing that invariant forbids.
+///
+/// Two properties make it not that. First, the only number a shop can state here
+/// is bounded above by `intent.amount` — a figure the CUSTOMER already saw and
+/// approved — so the most this can do is confirm what was already authorized;
+/// there is no value of `fulfilled_amount` that takes more. Second, it writes no
+/// ledger row at all: it records a fact about the order, and the release sweep
+/// moves money later, after the gate. A leaked API key can therefore under-report
+/// its own takings (giving the customer their money back) and nothing else.
+///
+/// The direction is deliberately asymmetric: reporting is the shop's way of
+/// giving up its claim on the part it could not deliver.
+pub fn fulfill(
+    conn: &mut Connection,
+    merchant_id: &str,
+    intent_id: &str,
+    fulfilled_amount: i64,
+    reason: Option<&str>,
+) -> rusqlite::Result<FulfillOutcome> {
+    let now = now_ms();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // The ownership filter is in the read, so another shop's intent never even
+    // becomes a row this function has an opinion about.
+    let Some(intent) = tx
+        .query_row(
+            &format!(
+                "SELECT {INTENT_COLS} FROM payment_intents WHERE intent_id = ?1 AND merchant_id = ?2"
+            ),
+            params![intent_id, merchant_id],
+            row_to_intent,
+        )
+        .optional()?
+    else {
+        tx.commit()?;
+        return Ok(FulfillOutcome::UnknownIntent);
+    };
+
+    // Reported already: said before the stage check, because it is the more
+    // useful answer for an intent that is both fulfilled and since released.
+    if intent.fulfilled_unix_ms.is_some() {
+        tx.commit()?;
+        return Ok(FulfillOutcome::AlreadyFulfilled {
+            fulfilled_amount: intent.fulfilled_amount,
+        });
+    }
+    // Only money still being held can be reported on. `held` excludes both an
+    // intent that was never paid and one whose money has left escrow — including
+    // the pre-v9 payments the migration closed, which went straight to the
+    // merchant and which the sweep will never look at again. Accepting a report
+    // on one of those would leave the shop a record saying it reported, and no
+    // effect anywhere.
+    let stage = escrow_stage(&intent);
+    if stage != "held" {
+        tx.commit()?;
+        return Ok(FulfillOutcome::NotHeld { stage });
+    }
+    // `0` is in range and means "nothing could be delivered" — the whole payment
+    // goes back. The caller distinguishes that from an absent field, which is
+    // refused before this is reached.
+    if !(0..=intent.amount).contains(&fulfilled_amount) {
+        tx.commit()?;
+        return Ok(FulfillOutcome::AmountOutOfRange {
+            amount: intent.amount,
+        });
+    }
+
+    // THE claim, in the shape `force_refund` uses: `fulfilled_unix_ms IS NULL` is
+    // part of the UPDATE, so two reports arriving together produce one. The state
+    // conditions are repeated from the checks above because those read the row
+    // and this writes it — between them is where a concurrent release would land.
+    let claimed = tx.execute(
+        "UPDATE payment_intents SET fulfilled_unix_ms = ?3, fulfilled_amount = ?4, \
+                updated_unix_ms = ?3 \
+         WHERE intent_id = ?1 AND merchant_id = ?2 AND fulfilled_unix_ms IS NULL \
+           AND state = ?5 AND escrowed_unix_ms IS NOT NULL AND released_unix_ms IS NULL",
+        params![intent_id, merchant_id, now, fulfilled_amount, STATE_PAID],
+    )?;
+    if claimed == 0 {
+        tx.commit()?;
+        return Ok(FulfillOutcome::AlreadyFulfilled {
+            fulfilled_amount: None,
+        });
+    }
+    tx.commit()?;
+
+    let refund_amount = intent.amount - fulfilled_amount;
+    // The shop's own words for why it under-delivered. Logged rather than stored:
+    // no column holds it, and inventing one for a string nothing reads would be a
+    // migration for a log line. If the sales page is to show it, it needs a column.
+    tracing::info!(
+        intent_id, merchant_id, fulfilled_amount, refund_amount,
+        reason = reason.unwrap_or(""),
+        "merchant reported an order fulfilled"
+    );
+    Ok(FulfillOutcome::Ok {
+        fulfilled_amount,
+        refund_amount,
+    })
+}
+
 // ── escrow release ───────────────────────────────────────────────────────────
 
 /// Label on the escrow → merchant payout.
@@ -2251,6 +2380,161 @@ mod tests {
             force_refund(&mut conn, &intent_id, "fraud").unwrap(),
             RefundOutcome::Ok { .. }
         ));
+    }
+
+    fn report(pool: &Pool, merchant_id: &str, intent_id: &str, amount: i64) -> FulfillOutcome {
+        let mut conn = pool.get().unwrap();
+        fulfill(&mut conn, merchant_id, intent_id, amount, Some("test")).unwrap()
+    }
+
+    /// A fulfilment is stated once, and the second attempt is told so.
+    ///
+    /// The claim decides what the customer is refunded, so "already reported" and
+    /// "recorded" must not look alike to a retrying integrator — an at-least-once
+    /// caller that read a repeat as success would believe its second figure took.
+    #[test]
+    fn an_order_can_be_reported_fulfilled_exactly_once() {
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        assert_eq!(
+            report(&pool, &m.merchant_id, &intent_id, 200),
+            FulfillOutcome::Ok {
+                fulfilled_amount: 200,
+                refund_amount: 100
+            }
+        );
+        // A second report — even one claiming a different figure — cannot revise it.
+        assert_eq!(
+            report(&pool, &m.merchant_id, &intent_id, 300),
+            FulfillOutcome::AlreadyFulfilled {
+                fulfilled_amount: Some(200)
+            }
+        );
+        assert_eq!(intent_of(&pool, &intent_id).fulfilled_amount, Some(200));
+
+        // …and the sweep pays out the figure the FIRST report set.
+        assert_eq!(sweep_after_gate(&pool), 1);
+        assert_eq!(balance_of(&pool, "acct-m"), 200);
+        assert_eq!(balance_of(&pool, "acct-a"), 800);
+    }
+
+    #[test]
+    fn a_report_cannot_claim_more_than_the_customer_approved() {
+        // The bound that keeps this endpoint from being a way to move money UP:
+        // the ceiling is a figure the buyer already saw and agreed to.
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        for bad in [301, 1_000, i64::MAX, -1] {
+            assert_eq!(
+                report(&pool, &m.merchant_id, &intent_id, bad),
+                FulfillOutcome::AmountOutOfRange { amount: 300 },
+                "{bad} was accepted"
+            );
+        }
+        // Nothing was recorded by any of them.
+        assert_eq!(intent_of(&pool, &intent_id).fulfilled_unix_ms, None);
+        // The bound itself is reachable.
+        assert_eq!(
+            report(&pool, &m.merchant_id, &intent_id, 300),
+            FulfillOutcome::Ok {
+                fulfilled_amount: 300,
+                refund_amount: 0
+            }
+        );
+    }
+
+    #[test]
+    fn reporting_zero_is_a_valid_report_of_total_failure() {
+        // Distinct from an absent field, which the handler refuses: `0` says the
+        // shop delivered nothing and gives up its whole claim.
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        assert_eq!(
+            report(&pool, &m.merchant_id, &intent_id, 0),
+            FulfillOutcome::Ok {
+                fulfilled_amount: 0,
+                refund_amount: 300
+            }
+        );
+        let i = intent_of(&pool, &intent_id);
+        assert_eq!(i.fulfilled_amount, Some(0));
+        // …and it IS a report: the row is `fulfilled`, not still waiting.
+        assert!(i.fulfilled_unix_ms.is_some());
+        assert_eq!(escrow_stage(&i), "fulfilled");
+    }
+
+    #[test]
+    fn a_report_moves_no_money_until_the_gate_elapses() {
+        // The invariant this endpoint has to keep: an API key writes a fact, and
+        // the sweep is the only thing that pays.
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        report(&pool, &m.merchant_id, &intent_id, 300);
+        assert_eq!(escrow_balance(&pool), 300, "the report itself paid out");
+        assert_eq!(balance_of(&pool, "acct-m"), 0);
+        assert_eq!(sweep_now(&pool), 0);
+        assert_eq!(balance_of(&pool, "acct-m"), 0);
+    }
+
+    #[test]
+    fn one_shop_cannot_report_on_another_shops_order() {
+        // Indistinguishable from a missing intent, so this cannot be used to probe
+        // whether another shop's intent id exists.
+        let (pool, intent_id, _) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+
+        assert_eq!(
+            report(&pool, "m-somebody-else", &intent_id, 300),
+            FulfillOutcome::UnknownIntent
+        );
+        assert_eq!(intent_of(&pool, &intent_id).fulfilled_unix_ms, None);
+    }
+
+    #[test]
+    fn a_payment_that_predates_escrow_cannot_be_reported_on() {
+        // The rows the v9 migration closed: their money went straight to the shop
+        // and the sweep will never look at them again. Accepting a report would
+        // leave the shop a record saying it reported, with no effect anywhere.
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        assert_eq!(do_approve(&pool, &intent_id, PIN)["ok"], json!(true));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE payment_intents SET escrowed_unix_ms = NULL, release_due_unix_ms = NULL, \
+                        released_unix_ms = ?2 WHERE intent_id = ?1",
+                params![intent_id, now_ms()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            report(&pool, &m.merchant_id, &intent_id, 300),
+            FulfillOutcome::NotHeld { stage: "none" }
+        );
+    }
+
+    #[test]
+    fn an_unpaid_or_already_released_order_cannot_be_reported_on() {
+        let (pool, intent_id, m) = fixture(300, 1_000);
+        // Never approved: nothing is being held, so there is nothing to report.
+        assert_eq!(
+            report(&pool, &m.merchant_id, &intent_id, 300),
+            FulfillOutcome::NotHeld { stage: "none" }
+        );
+
+        // Paid, reported and released — the money has left escrow, so a further
+        // report cannot change what anybody received.
+        approve_and_release(&pool, &intent_id, 300);
+        assert_eq!(
+            report(&pool, &m.merchant_id, &intent_id, 0),
+            FulfillOutcome::AlreadyFulfilled {
+                fulfilled_amount: Some(300)
+            }
+        );
+        assert_eq!(balance_of(&pool, "acct-m"), 300);
     }
 
     /// **THE test for the sweep.** It runs every 30 seconds for the life of the

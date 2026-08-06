@@ -1433,6 +1433,107 @@ pub(crate) async fn intent_get(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct IntentFulfillReq {
+    intent_id: String,
+    /// How much of the order was actually delivered, in minor units.
+    ///
+    /// **Optional in the struct so that ABSENT and `0` stay different things.**
+    /// `0` is a legitimate report — "nothing could be delivered, return it all" —
+    /// while a missing field is a caller that did not say. Declared as a bare
+    /// `i64` this would be a `422` in the deserializer's words rather than a `400`
+    /// in ours, and any later `#[serde(default)]` would quietly turn "did not say"
+    /// into "refund everything".
+    ///
+    /// `_minor` is in the name for the reason `amount_minor` is: a number whose
+    /// unit is carried only by convention is a number the next migration changes
+    /// the meaning of without anybody noticing.
+    fulfilled_amount_minor: Option<i64>,
+    /// The shop's own explanation, for the wallet's log. Not stored — see
+    /// [`payments::fulfill`].
+    reason: Option<String>,
+}
+
+/// Report how much of a paid order was actually delivered.
+///
+/// **Moves no money.** [`payments::fulfill`] explains why an endpoint that takes
+/// an amount from an API key holder does not breach the "a merchant credential
+/// can move nothing" invariant. The payout happens later, on the release sweep,
+/// once the gate has elapsed.
+pub(crate) async fn intent_fulfill(
+    State(st): State<AppState>,
+    m: MerchantAuth,
+    Json(req): Json<IntentFulfillReq>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if req.intent_id.trim().is_empty() {
+        return Err(ApiError::bad_request("intent_id required"));
+    }
+    let Some(fulfilled) = req.fulfilled_amount_minor else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "missing_fulfilled_amount_minor",
+                "detail": "`fulfilled_amount_minor` (1/100 エメ) is required; send 0 to report \
+                           that nothing could be delivered",
+            })),
+        ));
+    };
+    let value = blocking(st.pool, move |conn| {
+        let out = payments::fulfill(
+            conn,
+            &m.merchant.merchant_id,
+            &req.intent_id,
+            fulfilled,
+            req.reason.as_deref(),
+        )?;
+        Ok::<(StatusCode, Value), ApiError>(match out {
+            payments::FulfillOutcome::Ok {
+                fulfilled_amount,
+                refund_amount,
+            } => (
+                StatusCode::OK,
+                json!({
+                    "ok": true,
+                    "intent_id": req.intent_id,
+                    "state": "fulfilled",
+                    "fulfilled_amount_minor": fulfilled_amount,
+                    "refund_amount_minor": refund_amount,
+                }),
+            ),
+            payments::FulfillOutcome::UnknownIntent => (
+                StatusCode::OK,
+                json!({ "ok": false, "error": "unknown_intent" }),
+            ),
+            // A conflict, not a success. A retrying integrator has to be able to
+            // tell "your report was recorded" from "a report already existed",
+            // because only the first decided what the customer gets back.
+            payments::FulfillOutcome::AlreadyFulfilled { fulfilled_amount } => (
+                StatusCode::CONFLICT,
+                json!({
+                    "ok": false, "error": "already_fulfilled",
+                    "fulfilled_amount_minor": fulfilled_amount,
+                }),
+            ),
+            payments::FulfillOutcome::NotHeld { stage } => (
+                StatusCode::CONFLICT,
+                json!({ "ok": false, "error": "not_held", "escrow_stage": stage }),
+            ),
+            payments::FulfillOutcome::AmountOutOfRange { amount } => (
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "ok": false, "error": "bad_fulfilled_amount",
+                    "amount_minor": amount,
+                    "detail": "fulfilled_amount_minor must be between 0 and the amount the \
+                               customer approved",
+                }),
+            ),
+        })
+    })
+    .await?;
+    Ok((value.0, Json(value.1)))
+}
+
+#[derive(Deserialize)]
 pub(crate) struct IntentCancelReq {
     intent_id: String,
 }
@@ -1515,6 +1616,43 @@ mod tests {
         let mut new = base;
         new["amount_minor"] = serde_json::json!(12_900);
         assert_eq!(intent_req(new).amount_minor().unwrap(), 12_900);
+    }
+
+    /// An absent `fulfilled_amount_minor` and a `0` are different statements, and
+    /// the wire keeps them apart.
+    ///
+    /// `0` means "nothing could be delivered, refund it all" — a real report a
+    /// shop makes. Absent means the caller did not say. Collapsing them (a bare
+    /// `i64` with a serde default, say) would turn a malformed request into a full
+    /// refund of somebody's order.
+    #[test]
+    fn a_missing_fulfilled_amount_is_not_a_report_of_zero() {
+        let parse = |v: serde_json::Value| -> IntentFulfillReq {
+            serde_json::from_value(v).expect("the request parses")
+        };
+
+        let absent = parse(serde_json::json!({ "intent_id": "pi_x" }));
+        assert_eq!(absent.fulfilled_amount_minor, None);
+
+        let zero = parse(serde_json::json!({
+            "intent_id": "pi_x", "fulfilled_amount_minor": 0
+        }));
+        assert_eq!(zero.fulfilled_amount_minor, Some(0));
+
+        let partial = parse(serde_json::json!({
+            "intent_id": "pi_x", "fulfilled_amount_minor": 340_000,
+            "reason": "2 of 3 lines undeliverable"
+        }));
+        assert_eq!(partial.fulfilled_amount_minor, Some(340_000));
+        assert_eq!(partial.reason.as_deref(), Some("2 of 3 lines undeliverable"));
+
+        // The old spelling is not quietly accepted: a caller sending `amount` or
+        // `fulfilled_amount` has stated a number in a unit this API never names,
+        // and it lands in the same place as sending nothing.
+        for key in ["amount", "fulfilled_amount", "amount_minor"] {
+            let req = parse(serde_json::json!({ "intent_id": "pi_x", key: 340_000 }));
+            assert_eq!(req.fulfilled_amount_minor, None, "`{key}` was read as the amount");
+        }
     }
 
     #[test]

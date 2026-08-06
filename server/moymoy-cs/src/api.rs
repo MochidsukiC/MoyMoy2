@@ -45,6 +45,7 @@
 //!   GET  /merchant/portal/list                                     (auth)
 //!   POST /merchant/v1/intent/create {…}                            (API key)
 //!   GET  /merchant/v1/intent?intent_id=                            (API key)
+//!   POST /merchant/v1/intent/fulfill {intent_id, fulfilled_amount_minor, reason?} (API key)
 //!   POST /merchant/v1/intent/cancel {intent_id}                    (API key)
 //!
 //! `/wallet/pay` is gone. It sent a client-chosen amount to a client-chosen
@@ -161,6 +162,7 @@ pub fn router(state: AppState) -> Router {
         // Merchant API (Bearer moy_sk_…): intents only, never a balance.
         .route("/merchant/v1/intent/create", post(merchant::intent_create))
         .route("/merchant/v1/intent", get(merchant::intent_get))
+        .route("/merchant/v1/intent/fulfill", post(merchant::intent_fulfill))
         .route("/merchant/v1/intent/cancel", post(merchant::intent_cancel))
         // Dev-only funding affordance (MC-less E2E). Gated by MOYMOY_DEV_CREDIT=1;
         // 403 otherwise. Never enable in a real deploy.
