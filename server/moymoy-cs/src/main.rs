@@ -232,7 +232,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Serve the router over TLS (path C: end-to-end through the gateway CONNECT
-/// tunnel — the gateway never decrypts). Adapted from `services/rein/src/main.rs`.
+/// tunnel — the gateway never decrypts). "path C" is local shorthand, defined
+/// nowhere else in this repo; [`tls`] spells out what it means and which
+/// MochiOS2.0 DEV.md section covers it. Adapted from `services/rein/src/main.rs`.
 async fn serve_tls(
     listener: tokio::net::TcpListener,
     app: axum::Router,

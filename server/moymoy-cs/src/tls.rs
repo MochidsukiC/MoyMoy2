@@ -1,6 +1,12 @@
 //! TLS for the `moymoy.cs.mnn` endpoint (path C: end-to-end through the
 //! gateway CONNECT tunnel — the gateway never decrypts, MochiOS2.0 DEV.md
-//! §7.3.3).
+//! §5.4.1, the third of its "intake 3 形").
+//!
+//! **Not §7.3.3.** That section is the privileged command bus (App backend ⇄ CS
+//! ⇄ MC receiving Mod, over QUIC), and the "dumb pipe" in it is that bus's
+//! routing header — `command_bus.rs`. Different mechanism, different section.
+//! Both halves of this module are §5.4.1: the CONNECT intake above and the
+//! `.mnn` server CA below.
 //!
 //! MoyMoy presents its own TLS certificate — the certificate comes from the
 //! Hub's `.mnn` CA (MochiOS2.0 DEV.md §5.4.1): the launcher issues one for
