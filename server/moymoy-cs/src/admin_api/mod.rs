@@ -7,22 +7,24 @@
 //! operator action that does (`force_refund`) stays where `main.rs`'s `admin`
 //! module put it, off the network entirely.
 //!
-//! # ⚠ NOT MOUNTED YET — and [`crate::api::router`] is the wrong place for it
+//! # Mounted on a SECOND listener — and [`crate::api::router`] is still the
+//! # wrong place for it
 //!
-//! [`router`] is built here and called by nothing outside the tests. That is
-//! deliberate and it is the finding this module exists to record.
+//! [`router`] is served by [`crate::spawn_admin_listener`], on its own loopback
+//! socket that is never handed to the tunnel. It must stay off
+//! [`crate::api::router`], and the reason is the finding this module was written
+//! to record.
 //!
-//! The obvious place to mount it is [`crate::api::router`], and that place is
-//! unsafe. `main` binds ONE listener on `127.0.0.1:<port>` and then hands that
-//! same address to [`crate::tunnel::spawn`], which claims `moymoy.cs.mnn` and
-//! forwards inbound overlay traffic to it — unfiltered, with no notion of paths
+//! `main` binds a listener on `127.0.0.1:<port>` and hands that same address to
+//! [`crate::tunnel::spawn`], which claims `moymoy.cs.mnn` and forwards inbound
+//! overlay traffic to it — unfiltered, with no notion of paths
 //! (`CsTunnelConfig::local_target` is a `SocketAddr` and nothing more). `main`'s
 //! own docs say it: "`moymoy.cs.mnn` is our ONLY ingress". So a route added to
 //! that router is reachable by anything on the MNN overlay that can resolve
 //! `https://moymoy.cs.mnn/`, not only by a Hub proxying from the host.
 //!
-//! Three consequences, and the third is why this is unmounted rather than
-//! guarded:
+//! Three consequences, and the third is why this is a separate socket rather
+//! than a guard on the shared one:
 //!
 //! 1. **What is behind these five routes** is every account balance and card
 //!    face, the whole cross-account ledger, and every payment intent with its
@@ -35,22 +37,21 @@
 //!    does not distinguish a Hub proxy from overlay traffic. The obvious guard
 //!    does not exist.
 //!
-//! ## How this gets wired
+//! ## How this is wired
 //!
-//! On a SECOND loopback listener that is never handed to the tunnel, so the
-//! overlay has no route to it at all. A second listener costs no second cs
-//! claim — the claim is made by the tunnel at its handshake, and this listener
-//! is not part of one.
+//! A SECOND loopback listener that is never handed to the tunnel, so the overlay
+//! has no route to it at all. It costs no second cs claim — the claim is made by
+//! the tunnel at its handshake, and this listener is not part of one.
 //!
-//! That needs a port, and choosing one is not this module's call: the launcher
-//! allocates and injects it (`app.toml`'s `[admin]` declaring a second
-//! `listen_env`), which is a MochiOS-side change awaiting approval. **Deliberately
-//! no environment variable is read here** — a fallback port invented locally is
-//! exactly the kind of default that ends up in production unreviewed.
+//! The port is not this module's call and never was: the MochiOS launcher
+//! allocates one and injects it as `MOYMOY_ADMIN_LISTEN`, declared by
+//! `app.toml`'s `[admin] listen_env`. **No default is invented here** — with the
+//! variable unset there is simply no admin listener, because a fallback port
+//! chosen locally is exactly the kind of default that ends up in production
+//! unreviewed.
 //!
-//! Until that lands, [`router`] stays callable and fully tested but reaches no
-//! socket. `admin_routes_are_not_mounted_on_the_public_router` pins that: mount
-//! these on the tunnel's router and it fails.
+//! `admin_routes_are_not_mounted_on_the_public_router` keeps pinning the half
+//! that matters: merge these onto the tunnel's router and it fails.
 //!
 //! # CORS (for whoever mounts this)
 //!
@@ -69,17 +70,6 @@
 //! `merging_before_the_layer_would_hand_admin_routes_cors` demonstrates the
 //! failure that ordering avoids, so the hazard is pinned rather than described.
 
-// Everything below is reachable only from the tests until the second listener
-// above exists, so `dead_code` fires on all of it — 40 warnings, against the 3
-// this crate otherwise has. That is not a finding being silenced: it is the
-// state the module docs describe, and burying the other 3 would cost more than
-// it reports.
-//
-// **Delete this the moment `router()` is mounted.** At that point the lint goes
-// back to meaning what it usually means, and anything it names is genuinely
-// unreachable code that should be removed rather than kept.
-#![allow(dead_code)]
-
 pub mod read;
 
 use axum::extract::{Query, State};
@@ -96,9 +86,9 @@ use read::Cursor;
 
 /// The operator routes, as their own `Router`.
 ///
-/// Nothing calls this outside the tests yet — read the module docs before
-/// changing that, because the router it looks like it belongs on is the cs
-/// tunnel's ingress.
+/// Served by [`crate::spawn_admin_listener`] and by nothing else — read the
+/// module docs before changing that, because the router this looks like it
+/// belongs on ([`crate::api::router`]) is the cs tunnel's ingress.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/admin/api/overview", get(overview))
@@ -266,7 +256,7 @@ async fn accounts(
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::AppState;
     use axum::body::Body;
     use axum::http::Request;
@@ -275,7 +265,10 @@ mod tests {
     /// A real [`AppState`], built the way `merchant.rs`'s own router test builds
     /// one. Nothing here reaches the tunnel: these routes only ever touch the
     /// pool.
-    fn app_state() -> AppState {
+    /// Shared with `main`'s own tests (which serve this router on a real socket),
+    /// so there is one construction of the operator plane's state rather than two
+    /// that can drift.
+    pub(crate) fn app_state() -> AppState {
         let pool = crate::db::open_memory().expect("in-memory pool");
         {
             let conn = pool.get().unwrap();

@@ -204,6 +204,21 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // --- operator plane (SECOND listener) ---
+    // Never reachable from the overlay, and not because of where this sits in
+    // `main`: [`spawn_admin_listener`] binds its listener and moves it straight
+    // into its serving task, so no admin `SocketAddr` is ever produced that
+    // `tunnel::spawn` could be handed — at any position in this function. The
+    // address below exists for the log line.
+    // Unset ⇒ no operator plane at all (see [`admin_listen`]).
+    if let Some(admin) = admin_listen(std::env::var("MOYMOY_ADMIN_LISTEN").ok()) {
+        let admin_local = spawn_admin_listener(&admin, state.clone()).await?;
+        tracing::info!(
+            %admin_local,
+            "operator plane online — admin_api only, no TLS, no CORS, not on the tunnel"
+        );
+    }
+
     // --- serve ---
     let app = api::router(state);
     if tls_on {
@@ -257,6 +272,68 @@ async fn serve_tls(
             }
         });
     }
+}
+
+// ── operator plane ───────────────────────────────────────────────────────────
+
+/// Where the operator plane should listen, from whatever the environment
+/// supplied — or `None`, meaning this process serves no operator plane at all.
+///
+/// **No default is invented**, and that is the decision, not an omission: the
+/// port belongs to the MochiOS launcher, which allocates a free one and injects
+/// it as `MOYMOY_ADMIN_LISTEN` because `app.toml` declares
+/// `[admin] listen_env = "MOYMOY_ADMIN_LISTEN"`. A fallback chosen here would be
+/// a port nobody reviewed, listening on a surface that lists every balance in the
+/// wallet. So this reads the value the way [`tunnel::spawn`] reads
+/// `MOCHI_SVC_IDENTITY_TOKEN` (present and non-empty, or absent) rather than
+/// through [`env_or`], which demands a default.
+///
+/// Takes the value instead of reading the variable so both branches are testable:
+/// cargo runs a binary's tests as threads in ONE process, where a `set_var` would
+/// race every other test in it.
+fn admin_listen(configured: Option<String>) -> Option<String> {
+    configured.filter(|s| !s.is_empty())
+}
+
+/// Bind the operator plane on `listen`, serve [`admin_api::router`] there, and
+/// return the address actually bound (so `127.0.0.1:0` resolves to a real port).
+///
+/// **The listener never leaves this function**, and that — not the call's
+/// position in `main` — is what keeps the operator plane off the overlay. It is
+/// created here and moved straight into the serving task, so the only thing that
+/// escapes is a `SocketAddr` for the log line and for tests. [`tunnel::spawn`]
+/// takes one `SocketAddr` and `main` hands it the PUBLIC listener's; moving this
+/// call earlier or later cannot change that, because no admin listener exists
+/// anywhere for it to be given.
+///
+/// **No TLS and no CORS, both deliberately.** `MOYMOY_CS_TLS` gates the wallet
+/// listener only, and this function sits outside that branch, so the flag cannot
+/// reach here — deployments DO set `MOYMOY_CS_TLS = "1"` (see
+/// `app_backends/moymoy/app.toml`) while this plane stays plaintext. That is the
+/// intended shape: it is loopback-only, reached by the Hub on the same host, and
+/// the Hub's side dials `http://` unconditionally
+/// (`hub/server/src/launcher/admin_proxy.rs`'s `admin_url`, which hardcodes the
+/// scheme and re-checks it). Do not "fix" one half without the other. CORS is
+/// covered by
+/// `admin_api::tests::the_admin_router_answers_on_its_own_and_carries_no_cors`.
+///
+/// A bind failure is a hard error, matching [`tunnel::spawn`]'s posture: the
+/// operator declared an admin plane in `app.toml`, and one the console cannot
+/// reach is worse silent than loud.
+async fn spawn_admin_listener(listen: &str, state: AppState) -> anyhow::Result<SocketAddr> {
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind operator plane {listen}: {e}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("operator plane local_addr: {e}"))?;
+    let app = admin_api::router(state);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = %e, "operator plane listener stopped");
+        }
+    });
+    Ok(local)
 }
 
 // ── operator commands ────────────────────────────────────────────────────────
@@ -402,5 +479,78 @@ pub fn env_flag(key: &str, default: bool) -> bool {
     match std::env::var(key).ok().filter(|s| !s.is_empty()) {
         Some(v) => matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"),
         None => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unset (or blank) `MOYMOY_ADMIN_LISTEN` means NO operator plane — the
+    /// deployment that never declared `[admin]` in its `app.toml` must start
+    /// exactly as it did before this existed, with no port invented for it.
+    ///
+    /// Driven by value rather than by `set_var`: cargo runs this binary's tests as
+    /// threads in one process, so an env write here would race every other test.
+    /// `main`'s one-line `if let` over `std::env::var(..).ok()` is the only part
+    /// not covered, and it is inspected rather than tested.
+    #[test]
+    fn without_the_env_var_there_is_no_operator_plane() {
+        assert_eq!(admin_listen(None), None);
+        assert_eq!(admin_listen(Some(String::new())), None);
+        assert_eq!(
+            admin_listen(Some("127.0.0.1:51999".to_string())),
+            Some("127.0.0.1:51999".to_string()),
+            "a launcher-injected address is taken verbatim"
+        );
+    }
+
+    /// With an address, the operator plane really answers on it — asserted over a
+    /// real socket with a real HTTP client, not by inspecting a `Router`.
+    ///
+    /// The second half is the one that matters as much: this listener serves
+    /// `admin_api` and NOTHING else. If it ever also carried `api::router`, the
+    /// wallet API would be duplicated onto a port with no TLS, and `/healthz`
+    /// answering here is how that would first show up.
+    #[tokio::test]
+    async fn the_operator_plane_answers_where_it_was_told_to_and_serves_only_admin_api() {
+        let addr = spawn_admin_listener("127.0.0.1:0", crate::admin_api::tests::app_state())
+            .await
+            .expect("the operator plane binds");
+        assert!(addr.ip().is_loopback(), "must not bind off loopback: {addr}");
+
+        let client = reqwest::Client::new();
+        let admin = client
+            .get(format!("http://{addr}/admin/api/overview"))
+            .send()
+            .await
+            .expect("the operator plane answers");
+        assert_eq!(admin.status(), 200);
+
+        let wallet = client
+            .get(format!("http://{addr}/healthz"))
+            .send()
+            .await
+            .expect("the operator plane answers");
+        assert_eq!(
+            wallet.status(),
+            404,
+            "the operator plane must serve admin_api alone — a wallet route here \
+             means api::router was merged onto it"
+        );
+    }
+
+    /// A declared operator plane that cannot bind stops the backend, rather than
+    /// leaving it running with a console surface nobody can reach. Same posture as
+    /// `tunnel::spawn`'s missing-identity error.
+    #[tokio::test]
+    async fn a_declared_operator_plane_that_cannot_bind_is_a_hard_error() {
+        let err = spawn_admin_listener("not-an-address", crate::admin_api::tests::app_state())
+            .await
+            .expect_err("an unusable address must not be shrugged off");
+        assert!(
+            err.to_string().contains("bind operator plane"),
+            "the error must say what failed: {err}"
+        );
     }
 }
