@@ -49,6 +49,10 @@
 //!   POST /merchant/v1/intent/fulfill {intent_id, fulfilled_amount_minor, reason?} (API key)
 //!   POST /merchant/v1/intent/cancel {intent_id}                    (API key)
 //!
+//! The operator console routes ([`crate::admin_api`]) are deliberately NOT on
+//! this router — everything here is reachable from the MNN overlay through the
+//! cs tunnel. See that module's docs before adding them.
+//!
 //! `/wallet/pay` is gone. It sent a client-chosen amount to a client-chosen
 //! merchant, which is the thing `payment_intents` exists to make impossible: the
 //! amount and the recipient now come from a record the merchant created and the
@@ -171,6 +175,12 @@ pub fn router(state: AppState) -> Router {
         .route("/wallet/_dev/credit", post(dev_credit))
         .with_state(state)
         .layer(cors)
+    // `crate::admin_api::router()` is deliberately NOT merged here. This router
+    // is the cs tunnel's ingress — `main` hands this same listener to
+    // `tunnel::spawn`, which forwards `moymoy.cs.mnn` traffic to it without any
+    // notion of paths — so anything mounted here is reachable from the whole MNN
+    // overlay, not just from a Hub proxying on loopback. The operator routes get
+    // an ingress of their own instead; see the `admin_api` module docs.
 }
 
 // ── status ───────────────────────────────────────────────────────────────────

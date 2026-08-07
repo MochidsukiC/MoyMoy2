@@ -11,6 +11,11 @@
 //!     SAME tunnel (`crate::mc`); it degrades to wallet-only whenever the tunnel
 //!     is down, which is the only "unavailable" state left.
 
+// `admin_api` and the `admin` module further down are different things and the
+// names are not interchangeable: `admin` is the operator CLI (it moves money and
+// has no network surface at all), `admin_api` is the read-only console API. The
+// suffix is also forced — `mod admin` below already owns that name in this crate.
+mod admin_api;
 mod api;
 mod attest;
 mod auth;
