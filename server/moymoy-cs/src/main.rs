@@ -297,6 +297,59 @@ fn admin_listen(configured: Option<String>) -> Option<String> {
     configured.filter(|s| !s.is_empty())
 }
 
+/// Parse `listen` and refuse anything that is not a loopback address.
+///
+/// **This is the enforcement behind every "loopback-only" claim in this module.**
+/// [`admin_api`] has no authentication of any kind — it answers every balance,
+/// every card face, and the cross-account ledger to whoever connects. What makes
+/// that safe is that only the Hub, on this same host, can reach it. Nothing else
+/// checks that. Without this function, `MOYMOY_ADMIN_LISTEN=0.0.0.0:9999` would
+/// publish the whole wallet to the network, and the code would have been doing
+/// exactly what it was told.
+///
+/// The launcher always injects `127.0.0.1:<port>` (MochiOS2.0's
+/// `launcher/spawn.rs` applies it AFTER `app.toml`'s `[env]`, so the manifest
+/// cannot override it). A value that arrives here non-loopback therefore means
+/// something other than the launcher started this process — which is precisely
+/// the case that needs stopping, not accommodating.
+///
+/// Checked BEFORE binding. Binding first and inspecting `local_addr()` after
+/// would open the socket, however briefly, on every interface.
+///
+/// # Two deliberate narrownesses
+///
+/// A hostname (`localhost:9999`) does not parse as a `SocketAddr` and is
+/// refused. Accepting one would require resolving it, and what a name resolves
+/// to is not ours to decide — a check that consults DNS is a check an attacker
+/// can influence. The launcher sends a literal address, so nothing real needs
+/// this.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) is NOT loopback to
+/// [`std::net::Ipv6Addr::is_loopback`], so it is refused too, even though it
+/// names a loopback host. Same reasoning as the console's CIDR matching in
+/// MochiOS2.0's `console/net.rs`: silently unwrapping the mapping makes one rule
+/// span two address families. Refusing costs nothing here.
+fn require_loopback(listen: &str) -> anyhow::Result<SocketAddr> {
+    let addr: SocketAddr = listen.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "bind operator plane {listen}: not a host:port address. The operator \
+             plane takes a literal loopback socket address (e.g. 127.0.0.1:0); \
+             hostnames are not resolved here on purpose"
+        )
+    })?;
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "bind operator plane {listen}: refusing to serve the operator plane \
+             off loopback. It carries every account balance, card face and the \
+             cross-account ledger with NO authentication — being reachable only \
+             from this host is the whole security boundary. The Hub launcher \
+             injects 127.0.0.1:<port>; a different value means this process was \
+             started some other way"
+        );
+    }
+    Ok(addr)
+}
+
 /// Bind the operator plane on `listen`, serve [`admin_api::router`] there, and
 /// return the address actually bound (so `127.0.0.1:0` resolves to a real port).
 ///
@@ -312,7 +365,8 @@ fn admin_listen(configured: Option<String>) -> Option<String> {
 /// listener only, and this function sits outside that branch, so the flag cannot
 /// reach here — deployments DO set `MOYMOY_CS_TLS = "1"` (see
 /// `app_backends/moymoy/app.toml`) while this plane stays plaintext. That is the
-/// intended shape: it is loopback-only, reached by the Hub on the same host, and
+/// intended shape: it is loopback-only — enforced by [`require_loopback`] rather
+/// than merely intended — reached by the Hub on the same host, and
 /// the Hub's side dials `http://` unconditionally
 /// (`hub/server/src/launcher/admin_proxy.rs`'s `admin_url`, which hardcodes the
 /// scheme and re-checks it). Do not "fix" one half without the other. CORS is
@@ -323,7 +377,8 @@ fn admin_listen(configured: Option<String>) -> Option<String> {
 /// operator declared an admin plane in `app.toml`, and one the console cannot
 /// reach is worse silent than loud.
 async fn spawn_admin_listener(listen: &str, state: AppState) -> anyhow::Result<SocketAddr> {
-    let listener = tokio::net::TcpListener::bind(listen)
+    let addr = require_loopback(listen)?;
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("bind operator plane {listen}: {e}"))?;
     let local = listener
@@ -519,6 +574,11 @@ mod tests {
         let addr = spawn_admin_listener("127.0.0.1:0", crate::admin_api::tests::app_state())
             .await
             .expect("the operator plane binds");
+        // NOTE: this asserts a property of the address THIS TEST chose to pass
+        // in. It enforces nothing — pass "0.0.0.0:0" and it would simply assert
+        // about that instead. The invariant is enforced by `require_loopback`
+        // and pinned by `a_non_loopback_operator_plane_is_refused_before_binding`
+        // below; do not read this line as the guard.
         assert!(addr.ip().is_loopback(), "must not bind off loopback: {addr}");
 
         let client = reqwest::Client::new();
@@ -553,6 +613,58 @@ mod tests {
         assert!(
             err.to_string().contains("bind operator plane"),
             "the error must say what failed: {err}"
+        );
+    }
+
+    /// The loopback rule itself, with no socket involved.
+    ///
+    /// `admin_api` has no authentication, so "only this host can reach it" is the
+    /// entire security boundary. This is the function that makes that true.
+    #[test]
+    fn only_a_literal_loopback_address_is_accepted() {
+        for ok in ["127.0.0.1:0", "127.0.0.1:51999", "127.9.9.9:80", "[::1]:0"] {
+            assert!(
+                require_loopback(ok).is_ok(),
+                "the launcher's own shape must be accepted: {ok}"
+            );
+        }
+        // The wildcard is the dangerous one: it is what an operator types when
+        // they mean "let me reach it from my laptop", and it publishes every
+        // balance to the network.
+        for bad in ["0.0.0.0:0", "0.0.0.0:9999", "192.0.2.1:0", "[::]:0"] {
+            // `expect_err` prints the accepted address, so the failure names the
+            // offender without interpolating here.
+            let err = require_loopback(bad).expect_err("a non-loopback address must be refused");
+            assert!(
+                err.to_string().contains("off loopback"),
+                "the refusal must name the reason: {err}"
+            );
+        }
+        // Refused on purpose, both of them — see `require_loopback`'s docs.
+        assert!(
+            require_loopback("localhost:9999").is_err(),
+            "a hostname is not resolved here"
+        );
+        assert!(
+            require_loopback("[::ffff:127.0.0.1]:0").is_err(),
+            "an IPv4-mapped v6 address is not unwrapped into a v4 rule"
+        );
+    }
+
+    /// The rule reaches the real code path, and it fires BEFORE any socket opens.
+    ///
+    /// `0.0.0.0:0` binds successfully on every machine this could run on, so an
+    /// `Err` here can only have come from [`require_loopback`] — if the check were
+    /// removed, this call would succeed rather than fail differently. That is what
+    /// makes this test discriminating rather than merely passing.
+    #[tokio::test]
+    async fn a_non_loopback_operator_plane_is_refused_before_binding() {
+        let err = spawn_admin_listener("0.0.0.0:0", crate::admin_api::tests::app_state())
+            .await
+            .expect_err("the wallet must never be published off loopback");
+        assert!(
+            err.to_string().contains("off loopback"),
+            "must be refused by the loopback rule, not by a bind failure: {err}"
         );
     }
 }
