@@ -1,10 +1,13 @@
 package jp.houlab.mochidsuki.moymoy;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -384,26 +387,39 @@ public final class EmeraldOpStore extends SavedData {
      * the vanilla save path, recorded there as a residual window rather than
      * worked around here.
      *
-     * <p>Nothing is written to the in-memory store until every legacy entry has
-     * been decoded and validated. That ordering matters: {@code
-     * SavedDataStorage#computeIfAbsent} marks a freshly created store dirty
-     * (its {@code set} calls {@code SavedData#setDirty()}), and an exception out
-     * of {@code SERVER_STARTING} reaches {@code MinecraftServer#runServer}'s
-     * outer handler, which runs {@code stopServer} → {@code
-     * savedDataStorage.close()} → {@code saveAndJoin()}. A half-applied merge
-     * would therefore be written on the way down; validating first means there
-     * is never a half-applied merge to write.
+     * <p>The backup is written with {@link StandardOpenOption#SYNC}, so its
+     * CONTENT is on the medium before the migration touches the target. Its
+     * DIRECTORY ENTRY is not: there is no portable way to fsync a directory from
+     * Java, and on Windows {@code FileChannel#force} on a directory throws. A
+     * power loss in the window between creating the backup and the target write
+     * completing can therefore still leave a filesystem whose metadata has not
+     * caught up. That residual is stated rather than papered over.
+     *
+     * <p><b>Order of operations.</b> Nothing touches the in-memory store until
+     * every legacy entry has been decoded and validated AND the backup is in
+     * hand. That ordering matters: {@code SavedDataStorage#computeIfAbsent}
+     * marks a freshly created store dirty (its {@code set} calls {@code
+     * SavedData#setDirty()}), and an exception out of {@code SERVER_STARTING}
+     * reaches {@code MinecraftServer#runServer}'s outer handler, which runs
+     * {@code stopServer} → {@code savedDataStorage.close()} → {@code
+     * saveAndJoin()}. Anything this method has already put into the store is
+     * therefore written on the way down, through the plain vanilla path — no
+     * backup, no verification. Validating first means there is never a
+     * half-applied merge to write; taking the backup first means that even a
+     * refusal to proceed (a stale backup, an unreadable target) cannot end with
+     * shutdown overwriting the target unprotected.
      *
      * @throws IllegalStateException if the legacy file's existence cannot be
      *         determined; if it exists but cannot be read, does not have the
-     *         expected shape, or holds an entry that is not a positive {@code
-     *         IntTag}; if a stale {@code .premigration} backup is in the way; if
-     *         the backup cannot be taken; or if the merged entries cannot be
-     *         verified on disk afterwards. Starting {@code serve()} with a
-     *         ledger that is unreadable, malformed or unpersisted is more
-     *         dangerous than failing to boot, so none of this is swallowed. In
-     *         every failure case the legacy file is left exactly where it is. A
-     *         merely ABSENT legacy file is the normal path, not an error.
+     *         expected shape, or holds an entry that is not an {@code IntTag} at
+     *         or above its field's minimum; if a stale {@code .premigration}
+     *         backup is in the way; if the backup cannot be taken; or if the
+     *         merged entries cannot be verified on disk afterwards. Starting
+     *         {@code serve()} with a ledger that is unreadable, malformed or
+     *         unpersisted is more dangerous than failing to boot, so none of
+     *         this is swallowed. In every failure case the legacy file is left
+     *         exactly where it is. A merely ABSENT legacy file is the normal
+     *         path, not an error.
      */
     public static void migrateLegacyStore(MinecraftServer server) {
         Path legacy = server.getWorldPath(LevelResource.DATA).resolve(LEGACY_FILE_NAME);
@@ -430,12 +446,28 @@ public final class EmeraldOpStore extends SavedData {
         CompoundTag legacyGrants = optionalCompound(data, "grants", legacy, LEGACY_LEDGER);
 
         // Decode and validate EVERY entry before the store is even fetched, let
-        // alone mutated — see the class of failure described in this method's
-        // Javadoc ("Nothing is written to the in-memory store until ...").
+        // alone mutated — see this method's "Order of operations" Javadoc for the
+        // shutdown save that would otherwise write a half-applied merge.
         Map<String, Integer> legacyOpEntries =
                 readEntries(legacyOps, "ops", legacy, MIN_OPS_VALUE);
         Map<String, Integer> legacyGrantEntries =
                 readEntries(legacyGrants, "grants", legacy, MIN_GRANTS_VALUE);
+
+        // Preflight the backup BEFORE the store is fetched. get() below can create
+        // the store, and creating it marks it dirty, after which any throw on the
+        // way to the guarded write gets the target written anyway by the shutdown
+        // save (see "Order of operations" above). Refusing to proceed must not be
+        // the thing that causes an unprotected write.
+        //
+        // Checked on every boot the legacy file is still present, NOT only when
+        // something gets inserted: a run that failed to delete its backup AND
+        // failed to retire the legacy file leaves all three files behind, and the
+        // next boot may well insert nothing (the target already has every legacy
+        // key). That is precisely the state where "how far did the last run get?"
+        // is unanswerable, so it must not be the state that skips the check.
+        Path dataFile = ledgerFile(server);
+        Path backup = dataFile.resolveSibling(dataFile.getFileName() + BACKUP_SUFFIX);
+        boolean backedUp = takeBackup(dataFile, backup, legacy);
 
         EmeraldOpStore store = get(server);
 
@@ -452,18 +484,31 @@ public final class EmeraldOpStore extends SavedData {
         Map<String, Integer> insertedOps = mergeInto(store.consumed, legacyOpEntries);
         Map<String, Integer> insertedGrants = mergeInto(store.grants, legacyGrantEntries);
 
-        if (insertedOps.isEmpty() && insertedGrants.isEmpty()) {
-            // Nothing to make durable, so nothing to back up or verify. Not a
-            // shortcut: with zero insertions the store's contents are precisely what
-            // SavedDataStorage read back out of the new .dat on this very boot, so
-            // they are durable by construction. The flush still happens because
-            // get() above may have CREATED the store (computeIfAbsent's set() marks
-            // it dirty), and writing that empty ledger out costs nothing.
-            flush(server);
-        } else {
+        boolean moved = !insertedOps.isEmpty() || !insertedGrants.isEmpty();
+        if (moved) {
             store.setDirty();
-            persistAndVerify(server, legacy, insertedOps, insertedGrants);
         }
+        try {
+            // Flush even when nothing moved: get() above may have CREATED the store
+            // (computeIfAbsent's set() marks it dirty), and writing that ledger out
+            // costs nothing.
+            flush(server);
+            if (moved) {
+                verifyPersisted(dataFile, legacy, insertedOps, insertedGrants);
+            }
+            // Verification is skipped when nothing was inserted, and that is not a
+            // shortcut: with zero insertions the store's contents are precisely what
+            // SavedDataStorage read back out of the target on this very boot, so
+            // they are durable by construction and this flush had nothing of ours to
+            // lose.
+        } catch (RuntimeException e) {
+            if (backedUp) {
+                restore(backup, dataFile, e);
+            }
+            throw e;
+        }
+
+        deleteBackup(backup, backedUp);
 
         LOGGER.info("Migrated legacy emerald op ledger {}: {} ops, {} grants",
                 LEGACY_FILE_NAME, insertedOps.size(), insertedGrants.size());
@@ -483,20 +528,22 @@ public final class EmeraldOpStore extends SavedData {
     }
 
     /**
-     * Backs up the 26.2 ledger, flushes the merge, verifies it reached disk, and
-     * restores the backup if it did not. Only called when something was actually
-     * inserted.
+     * Copies the 26.2 ledger aside so a failed migration write can be undone,
+     * returning whether a backup was actually taken. Touches no live state, so
+     * it is safe to call — and must be called — before {@link #get} creates and
+     * dirties the store.
      *
-     * @throws IllegalStateException if a stale backup is in the way, the backup
-     *         cannot be taken, or the merge cannot be verified on disk. The
-     *         legacy file is never touched by this method, so the caller's
-     *         retire step is simply never reached.
+     * <p>The copy goes through {@link StandardOpenOption#SYNC} rather than
+     * {@code Files.copy}: {@code Files.copy} promises only that the bytes were
+     * handed to the filesystem, and this backup exists precisely to survive the
+     * case where the machine stops mid-write. See {@link #migrateLegacyStore}'s
+     * class of residual for what {@code SYNC} still does not cover (the
+     * directory entry).
+     *
+     * @throws IllegalStateException if a stale backup is in the way, or the
+     *         backup cannot be taken. The legacy file is never touched here.
      */
-    private static void persistAndVerify(MinecraftServer server, Path legacy,
-            Map<String, Integer> insertedOps, Map<String, Integer> insertedGrants) {
-        Path dataFile = ledgerFile(server);
-        Path backup = dataFile.resolveSibling(dataFile.getFileName() + BACKUP_SUFFIX);
-
+    private static boolean takeBackup(Path dataFile, Path backup, Path legacy) {
         // A backup left over from a previous run means that run died between taking
         // it and either restoring or deleting it — so which of the two files is the
         // real ledger is exactly what we cannot know. Overwriting the backup here
@@ -516,45 +563,50 @@ public final class EmeraldOpStore extends SavedData {
         // 1.20.1 world booting on 26.2 for the first time — the 26.2 ledger does not
         // exist yet, the whole file is about to be created from the merge, and a
         // failed write leaves the legacy file untouched for the next attempt.
-        boolean backedUp = false;
-        if (exists(dataFile, MIGRATED_LEDGER)) {
-            try {
-                // No REPLACE_EXISTING: absence was just established, so a collision
-                // here means something else is writing this directory and we would
-                // rather fail than race it.
-                Files.copy(dataFile, backup);
-                backedUp = true;
-            } catch (IOException e) {
-                LOGGER.error("Could not back up {} to {} before migrating the legacy emerald op "
-                        + "ledger; leaving {} in place", dataFile, backup, legacy, e);
-                throw new IllegalStateException(
-                        "Could not back up the emerald op ledger: " + dataFile, e);
-            }
+        //
+        // Taken regardless of how many entries the merge will end up inserting: that
+        // count is only known after the merge, and the merge is what dirties the
+        // store. A copy on the handful of boots where the legacy file still exists
+        // costs nothing worth optimising away.
+        if (!exists(dataFile, MIGRATED_LEDGER)) {
+            return false;
         }
+        try (InputStream in = Files.newInputStream(dataFile);
+                // CREATE_NEW, not CREATE: absence was just established, so a
+                // collision here means something else is writing this directory and
+                // we would rather fail than race it.
+                OutputStream out = Files.newOutputStream(backup,
+                        StandardOpenOption.CREATE_NEW,
+                        StandardOpenOption.WRITE,
+                        StandardOpenOption.SYNC)) {
+            in.transferTo(out);
+        } catch (IOException e) {
+            LOGGER.error("Could not back up {} to {} before migrating the legacy emerald op "
+                    + "ledger; leaving {} in place", dataFile, backup, legacy, e);
+            throw new IllegalStateException(
+                    "Could not back up the emerald op ledger: " + dataFile, e);
+        }
+        return true;
+    }
 
+    /**
+     * Removes the backup once the migration has been verified. A failure here is
+     * only a warning: it costs nothing now, and the legacy file is about to be
+     * retired, after which the next boot returns early and never looks here. It
+     * matters only if that retire ALSO fails, in which case the next boot stops
+     * on {@link #takeBackup}'s stale-backup check — hence the explicit permission
+     * to delete the file by hand.
+     */
+    private static void deleteBackup(Path backup, boolean backedUp) {
+        if (!backedUp) {
+            return;
+        }
         try {
-            flush(server);
-            verifyPersisted(dataFile, legacy, insertedOps, insertedGrants);
-        } catch (RuntimeException e) {
-            if (backedUp) {
-                restore(backup, dataFile, e);
-            }
-            throw e;
-        }
-
-        if (backedUp) {
-            try {
-                Files.delete(backup);
-            } catch (IOException e) {
-                // Harmless on its own: the legacy file is about to be retired, so the
-                // next boot returns early and never looks at this backup. It only
-                // matters if the retire below ALSO fails, in which case the next boot
-                // stops on the stale-backup check above — hence the explicit
-                // permission to delete it.
-                LOGGER.warn("Emerald op ledger migration succeeded but could not delete the "
-                        + "backup {}. It is safe to delete this file by hand; leaving it may "
-                        + "block a future migration.", backup, e);
-            }
+            Files.delete(backup);
+        } catch (IOException e) {
+            LOGGER.warn("Emerald op ledger migration succeeded but could not delete the "
+                    + "backup {}. It is safe to delete this file by hand; leaving it may "
+                    + "block a future migration.", backup, e);
         }
     }
 
