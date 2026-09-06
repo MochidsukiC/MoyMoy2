@@ -3,7 +3,9 @@ package jp.houlab.mochidsuki.moymoy;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.mojang.serialization.Codec;
@@ -70,6 +72,12 @@ public final class EmeraldOpStore extends SavedData {
      */
     private static final String LEGACY_FILE_NAME = "moymoy_emerald_ops.dat";
 
+    /** What the migration calls the 1.20.1 file in logs and exception messages. */
+    private static final String LEGACY_LEDGER = "Legacy emerald op ledger";
+
+    /** What it calls the 26.2 file it wrote, when reading it back to verify. */
+    private static final String MIGRATED_LEDGER = "Migrated emerald op ledger";
+
     /**
      * Codec for the on-disk form: {@code {ops:{op_id:int,...},
      * grants:{op_id:int,...}}}.
@@ -88,6 +96,20 @@ public final class EmeraldOpStore extends SavedData {
      * <p>Side effect of the default value, harmless: on ENCODE a field equal to
      * its default is omitted, so an empty ledger writes {@code {}} instead of
      * {@code {ops:{},grants:{}}}. It decodes back to the same empty maps.
+     *
+     * <p><b>Do NOT "harden" this to {@code fieldOf("ops")}.</b> It looks like the
+     * safer choice — a ledger with no {@code ops} key is certainly suspicious —
+     * but the omit-on-default encode above makes it a double-mint bug. A store
+     * that has grants but no charges (every charge settled and pruned, or a
+     * world that has only ever withdrawn) encodes as {@code {grants:{...}}} with
+     * no {@code ops} key at all. {@code fieldOf("ops")} would then fail the
+     * decode on the next load, and {@code SavedDataStorage#readSavedData}
+     * swallows a failed decode into "no saved data" — so the {@code grants} map
+     * would vanish along with it and every settled withdrawal would re-mint on
+     * replay. Strictness belongs on the LEGACY-file reader, which is a one-shot
+     * import of a file some other version wrote and which cannot be re-derived
+     * (see {@link #migrateLegacyStore}), not on the round-trip codec that reads
+     * back what this very class just wrote.
      */
     public static final Codec<EmeraldOpStore> CODEC = RecordCodecBuilder.create(i -> i.group(
             Codec.unboundedMap(Codec.STRING, Codec.INT).optionalFieldOf("ops", Map.of())
@@ -304,14 +326,30 @@ public final class EmeraldOpStore extends SavedData {
      * upgrade must not proceed without carrying the ledger across.
      *
      * <p>Idempotent: entries are merged with put-if-absent semantics and the
-     * old file is only renamed to {@code .migrated} AFTER a successful flush,
-     * so re-running it (including after a failed rename) changes nothing.
+     * old file is only renamed to {@code .migrated} AFTER the merge has been
+     * read back off disk, so re-running it (including after a failed rename or
+     * a fail-closed abort) changes nothing.
+     *
+     * <p><b>Why the read-back:</b> {@link #flush} returning tells us nothing
+     * about whether the bytes landed. {@code SavedDataStorage#tryWrite} catches
+     * the {@code IOException} from {@code NbtIo.writeCompressed} and only logs
+     * it, and {@code collectDirtyTagsToSave} has already cleared the dirty flag
+     * by then, so a full disk, a read-only mount or any I/O fault produces a
+     * silent no-op that {@code saveAndJoin()} reports as success and {@code
+     * isDirty()} cannot detect. Renaming the source away on the strength of
+     * that would destroy the only copy of the ledger AND leave the new store
+     * empty — the exact double-consume / double-mint this method exists to
+     * prevent, with no recovery path left. So the merged entries are read back
+     * from the new {@code .dat} and compared before the old file is touched.
      *
      * @throws IllegalStateException if the legacy file exists but cannot be
-     *         read or does not have the expected shape. Starting {@code serve()}
-     *         with an unreadable ledger is more dangerous than failing to boot,
-     *         so this is deliberately NOT swallowed. A merely ABSENT legacy file
-     *         is the normal path, not an error.
+     *         read, does not have the expected shape, or if the merged entries
+     *         cannot be verified on disk afterwards. Starting {@code serve()}
+     *         with a ledger that is unreadable, malformed or unpersisted is
+     *         more dangerous than failing to boot, so none of this is
+     *         swallowed. In every failure case the legacy file is left exactly
+     *         where it is. A merely ABSENT legacy file is the normal path, not
+     *         an error.
      */
     public static void migrateLegacyStore(MinecraftServer server) {
         Path legacy = server.getWorldPath(LevelResource.DATA).resolve(LEGACY_FILE_NAME);
@@ -320,34 +358,22 @@ public final class EmeraldOpStore extends SavedData {
             return;
         }
 
-        CompoundTag root;
-        try {
-            // Read the raw NBT, no DataFixer: the root is
-            // {data:{ops:{...},grants:{...}}, DataVersion:n} written by 1.20.1's
-            // SavedData#save(File), and TYPE's DataFixTypes.SAVED_DATA_WEATHER is
-            // registered as DSL.remainder() — a pass-through — so running the
-            // fixer chain over it could not change a single byte anyway.
-            root = NbtIo.readCompressed(legacy, NbtAccounter.unlimitedHeap());
-        } catch (IOException | RuntimeException e) {
-            LOGGER.error("Failed to read the legacy emerald op ledger at {}", legacy, e);
-            throw new IllegalStateException(
-                    "Failed to read the legacy emerald op ledger: " + legacy, e);
-        }
+        CompoundTag data = readLedgerData(legacy, LEGACY_LEDGER);
 
-        // 1.20.1's SavedData#save(File) ALWAYS wrote the "data" wrapper, so its
-        // absence means this file is not the ledger we think it is. Bail out loudly
-        // rather than treat a file we cannot parse as an empty ledger and rename it
-        // away — that would lose the very records this migration exists to keep.
-        CompoundTag data = root.getCompound("data").orElseThrow(() -> {
-            LOGGER.error("Legacy emerald op ledger at {} has no \"data\" compound", legacy);
-            return new IllegalStateException(
-                    "Legacy emerald op ledger has no \"data\" compound: " + legacy);
-        });
+        // "ops" is REQUIRED. 1.20.1's save(CompoundTag) unconditionally did
+        // tag.put("ops", ops), so a legacy file without it is either not our ledger
+        // or is damaged. Accepting it as "no charges" and then retiring the source
+        // would silently discard every settled charge — after which a replayed
+        // emerald.charge consumes a second time. This strictness is deliberately
+        // NOT mirrored onto CODEC; see CODEC's Javadoc for why the round-trip codec
+        // must stay lenient.
+        CompoundTag legacyOps = requireCompound(data, "ops", legacy, LEGACY_LEDGER);
 
-        // getCompoundOrEmpty mirrors 1.20.1's getCompound-returns-empty behaviour:
-        // a world saved before emerald.withdraw existed simply has no "grants" key.
-        CompoundTag legacyOps = data.getCompoundOrEmpty("ops");
-        CompoundTag legacyGrants = data.getCompoundOrEmpty("grants");
+        // "grants" may legitimately be ABSENT: a world saved before
+        // emerald.withdraw existed has no such key (the same case CODEC's
+        // optionalFieldOf covers). Present-but-not-a-compound is still a corrupt
+        // file, so that fails closed.
+        CompoundTag legacyGrants = optionalCompound(data, "grants", legacy, LEGACY_LEDGER);
 
         EmeraldOpStore store = get(server);
 
@@ -358,22 +384,15 @@ public final class EmeraldOpStore extends SavedData {
         // logic in MoyMoyExtension would treat the withdrawal as never completed
         // and mint the emeralds a second time. The same applies to a settled charge
         // being replaced by a stale consumed amount.
-        // getIntOr(key, 0) reproduces 1.20.1's getInt(key), which likewise yielded 0
-        // for a missing or wrongly-typed value.
-        int movedOps = 0;
-        for (String opId : legacyOps.keySet()) {
-            if (store.consumed.putIfAbsent(opId, legacyOps.getIntOr(opId, 0)) == null) {
-                movedOps++;
-            }
-        }
-        int movedGrants = 0;
-        for (String opId : legacyGrants.keySet()) {
-            if (store.grants.putIfAbsent(opId, legacyGrants.getIntOr(opId, 0)) == null) {
-                movedGrants++;
-            }
-        }
+        //
+        // What was actually inserted is remembered, not merely counted: that set is
+        // exactly what has to be proven durable below.
+        Map<String, Integer> insertedOps = mergeInto(store.consumed, legacyOps, "ops", legacy);
+        Map<String, Integer> insertedGrants =
+                mergeInto(store.grants, legacyGrants, "grants", legacy);
+        boolean moved = !insertedOps.isEmpty() || !insertedGrants.isEmpty();
 
-        if (movedOps > 0 || movedGrants > 0) {
+        if (moved) {
             store.setDirty();
         }
         // Flush unconditionally, even when nothing moved: the rename below is what
@@ -382,20 +401,168 @@ public final class EmeraldOpStore extends SavedData {
         // nothing — scheduleSave() returns an already-completed future.
         flush(server);
 
-        LOGGER.info("Migrated legacy emerald op ledger {}: {} ops, {} grants",
-                LEGACY_FILE_NAME, movedOps, movedGrants);
+        // Prove the merge is durable before retiring the source. Skipped when
+        // nothing was inserted, and that is not a shortcut: with zero insertions the
+        // store's contents are precisely what SavedDataStorage read back out of the
+        // new .dat on this very boot, so they are durable by construction and there
+        // is nothing this migration could have failed to write.
+        if (moved) {
+            verifyPersisted(server, legacy, insertedOps, insertedGrants);
+        }
 
-        // Only now, with the merge durable, retire the old file. A failure here is
-        // not fatal: the next boot reads the same file again and the put-if-absent
-        // merge above is a no-op, so we log and carry on rather than refusing to
-        // start. (A leftover .migrated file from an earlier partial run makes
-        // Files.move throw FileAlreadyExistsException, which lands here too.)
+        LOGGER.info("Migrated legacy emerald op ledger {}: {} ops, {} grants",
+                LEGACY_FILE_NAME, insertedOps.size(), insertedGrants.size());
+
+        // Only now, with the merge read back off disk, retire the old file. A
+        // failure here is not fatal: the next boot reads the same file again and the
+        // put-if-absent merge above is a no-op, so we log and carry on rather than
+        // refusing to start. (A leftover .migrated file from an earlier partial run
+        // makes Files.move throw FileAlreadyExistsException, which lands here too.)
         Path retired = legacy.resolveSibling(LEGACY_FILE_NAME + ".migrated");
         try {
             Files.move(legacy, retired);
         } catch (IOException e) {
             LOGGER.warn("Migrated the legacy emerald op ledger but could not rename {} to {}"
                     + "; it will be re-read (harmlessly) on the next start", legacy, retired, e);
+        }
+    }
+
+    /**
+     * Reads {@code file} as one of our {@code .dat} ledgers and returns its
+     * {@code data} compound. Fails closed on anything unreadable or malformed —
+     * see {@link #migrateLegacyStore}'s {@code @throws} for why.
+     */
+    private static CompoundTag readLedgerData(Path file, String what) {
+        CompoundTag root;
+        try {
+            // Read the raw NBT, no DataFixer: the root is
+            // {data:{ops:{...},grants:{...}}, DataVersion:n} — the shape 1.20.1's
+            // SavedData#save(File) wrote and the shape 26.2's
+            // SavedDataStorage#encodeUnchecked still writes — and TYPE's
+            // DataFixTypes.SAVED_DATA_WEATHER is registered as DSL.remainder(), a
+            // pass-through, so running the fixer chain over it could not change a
+            // single byte anyway.
+            root = NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap());
+        } catch (IOException | RuntimeException e) {
+            LOGGER.error("Failed to read {} at {}", what, file, e);
+            throw new IllegalStateException("Failed to read " + what + ": " + file, e);
+        }
+        // Both writers ALWAYS wrap in "data", so its absence means this file is not
+        // the ledger we think it is. Bail out loudly rather than treat a file we
+        // cannot parse as an empty ledger — with the legacy file that would lose the
+        // very records this migration exists to keep.
+        return requireCompound(root, "data", file, what);
+    }
+
+    /**
+     * A REQUIRED child compound: fails closed both when the key is missing and
+     * when it holds something that is not a {@link CompoundTag}. {@code
+     * CompoundTag#getCompoundOrEmpty} conflates those two with "empty", which is
+     * never the right answer on a path that retires the source file.
+     */
+    private static CompoundTag requireCompound(
+            CompoundTag parent, String field, Path file, String what) {
+        if (!parent.contains(field)) {
+            LOGGER.error("{} at {} has no \"{}\" compound; leaving the file in place",
+                    what, file, field);
+            throw new IllegalStateException(
+                    what + " has no \"" + field + "\" compound: " + file);
+        }
+        return parent.getCompound(field).orElseThrow(() -> {
+            LOGGER.error("{} at {}: \"{}\" is present but is not a compound; "
+                    + "leaving the file in place", what, file, field);
+            return new IllegalStateException(
+                    what + ": \"" + field + "\" is present but is not a compound: " + file);
+        });
+    }
+
+    /**
+     * An OPTIONAL child compound: a missing key yields an empty compound, but a
+     * key holding a non-compound still fails closed.
+     */
+    private static CompoundTag optionalCompound(
+            CompoundTag parent, String field, Path file, String what) {
+        if (!parent.contains(field)) {
+            return new CompoundTag();
+        }
+        return requireCompound(parent, field, file, what);
+    }
+
+    /**
+     * Put-if-absent every {@code op_id → int} of {@code source} into {@code
+     * target}, returning only what was actually inserted.
+     *
+     * <p>Values are read with {@code getInt}, which yields an empty {@link
+     * Optional} for a non-numeric tag, and that fails closed. 1.20.1's {@code
+     * getInt} silently yielded {@code 0} instead, but reproducing that here would
+     * write "settled, consumed 0 エメ" or "confirmed, granted 0 エメ" into the
+     * ledger and then delete the evidence: a charge that really consumed emeralds
+     * would be re-acked as {@code duplicate} with {@code settled: 0}, and the
+     * backend would credit nothing for emeralds the player has already lost. On a
+     * one-way import, refusing to guess beats being bug-compatible.
+     */
+    private static Map<String, Integer> mergeInto(
+            Map<String, Integer> target, CompoundTag source, String field, Path file) {
+        Map<String, Integer> inserted = new HashMap<>();
+        for (String opId : source.keySet()) {
+            Optional<Integer> value = source.getInt(opId);
+            if (value.isEmpty()) {
+                LOGGER.error("{} at {}: \"{}\" entry \"{}\" is not an int; "
+                        + "leaving the file in place", LEGACY_LEDGER, file, field, opId);
+                throw new IllegalStateException(LEGACY_LEDGER + ": \"" + field
+                        + "\" entry \"" + opId + "\" is not an int: " + file);
+            }
+            if (target.putIfAbsent(opId, value.get()) == null) {
+                inserted.put(opId, value.get());
+            }
+        }
+        return inserted;
+    }
+
+    /**
+     * Re-reads the 26.2 {@code .dat} from disk and asserts that every entry this
+     * migration inserted is actually in it, with the same value. Throws if not —
+     * leaving the legacy file untouched so the next boot can retry.
+     *
+     * <p>Only the INSERTED entries are checked, never the whole store. A field
+     * nothing was inserted into may legitimately be absent from the file: {@link
+     * #CODEC}'s {@code optionalFieldOf} omits a map equal to its empty default on
+     * encode, so a migration that moved only grants writes no {@code ops} key at
+     * all. Checking the whole store would read that omission as data loss.
+     */
+    private static void verifyPersisted(MinecraftServer server, Path legacy,
+            Map<String, Integer> insertedOps, Map<String, Integer> insertedGrants) {
+        // Resolve exactly the way SavedDataStorage#getDataFile does — verified with
+        // javap: id.withSuffix(".dat").resolveAgainst(dataFolder), where its
+        // dataFolder is the LevelResource.DATA path the MinecraftServer constructor
+        // handed it, i.e. the same path getWorldPath returns here.
+        Path dataFile = TYPE.id().withSuffix(".dat")
+                .resolveAgainst(server.getWorldPath(LevelResource.DATA));
+
+        CompoundTag data = readLedgerData(dataFile, MIGRATED_LEDGER);
+        verifyField(data, "ops", insertedOps, dataFile, legacy);
+        verifyField(data, "grants", insertedGrants, dataFile, legacy);
+    }
+
+    private static void verifyField(CompoundTag data, String field,
+            Map<String, Integer> inserted, Path dataFile, Path legacy) {
+        if (inserted.isEmpty()) {
+            return;
+        }
+        // Non-empty ⇒ the codec cannot have omitted this field, so it must be there.
+        CompoundTag written = requireCompound(data, field, dataFile, MIGRATED_LEDGER);
+        for (Map.Entry<String, Integer> entry : inserted.entrySet()) {
+            Optional<Integer> actual = written.getInt(entry.getKey());
+            if (actual.isEmpty() || !actual.get().equals(entry.getValue())) {
+                LOGGER.error("Emerald op ledger migration did not reach disk: {} entry \"{}\" "
+                        + "should be {} in {} but is {}. The vanilla save path swallows write "
+                        + "errors, so this is how a failed write surfaces. Leaving {} in place; "
+                        + "fix the underlying I/O problem and restart.",
+                        field, entry.getKey(), entry.getValue(), dataFile,
+                        actual.map(String::valueOf).orElse("absent"), legacy);
+                throw new IllegalStateException("Emerald op ledger migration did not reach disk: "
+                        + field + " entry \"" + entry.getKey() + "\" in " + dataFile);
+            }
         }
     }
 }
