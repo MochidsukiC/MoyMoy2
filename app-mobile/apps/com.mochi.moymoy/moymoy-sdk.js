@@ -226,7 +226,25 @@
   // so a longer URL is refused over there no matter what we decide here. Keeping
   // one here that is any wider would only buy a return button that does nothing
   // when it is pressed.
+  //
+  // It is measured on the NORMALIZED href, because that is the string the
+  // browser measures — see the check itself. This is the only length rule this
+  // app has; the raw bound below is a guard, not a second spec.
   const MAX_RETURN_URL_LEN = 2048;
+  // A bound on the work `new URL` is asked to do, deliberately set where it
+  // cannot also become a rule about which URLs are acceptable. The OS caps a
+  // launch intent's whole `params` JSON at 4096 BYTES, so no value that reaches
+  // us through the OS can exceed this many chars (non-ASCII costs more bytes
+  // than chars, never fewer) — which is the point: the guard never fires on a
+  // real intent, and every real decision is made after parsing.
+  //
+  // Setting it to 2048 instead would quietly make the raw string a second,
+  // stricter rule than the one the contract states. Normalization SHRINKS URLs
+  // as often as it grows them (a default port dropped, `/a/./b/../c` collapsed,
+  // tabs removed), so a raw-2049 URL that normalizes to 17 chars — which the
+  // browser accepts — would be refused here for a length it does not have by
+  // the time anyone measures it.
+  const MAX_RAW_RETURN_URL_LEN = 4096;
 
   /**
    * Reduce a merchant-supplied `return_url` to a page this app may send the
@@ -254,8 +272,8 @@
     if (typeof value !== "string") return "";
     const s = value.trim();
     if (!s) return "";
-    if (s.length > MAX_RETURN_URL_LEN) {
-      console.warn("MoyMoy: return_url refused (too long) — origin " + origin);
+    if (s.length > MAX_RAW_RETURN_URL_LEN) {
+      console.warn("MoyMoy: return_url refused (too long to parse) — origin " + origin);
       return "";
     }
     let parsed;
