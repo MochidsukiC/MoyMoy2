@@ -1232,8 +1232,10 @@ function errLabelFor(res) {
 
 /* ─── EC 決済の承認オーバーレイ ───────────────────────────────────
    表示する金額・加盟店・注文内容は、すべて `GET /wallet/payment/intent` の
-   応答だけから来る。起動してきたアプリが渡せたのは intent_id ひとつで、
-   それ以外は読まずに捨ててある（moymoy-sdk.js の readLaunchIntent）。
+   応答だけから来る。起動してきたアプリから読むのは intent_id と return_url の
+   2つだけで、それ以外は読まずに捨ててある（moymoy-sdk.js の readLaunchIntent）。
+   return_url はこの画面には一切届かない — OS が attest した origin と同一ホスト
+   であることを確かめたうえで、戻り先として OS へ返すだけの値である。
    ここが崩れると「見えている内容と請求内容が違う」決済が作れてしまう。 */
 
 const MOY_NEW_MERCHANT_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1736,8 +1738,9 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   /**
    * 承認画面が表示するものを取りに行く。
    *
-   * 起動元アプリが渡せたのは intent_id だけで、金額も店名も注文内容も
-   * この応答からしか読まない。ここを他の入力で補完すると WYSIWYS が崩れる。
+   * 起動元アプリから読むのは intent_id と（戻り先としてだけ使う）return_url の
+   * 2つだけで、金額も店名も注文内容もこの応答からしか読まない。ここを他の入力で
+   * 補完すると WYSIWYS が崩れる。
    */
   async function loadPaymentIntent(intentId, isAlive = () => true) {
     try {
@@ -1846,15 +1849,27 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   /**
    * 起動してきたアプリへ戻る。
    *
-   * 戻り先は OS が刻んだ `from` だけを使う。加盟店が intent に自己申告した
-   * `launch_app_id` を戻り先にすると、お店が「支払い後にユーザーをどこへ
-   * 送るか」を決められることになり、偽の完了画面へ誘導する余地ができる。
+   * 戻り先の「アプリ」は今も OS が刻んだ `from` だけを使う。加盟店が intent に
+   * 自己申告した `launch_app_id` を戻り先にすると、お店が「支払い後にユーザーを
+   * どこへ送るか」を決められることになり、偽の完了画面へ誘導する余地ができる。
+   *
+   * `return_url` が足すのは「その発信元のどのページへ戻るか」だけである。Web 起点
+   * の起動（MochiPOS の `.mnn` 注文ページ → MoyMoy）では `from` が
+   * `com.mochi.browser` になるため、それだけではブラウザが前面に出るだけで元の
+   * ページには戻らない。そこを埋めるのがこの値で、`readLaunchIntent` が OS の
+   * attest した `origin` と同一ホストであることを確かめた URL か "" しか入れない
+   * （`moymoy-sdk.js` の `webReturnUrl`）。つまり加盟店は自分のサイトの中にしか
+   * ユーザーを送り返せず、上の不変条件は一切緩まない。
+   *
+   * アプリ間起動（PiggleShop2 など）には `origin` が付かないので `return_url` は
+   * 必ず "" になり、`launchApp` は従来どおり引数 1 個で呼ばれる。よってここに
+   * 追加の分岐は要らない。
    */
   async function returnToShop() {
     const from = pendingPayment && pendingPayment.from;
     if (!from) { clearPayment(); return; }
     setPayBusy(true); setPayErr(null);
-    const r = await MoyMoy.launchApp(from);
+    const r = await MoyMoy.launchApp(from, pendingPayment.return_url);
     if (!mountedRef.current) return;
     setPayBusy(false);
     if (r && r.accepted) { clearPayment(); return; }

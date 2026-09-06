@@ -1,4 +1,4 @@
-/* global window, fetch, location, URLSearchParams, mochi, crypto, localStorage */
+/* global window, fetch, location, URL, URLSearchParams, mochi, crypto, localStorage */
 /* =====================================================================
    MoyMoy — client SDK (piggle-sdk.js pattern)
 
@@ -221,18 +221,161 @@
       : "k-" + Date.now() + "-" + Math.floor(Math.random() * 1e9);
 
   // ── launch intent (OS → this app) ───────────────────────────────────────────
+  // Same number as `com.mochi.browser`'s `MAX_LAUNCH_URL_LEN`, and it has to be:
+  // the browser re-applies that cap to `params.url` when we hand the value back,
+  // so a longer URL is refused over there no matter what we decide here. Keeping
+  // one here that is any wider would only buy a return button that does nothing
+  // when it is pressed.
+  const MAX_RETURN_URL_LEN = 2048;
+
   /**
-   * Reduce one OS launch intent to the only field this app is willing to act on.
+   * Reduce a merchant-supplied `return_url` to a page this app may send the
+   * payer back to, or "" when there is none it is allowed to use.
    *
-   * `params` is whatever the LAUNCHING app chose to put there, and it is not
-   * trusted for anything: only `intent_id` is lifted out, every other key is
-   * dropped unread. The approval screen's amount, merchant and description come
-   * from `GET /wallet/payment/intent` — the backend's own record — so a shop
-   * cannot make the screen say one thing while billing another (WYSIWYS).
+   * `origin` is the OS's attestation of which `.mnn` page started this launch
+   * (`docs/mobile/web-launch.md`) — the one field of a web-started intent the
+   * page cannot write for itself — and every rule below is a comparison against
+   * it. The whole point is that a shop may return the payer INTO ITS OWN SITE
+   * and nowhere else: a shop that could name any URL could drop a just-paid user
+   * on a page of its choosing, which is where a convincing fake receipt (or a
+   * "your payment failed, pay again here") would live.
    *
-   * `from` and `age_ms` DO come from here, and only from here: the OS stamps
-   * `from` with the attested sender id, which is the one thing about the caller
-   * that cannot be forged.
+   * The value is never rendered and never reaches the approval screen. It is a
+   * destination only, and it goes straight back to the OS.
+   */
+  function webReturnUrl(value, origin) {
+    // No attested origin means this was an app→app launch, and there is nothing
+    // to hold the URL against. Refuse to carry one AT ALL rather than fall back
+    // to a looser check: the origin match IS the guarantee, so without an origin
+    // there is no guarantee left to make — and accepting it anyway would let any
+    // app that can launch us, with no web page and no host attestation anywhere
+    // in the chain, name an arbitrary URL and have us ask the browser to open it.
+    if (typeof origin !== "string" || origin === "") return "";
+    if (typeof value !== "string") return "";
+    const s = value.trim();
+    if (!s) return "";
+    if (s.length > MAX_RETURN_URL_LEN) {
+      console.warn("MoyMoy: return_url refused (too long) — origin " + origin);
+      return "";
+    }
+    let parsed;
+    let attested;
+    try {
+      // No base URL on purpose: a relative reference has no meaning across an
+      // app boundary, and `new URL` rejects it (as it does `http://` with no
+      // host). `origin` goes through the SAME parser so the host comparison
+      // below is between two values normalized identically.
+      parsed = new URL(s);
+      attested = new URL(origin);
+    } catch {
+      // The exception is deliberately not bound and never printed. A `TypeError`
+      // from `new URL` is free to quote the input it choked on (engines differ,
+      // and nothing in the spec forbids it), so logging `e.message` would hand
+      // the console the very `user:password@host` this gate exists to refuse —
+      // the same leak, arriving through the exception instead of the value.
+      console.warn("MoyMoy: return_url refused (not an absolute URL) — origin " + origin);
+      return "";
+    }
+    // `URL` already lower-cases the scheme; comparing the lower-cased value
+    // keeps the rule ("exactly http: or https:, case-insensitive") true of the
+    // input. Anything else — `javascript:`, `mochi-internal:` — is refused here
+    // and would be refused by the browser too.
+    const scheme = String(parsed.protocol).toLowerCase();
+    if (scheme !== "http:" && scheme !== "https:") {
+      console.warn("MoyMoy: return_url refused (scheme is not http/https) — origin " + origin);
+      return "";
+    }
+    // Userinfo, tested on the RAW authority and not on `parsed.username` /
+    // `parsed.password` alone. Those two are "" for an EMPTY userinfo
+    // (`https://@evil.mnn/`, `https://:@evil.mnn/`) and the parser then drops
+    // the `@` from `href` entirely — so a username/password test by itself
+    // accepts an authority the sender deliberately wrote an `@` into and hands
+    // back a URL that is not the string that was sent. `com.mochi.browser`
+    // refuses that exact shape for the same reason, so anything we let through
+    // here it would stop anyway, and the payer would be left pressing a return
+    // button that silently does nothing.
+    //
+    // Slice the authority out of the trimmed input: everything after the
+    // scheme's `:` and its leading slashes, up to the first `/`, `\`, `?` or `#`
+    // (WHATWG treats `\` as `/` for http(s), and `http:/host/` is a valid
+    // spelling of the same authority — which is why this cuts at the scheme
+    // colon rather than at `://`). An `@` in the PATH —
+    // `http://a.mnn/mail/user@example` — is untouched: the slice stops at the
+    // first separator.
+    const afterScheme = s.slice(s.indexOf(":") + 1).replace(/^[/\\]+/, "");
+    const sepAt = afterScheme.search(/[/\\?#]/);
+    const authority = sepAt < 0 ? afterScheme : afterScheme.slice(0, sepAt);
+    if (authority.indexOf("@") >= 0 || parsed.username !== "" || parsed.password !== "") {
+      console.warn("MoyMoy: return_url refused (userinfo in authority) — origin " + origin);
+      return "";
+    }
+    if (!parsed.hostname) {
+      console.warn("MoyMoy: return_url refused (empty host) — origin " + origin);
+      return "";
+    }
+    // The rule itself: the same HOST as the page the OS says launched us.
+    // Deliberately NOT the same scheme and NOT the same port — a host is a
+    // `.mnn` name with an owner, and which scheme or port that owner serves its
+    // own checkout page on is the owner's business, not ours; requiring a match
+    // there would break a shop that redirects `http` → `https` without stopping
+    // anything, since both spellings belong to the same person either way.
+    //
+    // Both sides come out of the same `URL` parser. Comparing a parsed hostname
+    // against a hand-sliced one is how a normalization mismatch (an IDN form, a
+    // bracketed IPv6 literal) turns into a hole; WHATWG has already lower-cased
+    // both, and `toLowerCase` is belt and braces.
+    //
+    // The root dot is the one place where the same parser is NOT enough, because
+    // the attested side has been through a second normalizer this one does not
+    // replicate: the host gate accepts `store.mnn.` (`host_is_mnn` trims the
+    // dot) and `validate_web_origin` then runs the host through
+    // `MochiDomain::parse`, whose `canonical_host` strips it — while WHATWG
+    // keeps it. Without folding it here, a page served at
+    // `http://store.mnn./order` that returns `location.href` (the idiom
+    // `docs/mobile/web-launch.md` documents) would compare `store.mnn.` against
+    // `store.mnn` and lose its return button over a spelling both sides already
+    // agree is one host. One dot, matching `canonical_host` — nothing further,
+    // since no host either parser mints ends in two.
+    const rootHost = (h) => h.toLowerCase().replace(/\.$/, "");
+    if (rootHost(parsed.hostname) !== rootHost(attested.hostname)) {
+      console.warn("MoyMoy: return_url refused (host is not the launching origin) — origin " + origin);
+      return "";
+    }
+    // `href`, not the raw input: the browser gates on `parsed.href` as well, so
+    // returning the same normalization means the URL we accepted is exactly the
+    // one it will act on.
+    const href = parsed.href;
+    // Which is also why the cap is measured HERE and not only on the input.
+    // `new URL` percent-encodes raw non-ASCII, and that is a NINEFOLD growth for
+    // Japanese (`あ` → `%E3%81%82`), so a 300-character order page with a product
+    // name in the query hands back a 2,700-character href: accepted here,
+    // refused over there for length, and the payer presses a return button that
+    // does nothing. Measuring the input alone is measuring a value nobody acts
+    // on. The pre-parse check stays as a cheap bound before `new URL`; this is
+    // the one that has to hold. `href` is all-ASCII, so its length is also its
+    // byte length, which is the unit the browser side counts in.
+    if (href.length > MAX_RETURN_URL_LEN) {
+      console.warn("MoyMoy: return_url refused (too long once normalized) — origin " + origin);
+      return "";
+    }
+    return href;
+  }
+
+  /**
+   * Reduce one OS launch intent to the only fields this app is willing to act on.
+   *
+   * `params` is whatever the LAUNCHING app chose to put there, and next to none
+   * of it is trusted: `intent_id` and `return_url` are lifted out, every other
+   * key is dropped unread. The approval screen's amount, merchant and
+   * description come from `GET /wallet/payment/intent` — the backend's own
+   * record — so a shop cannot make the screen say one thing while billing
+   * another (WYSIWYS), and `return_url` never reaches the screen at all: it is
+   * checked against `origin` and then only ever handed back to the OS.
+   *
+   * `from`, `origin` and `age_ms` DO come from here, and only from here: the OS
+   * stamps `from` with the attested sender id and `origin` with the attested
+   * origin of the `.mnn` page behind a web-started launch — the two things about
+   * the caller that cannot be forged.
    */
   function readLaunchIntent(raw) {
     if (!raw || typeof raw !== "object") return null;
@@ -246,8 +389,25 @@
     // and `qstr` escapes whatever we pass.
     if (id.indexOf("pi_") !== 0 || id.length > 128) return null;
     const from = typeof raw.from === "string" ? raw.from : "";
+    // Attested by the host, so it is carried through exactly as stamped. Absent
+    // on an app→app launch, and that absence is load-bearing rather than a gap:
+    // it is what makes `webReturnUrl` refuse every return URL on that path, so
+    // the app→app flow keeps behaving exactly as it did before web launches
+    // existed (`docs/mobile/web-launch.md`).
+    const origin = typeof raw.origin === "string" ? raw.origin : "";
     const age = Number(raw.age_ms);
-    return { intent_id: id, from, age_ms: Number.isFinite(age) && age >= 0 ? age : 0 };
+    // A `return_url` that does not check out collapses to "" and is never a
+    // reason to drop the intent: the payment is between the payer and the
+    // backend and stands with or without a way back to the page that started it.
+    // Losing the return button is the entire consequence.
+    const returnUrl = webReturnUrl(params && params.return_url, origin);
+    return {
+      intent_id: id,
+      from,
+      origin,
+      return_url: returnUrl,
+      age_ms: Number.isFinite(age) && age >= 0 ? age : 0,
+    };
   }
 
   // ── host attestation ────────────────────────────────────────────────────────
@@ -500,12 +660,22 @@
     // attested `from`, never a merchant-declared `return_app_id` / `launch_app_id`
     // — those are self-reported and would make the shop the authority on where
     // the user lands after paying.
-    launchApp: async (appId) => {
+    //
+    // `returnUrl` picks WHICH PAGE inside that app, and the same rule holds one
+    // level down: the only value that may be passed here is one `readLaunchIntent`
+    // has already held against the OS-attested `origin` (`webReturnUrl`), which
+    // is what keeps a shop confined to its own host. Callers do not get to widen
+    // this into a general params channel — exactly one key, `url`, is forwarded,
+    // so nothing else a caller happens to be holding can ride along to the OS.
+    // Omit it (or pass "") and this is the byte-for-byte call it has always been.
+    launchApp: async (appId, returnUrl) => {
       if (!(window.mochi && mochi.os && mochi.os.apps && mochi.os.apps.launch)) {
         return { accepted: false, reason: "no_host" };
       }
       try {
-        return await mochi.os.apps.launch(appId);
+        return typeof returnUrl === "string" && returnUrl !== ""
+          ? await mochi.os.apps.launch(appId, { url: returnUrl })
+          : await mochi.os.apps.launch(appId);
       } catch (e) {
         if (e && e.code === "SCOPE_DENIED") {
           console.error("MoyMoy: the app manifest does not declare apps.launch", e);

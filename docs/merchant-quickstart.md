@@ -8,6 +8,7 @@ MoyMoy を自分の EC アプリの決済手段として組み込むための最
 [EC バックエンド] ──① intent 作成 (API キー)──────────▶ [moymoy-cs]
       │                                                     ▲
       │ ② os.apps.launch("com.mochi.moymoy", {intent_id})   │
+      │    （`.mnn` Web ページからの起動は {intent_id, return_url}。§6）
 [EC アプリ] ─────────────────────────────────▶ [MoyMoy アプリ]
                                                     │ ③ 承認画面（表示は moymoy-cs の記録のみ）→ PIN
 [EC アプリへ復帰] ◀─────────────────────────────────┘
@@ -129,20 +130,37 @@ curl -X POST https://moymoy.cs.mnn/merchant/v1/intent/create \
 - `amount`: 整数エメ、1 以上 `MAX_AMOUNT`(10億) 以下。
 - `description`: 加盟店が入力した文言として承認画面に引用枠で表示される。制御文字・bidi制御・未割当は拒否される。
 - `expires_in_secs`: 省略時 600 秒。60〜1800 秒の範囲。短すぎると PIN 入力が間に合わず、長すぎると閉店後の加盟店に対する承認画面が生き続ける。
-- `launch_app_id`（任意）: 決済を開始したアプリの `app_id` の自己申告。MoyMoy は OS 由来の起動元と突き合わせて不一致なら警告バナーを出す（ブロックはしない）。
+- `launch_app_id`（任意）: 決済を開始したアプリの `app_id` の自己申告。MoyMoy は OS 由来の起動元と突き合わせて不一致なら警告バナーを出す（ブロックはしない）。**Web 起点（§6「`.mnn` の Web ページから起動する場合」）では OS 由来の起動元は必ず `com.mochi.browser` になるため、自分のアプリ id を申告すると正当な決済でも警告バナーが出る。**
 - `payer_hint_handle`（任意）: 支払者を `@handle` で指定する。指定すると他の口座からの承認・拒否は `payer_mismatch` で拒否される（支払者を「縛る」のであって「代わりに払わせる」のではない）。
 
 加盟店ごとの発行上限（拘束されない売上への代償措置）: 未決済 intent 件数の上限（既定20件）と 24h 発行合計金額の上限（既定50,000エメ）。超えると `too_many_open_intents` / `daily_issue_cap` で拒否される。引き上げは `/merchant/portal/limits`（セッション + PIN）のみ。
 
 ## 6. MoyMoy を起動する
 
-MochiOS の launch-intent 機構で、`intent_id` だけを渡して MoyMoy を起動する。
+MochiOS の launch-intent 機構で MoyMoy を起動する。EC アプリ（ネイティブアプリ）からの起動は `intent_id` のみでよい。
 
 ```js
 mochi.os.apps.launch("com.mochi.moymoy", { intent_id: "pi_..." });
 ```
 
-自分の manifest に `apps.launch` の宣言（`ServiceScope`）が必要。**MoyMoy は `params` から `intent_id` だけをホワイトリスト抽出し、他のキーは読まない** — 金額や加盟店名を一緒に渡しても無視される。表示は必ず moymoy-cs 自身の記録から取る。
+自分の manifest に `apps.launch` の宣言（`ServiceScope`）が必要。**MoyMoy は `params` から `intent_id` と `return_url` の2つだけをホワイトリスト抽出し、他のキーは読まない** — 金額や加盟店名を一緒に渡しても無視される。表示は必ず moymoy-cs 自身の記録から取る。なお `return_url` が意味を持つのは下記の Web 起点のときだけで、**アプリ間起動では OS が origin を刻まないため常に捨てられる**（突き合わせる相手が無い戻り先は受け取らない）。
+
+### `.mnn` の Web ページから起動する場合
+
+MochiPOS のように注文サイト自体が `.mnn` の Web ページであり、アプリではない場合は、MochiOS の Web 起点 launch-intent（詳細は MochiOS 側 `docs/mobile/web-launch.md`）を使う:
+
+```js
+mochi.os.apps.launch("com.mochi.moymoy", {
+  intent_id: "pi_...",
+  return_url: location.href,
+});
+```
+
+- ユーザー操作（クリック等）起点でなければ OS に拒否される。main frame からのみ呼べ、ページの host が `*.mnn` である必要があり、送信元 origin ごとに1秒1回のレート制限がある（詳細は MochiOS 側ドキュメント参照）。
+- `return_url` は**自分のサイトのホストでなければ無視される**。OS が attest した origin とホストが一致しない URL は使われず、その場合は決済後にブラウザが前面化されるだけで元のページには戻らない。これは「加盟店が申告した戻り先を信じない」という MoyMoy の既存方針そのもので、意地悪ではなく、偽の完了画面へ誘導する経路を作らないための制約である。
+- **正規化後 2048 文字**の上限がある。クエリに生の日本語を大量に載せると percent-encode で最大9倍に膨らみ（`あ` → `%E3%81%82`）上限を超え、戻れなくなる。戻り先 URL は短く保つこと。
+- Web 起点では OS 由来の起動元（`from`）が `com.mochi.browser` になる（§5「`launch_app_id`」参照）。自分のアプリ id を申告すると承認画面に不一致の警告バナーが出てしまうので、Web 起点なら `com.mochi.browser` を申告するか省略すること。
+- ページ側が「決済から戻ってきたこと」を知る手段は launch-intent 機構自体には無い。`visibilitychange` かバックエンドへのポーリングで検知すること。**§7の「クライアントの申告を信じない」原則はここでも一切緩まない**——決済結果は必ず自分のバックエンド経由で moymoy-cs へ照会して確定させる。
 
 ## 7. 結果を受け取る（最重要）
 
