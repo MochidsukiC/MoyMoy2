@@ -21,7 +21,7 @@ MoyMoy を自分の EC アプリの決済手段として組み込むための最
 ## 2. 前提
 
 - 加盟店になるには MoyMoy の口座（handle + PIN）が要る。**売上は登録者本人の口座に入る**。
-- 金額は**整数エメ**のみ（小数不可）。丸め方は §8。
+- 金額は **1/100 エメの整数マイナーユニット**で送る（フィールド名は `amount_minor`。`1600` が 16 エメ）。§5・§8。
 - moymoy-cs は `https://moymoy.cs.mnn` の e2e TLS backend。到達方法は §4。
 
 ## 3. 加盟店登録と API キー
@@ -51,12 +51,21 @@ curl -X POST https://moymoy.cs.mnn/merchant/portal/register \
 
 **`api_key` は応答に一度だけ出る。DB にはハッシュしか残らないので、取り逃すと再表示できない。** 環境変数などに置き、コードに埋め込まない。
 
+`api_key_prefix` は `moy_sk_` という接頭辞そのものではなく、**平文キーの先頭13文字**（`moy_sk_` + 本体6文字）。手元のどのキーが登録済みかを照合するなら `key.startsWith(api_key_prefix)`。閉店した加盟店では NULL になる。
+
 制約:
 - 名前は登録後**変更不可**（リネーム API は無い。承認画面表示中に名前が変わる余地を作らないため）。
 - 名前は同形異字（例: `PiggleShoр2` のキリル文字 `р`）とスクリプト混在を拒否し、`moymoy`/`公式`等の運営語彙は予約語として拒否される。
-- 1口座あたり保有できる加盟店は最大3件（閉じた分を除く）。
+- **保存され返ってくる店名は NFKC 正規化 + trim 後の文字列**（`㈱` は `(株)` に変わり、文字数も 1 から 3 に増える）。送った文字列がそのまま残る前提を置かず、表示には応答の `name` を使う。
+- 1口座あたり保有できる加盟店は最大3件で、**停止中（`disabled`）も枠を数える**。枠を返せるのは閉店（`/merchant/portal/close`）だけで、その閉店も未決済 intent が1件でもあれば `open_intents`、エスクロー中の資金が残っていれば `escrowed_funds` で拒否される。**閉じた加盟店は再オープンできない**（登録し直す）。
+- **登録に成功すると10分間、同じ口座からの次の登録が 429 になる。3件を続けて登録することはできない。** 名前の打ち間違い・PIN 違い・枠超過のような失敗ではこの10分枠を消費しないので即座に打ち直せる（ただし試行そのものには5回/10秒のバースト枠がある）。
 
-登録失敗時のエラー: `bad_name`（`reason`: `empty`/`too_long`/`invisible_char`/`stacked_marks`/`reserved_name`/`mixed_script`/`unnameable`）、`bad_sub`（同様）、`name_taken`、`too_many_merchants`。
+登録失敗時のエラー:
+- `bad_name`（`reason`: `empty`/`too_long`/`invisible_char`/`stacked_marks`/`reserved_name`/`mixed_script`/`unnameable`）、`bad_sub`（同様）、`name_taken`。
+- `too_many_merchants` — 応答に `limit` が入るので、3 という値を加盟店側に持たなくてよい。
+- `email_verification_required` — **HTTP 200** + `{"ok":false,"error":"email_verification_required"}`。フィールドではなくエラーコードで返る。条件は「サーバの email 機能が有効」かつ「その口座のメールが未検証」の AND で、`GET /auth/config` の `email_enabled` を見れば前者は事前に判別できる。判定は**PIN 照合の後**なので、PIN が違えば `invalid_pin` が先に返る。
+- `invalid_pin` / `locked` / `too_many_attempts` — いずれも HTTP 200 で、`retry_after_ms` が付く。
+- `rate_limited` — **HTTP 429** + `retry_after_ms`。**`Retry-After` ヘッダは付かない**ので、待ち時間は本文から読む。
 
 ### 3-2. キーのローテーション・停止
 
@@ -74,7 +83,15 @@ curl -X POST https://moymoy.cs.mnn/merchant/portal/status \
 
 キーのローテーションはセッション + PIN が要る。**API キーが漏れても、加盟店設定の乗っ取りやキー単体での再発行はできない。**
 
-> アプリ内の加盟店管理画面（キー表示/rotate・停止・上限引き上げの UI）は開発中（Phase 2）。現時点では上記のように API を直接叩く。
+> アプリ内にも加盟店管理画面がある（キー接頭辞と最終利用時刻の表示・キー再発行・停止/再開・発行上限の変更・売上ページ）。ボトムナビのタブからは入れず、到達手順は**ウォレット画面ヘッダ右上のアバター → シート「アカウント」の「設定」→「加盟店管理（MoyMoy で代金を受け取る）」**。登録もここから行える（一覧下部の「＋ 加盟店を登録する」→「PIN で確認して登録」→ PIN 画面の「登録する」）。アプリ自身の表記法に揃えるなら「設定 › 加盟店管理」。閉店（`/merchant/portal/close`）の UI は無いので、閉店だけは API を直接叩く。
+
+### 3-3. 応答の読み方と副作用
+
+- **業務的な失敗はほぼ全て HTTP 200 + `{"ok":false,"error":...}` で返る。** 非 200 は 401 / 403 / 429 / 500 と、リクエストがそもそも読めなかった 400 / 415 / 422 だけ。**ステータスコードで成否を判定する実装は誤動作する** — 見るのは `ok`。
+- ただし **400 / 415 / 422 の本文は JSON ではない**（axum の抽出器が返す text/plain で、`ok` フィールドを持たない）。415 は `content-type: application/json` の付け忘れ、422 は JSON としては読めるが型が合わない場合（必須フィールドの欠落、`amount_minor` に `1600.0` のような float や文字列を入れた場合）。**`amount_minor` の型を間違えると `unsupported_amount_unit` ではなく 422 になる** — serde のデータエラーの方が先に出るため。本文を無条件に `JSON.parse` するクライアントはここで例外を投げる。
+- **401 と 403 の境界**: 「停止中（`disabled`）」は 403 `merchant is disabled`、「閉店（`deleted`）」は **401** `invalid merchant API key`。閉店が `api_key_hash` を NULL にするため、閉店した加盟店のキーは無効なキーと区別が付かなくなる。
+- `GET /merchant/v1/intent` は**読み取りに見えて副作用がある**。キーが提示されるたび `api_key_last_used_unix_ms` を更新し（加盟店管理画面に「キー最終利用」として出る、**鍵の漏洩を検知するための信号**）、読み取りレート枠を1消費する（120回/60秒）。鍵の疎通確認に使うのは構わないが、注文と無関係に定期ポーリングすると最終利用時刻が常に「たった今」になり、漏洩検知が潰れる（決済を待つ間のポーリングは §7 のとおりで、これは注文の分だけで止まる）。
+- 存在しない `intent_id` も他店の `intent_id` も、どちらも 200 `unknown_intent` で返り区別が付かない。他店の注文フローを覗く手段にしないための意図的な設計。
 
 ## 4. 到達方法（ここでつまずきやすい）
 
@@ -117,17 +134,17 @@ curl -X POST https://moymoy.cs.mnn/merchant/v1/intent/create \
   -H 'Authorization: Bearer moy_sk_...' \
   -d '{
     "idem_key": "order-abc123",
-    "amount": 16,
+    "amount_minor": 1600,
     "description": "りんご 1個",
     "order_ref": "abc123",
     "expires_in_secs": 600
   }'
-# → {"ok":true,"intent_id":"pi_...","state":"created","amount":16,"expires_unix_ms":...}
+# → {"ok":true,"intent_id":"pi_...","state":"created","amount_minor":1600,"expires_unix_ms":...}
 ```
 
 フィールド:
 - `idem_key`: **自分の注文 ID を使う**。同じ `idem_key` での再送は新しい intent を作らず、最初の応答をそのまま再生する（自分の加盟店の名前空間内でのみ有効なので、他加盟店の `idem_key` とは衝突しない）。
-- `amount`: 整数エメ、1 以上 `MAX_AMOUNT`(10億) 以下。
+- `amount_minor`: **1/100 エメの整数マイナーユニット**（`1600` = 16 エメ）。1 以上 `MAX_AMOUNT`(1,000億マイナーユニット = 10億エメ) 以下。旧 `amount`（整数エメ建て）を送ると **400 `unsupported_amount_unit`**、どちらも無ければ **400 `missing_amount_minor`** で、レート制限にも冪等リプレイにも届く前に落ちる。**この改名自体が安全機構**で、キーを使い回していたら片側のデプロイが遅れたときに単位ズレが検知されずに通ってしまう（加盟店未更新なら100倍、ウォレット未更新なら1/100を請求して、どちらも商品は出る）。DEV.md §金額の単位。
 - `description`: 加盟店が入力した文言として承認画面に引用枠で表示される。制御文字・bidi制御・未割当は拒否される。
 - `expires_in_secs`: 省略時 600 秒。60〜1800 秒の範囲。短すぎると PIN 入力が間に合わず、長すぎると閉店後の加盟店に対する承認画面が生き続ける。
 - `launch_app_id`（任意）: 決済を開始したアプリの `app_id` の自己申告。MoyMoy は OS 由来の起動元と突き合わせて不一致なら警告バナーを出す（ブロックはしない）。**Web 起点（§6「`.mnn` の Web ページから起動する場合」）では OS 由来の起動元は必ず `com.mochi.browser` になるため、自分のアプリ id を申告すると正当な決済でも警告バナーが出る。**
@@ -169,7 +186,7 @@ EC アプリが復帰したら、**自分のバックエンド経由で** moymoy
 ```bash
 curl https://moymoy.cs.mnn/merchant/v1/intent?intent_id=pi_... \
   -H 'Authorization: Bearer moy_sk_...'
-# → {"ok":true,"intent":{"intent_id":"pi_...","state":"paid","amount":16,"payer_ref":"...","refunded":false,...}}
+# → {"ok":true,"intent":{"intent_id":"pi_...","state":"paid","amount_minor":1600,"payer_ref":"...","refunded":false,...}}
 ```
 
 **クライアントの「払いました」という申告を信じてはならない。** 改造されたクライアントは UI 上どんな状態でも表示できるので、EC アプリ側の判断には何の意味も無い。信じてよいのはこの照会の応答だけ。
@@ -180,23 +197,28 @@ curl https://moymoy.cs.mnn/merchant/v1/intent?intent_id=pi_... \
 
 ## 8. 金額の扱い
 
-MoyMoy は整数エメしか受け付けない。小数価格を持つカタログを整数エメに変換するのは加盟店側の責任。**PiggleShop の実装が worked example**（`server/piggleshop-cs/src/orders.rs`。金額計算ロジックは実装・テスト済みだが、moymoy-cs への intent 作成呼び出しはまだ配線されていない ── §11 参照）:
+MoyMoy が受け取るのは 1/100 エメの整数マイナーユニットだけで、浮動小数は一切入らない。小数価格を持つカタログをこの整数に変換するのは加盟店側の責任。**PiggleShop の実装が worked example**（`server/piggleshop-cs/src/orders.rs`。金額計算ロジックは実装・テスト済みだが、moymoy-cs への intent 作成呼び出しはまだ配線されていない ── §11 参照）:
 
 1. カタログ価格を **1/100 エメ単位の整数**（"cents"）に変換してから足し算する。浮動小数のまま `0.05 + 0.05 + 0.05` を足すと `0.15000000000000002` のような誤差が乗る。
-2. 丸めはカート**合計に一度だけ**適用し、**切り上げる**。行ごとに丸めると誤差が複利的に膨らむ（36行の 0.05 エメ商品を行ごとに切り上げると 36 エメ請求になりかねないところを、合計一度なら 4 エメで済む）。切り捨てや四捨五入は、安い商品だけの小さなカートを 0 エメで確定させてしまう危険がある。
+2. **その合計がそのまま `amount_minor`。整数エメへ丸め直してはいけない。** 丸めた数を `amount_minor` に入れると単位は正しいまま請求額が 1/100 になり、`unsupported_amount_unit` のような検知は一切効かない（キー名は合っているため）。
+3. float → integer の変換は `truncate` ではなく `round`。**この変換は行ごとに一度だけ**行い、以降は整数で合算する。合計を float のまま持って最後に丸めると、行ごとに見せた価格の和と請求額が一致しなくなる。カタログの刻みが 1/100 エメより細かい場合、1/100 エメ未満の行は 0 に丸まりうる — その行を 0 で通すか 1 に切り上げるかは加盟店の値付けの問題で、MoyMoy 側の要求は `amount_minor >= 1`（カート全体で）だけ。
 
 ```rust
-// cents は i64、価格計算の唯一の float→integer 境界
-let cents = (price * 100.0).round(); // truncate ではなく round — 4.25 が 4.2499999… で来ても 425 になる
-// … 全行を cents で合算 …
-let eme = (total_cents + 99) / 100; // 合計に一度だけ、切り上げ
+// 価格計算の唯一の float→integer 境界。`as i64` まで含めてここで整数にする
+let cents = (price * 100.0).round() as i64; // truncate ではなく round — 4.25 が 4.2499999… で来ても 425
+// … 全行を i64 の cents で合算 …
+let amount_minor = total_cents; // 合計がそのまま送る値。÷100 も切り上げもしない
 ```
+
+`amount_minor` は整数として直列化すること。`1600.0` のような float を送ると、後述の 422 で落ちる（`unsupported_amount_unit` にはならない）。
 
 ## 9. エラーとリトライ
 
 | コード | 意味 | 対処 |
 |---|---|---|
-| `bad_amount` | 金額が 1 未満 または `MAX_AMOUNT`(10億) 超 | 金額を直す |
+| 400 `unsupported_amount_unit` | 旧 `amount`（整数エメ建て）を送った | `amount_minor`（1/100 エメ）に直す。§5 |
+| 400 `missing_amount_minor` | `amount_minor` も `amount` も無い | `amount_minor` を入れる |
+| `bad_amount` | `amount_minor` が 1 未満 または `MAX_AMOUNT`(1,000億マイナーユニット=10億エメ) 超 | 金額を直す |
 | `bad_description` / `bad_order_ref` | 不正な文字列（`reason` 参照） | 制御文字・bidi制御・連続する結合文字を除く |
 | `bad_expires_in_secs` | TTL が 60〜1800 秒の範囲外 | 範囲内の値に直す（`min`/`max` が応答に入る） |
 | `too_many_open_intents` | 未決済 intent が上限（既定20）超過 | 古い intent を `cancel` するか、上限を portal で引き上げる |
@@ -205,8 +227,8 @@ let eme = (total_cents + 99) / 100; // 合計に一度だけ、切り上げ
 | `unknown_intent` | 存在しない、または他加盟店の intent_id | `intent_id` を確認する |
 | `already_paid` | 既に `paid`（cancel でも履行義務は消えない） | 履行済みか確認し、二重発送しない |
 | `not_cancelable` | `paid`/`canceled`/`expired` を再度 cancel した | 現在の `state` を見て判断 |
-| 429 `rate_limited` | 呼び出し過多（作成30/分・照会120/分・登録は口座あたり1回/10分） | `retry_after_ms` 待って再試行 |
-| 401 `invalid merchant API key` | キーが誤り・失効済み | ローテーション済みでないか確認 |
+| 429 `rate_limited` | 呼び出し過多（作成30/分・照会120/分・登録は口座あたり1回/10分） | `retry_after_ms` 待って再試行（`Retry-After` ヘッダは無い） |
+| 401 `invalid merchant API key` | キーが誤り・失効済み・**閉店した加盟店のもの**（§3-3） | ローテーション済みでないか確認 |
 | 403 `merchant is disabled` | 加盟店が停止中 | portal で `active` に戻す |
 
 `idem_key` は再送に対して安全 ── 同じキーでの再作成は新しい intent を作らず最初の応答を返す。ネットワークエラー時はそのまま同じ `idem_key` でリトライしてよい。
@@ -225,7 +247,7 @@ let eme = (total_cents + 99) / 100; // 合計に一度だけ、切り上げ
 - **webhook は無い。** 結果はポーリングで取得する。
 - **加盟店主導の返金 API は無い。** 運営による強制返金のみ（CLI 経由、加盟店 API からは呼べない）。
 - **署名レシートは無い。** 照会は API キー + TLS の認証済みチャネルの応答をそのまま信頼できる前提。
-- **アプリ内の加盟店管理画面は開発中（Phase 2）。** 現時点では portal API を直接叩く。
+- **閉店（`/merchant/portal/close`）だけはアプリ内の加盟店管理画面に UI が無い。** 登録・キー再発行・停止/再開・発行上限の変更・売上ページは画面から行える（到達手順は §3-2）。
 - PiggleShop の `orders.rs` にある金額計算・状態機械は実装・テスト済みだが、**moymoy-cs への intent 作成呼び出しの配線自体は未実装**（Phase 3 待ち）。worked example として参照する際は計算ロジックのみを見ること。
 
 受容しているリスクや設計判断の背景（加盟店売上を拘束しない理由、第二要素を持たない理由など）は `DEV.md` を参照。
