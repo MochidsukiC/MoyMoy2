@@ -188,7 +188,7 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 **単位の検査**: `api.rs` の `whole_emeralds()` — チャージ・出金は `%100 != 0` を **400** で拒否（エメラルドは不可分）。送金・決済承認には `%100` 検査が**無く**、1 マイナーユニット（0.01エメ）から通る。
 
 ### デプロイの制約
-**MoyMoy と PiggleShop2 は同時にしかデプロイできない**。`attest` の署名ハッシュと `amount_minor` 契約が、MoyMoy サーバー・MoyMoy アプリ・PiggleShop2 サーバー・PiggleShop2 クライアントの4成果物に跨るため。加えて v9〜v12（エスクロー・履行完了通知API）は MoyMoy-cs と PiggleShop2-cs 間の契約にも跨る。**逆マイグレーションは存在しない**——エスクローは実際に金を移すため、列を消すと保留中の金の行き先情報が失われる。**今回は PiggleShop2 側の MC mod が変わる（配送 claim を叩くようになる）ため、Minecraft サーバーの停止と mod 入れ替えが必要**（従来のv8リリース時点では「Minecraft サーバーと mod は停止も変更も不要」だったが、今回は当てはまらない。MoyMoy 自身の Forge mod は無変更）。**v9〜v12はコミット済み・本番未適用**。現在のアプリバージョン: **0.6.0**。**アプリの GitHub リリースはアプリストア公開より前に作る必要がある**——インストーラは manifest の `bundle.url` を見て直接 GitHub から取得し、ローカルのリポジトリは見ない（`MochiOS2.0/mobile/cef-host/src/app_install.rs:188-189`）。
+**MoyMoy と PiggleShop2 は同時にしかデプロイできない**。`attest` の署名ハッシュと `amount_minor` 契約が、MoyMoy サーバー・MoyMoy アプリ・PiggleShop2 サーバー・PiggleShop2 クライアントの4成果物に跨るため。加えて v9〜v12（エスクロー・履行完了通知API）は MoyMoy-cs と PiggleShop2-cs 間の契約にも跨る。**逆マイグレーションは存在しない**——エスクローは実際に金を移すため、列を消すと保留中の金の行き先情報が失われる。**今回は PiggleShop2 側の MC mod が変わる（配送 claim を叩くようになる）ため、Minecraft サーバーの停止と mod 入れ替えが必要**（従来のv8リリース時点では「Minecraft サーバーと mod は停止も変更も不要」だったが、今回は当てはまらない。MoyMoy 自身の Forge mod は無変更）。**v9〜v12はコミット済み・本番未適用**。アプリの状態は**レジストリ登録済み（＝本番の利用者に届いている）が 0.6.0**、**GitHub リリース済みだがストア未登録が 0.7.0（エスクロー）と 0.8.0（Web 起点の戻り先 URL）**の二段になっている。この二つを分けて読むこと——0.8.0 を登録すると 0.7.0 のエスクロー一式も同時に本番へ出るため、登録は上記の同時デプロイ計画が整うまで行わない。**アプリの GitHub リリースはアプリストア公開より前に作る必要がある**——インストーラは manifest の `bundle.url` を見て直接 GitHub から取得し、ローカルのリポジトリは見ない（`MochiOS2.0/mobile/cef-host/src/app_install.rs:188-189`）。
 
 ---
 
