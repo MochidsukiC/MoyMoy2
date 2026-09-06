@@ -1,0 +1,27 @@
+// MoyMoy — Fabric 26.2 ビルドルート (mod/ の Forge 1.20.1 版とは別ルート)。
+// ForgeGradle 6 / Gradle 8.8 / JDK 17 の mod/ とは同居できないため独立させている。
+// 範: MochiOS2.0/minecraft/fabric-26.2/settings.gradle。
+pluginManagement {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+// foojay-resolver-convention は入れない: Loom の要求する Gson を古い Gson がシャドーイングし
+// 構成段階で失敗する (AdvancedVC2.0/fabric・MochiOS2.0/minecraft/fabric-26.2 の実測)。
+// mod/settings.gradle (Forge 版) は 0.8.0 を入れているが、あれは ForgeGradle 6 側の話であって
+// こちらへ持ち込んではいけない。JDK 25 は Gradle の toolchain 自動検出 (~/.jdks 等) で足りる。
+// 検出できない環境ではこのファイルではなく ~/.gradle/gradle.properties に
+//   org.gradle.java.home=<JDK 25 のパス>
+// を書くこと (リポジトリに個人環境の絶対パスを持ち込まない)。
+
+rootProject.name = 'moymoy-mod-fabric'
+
+// connector-core は include しない。MochiOS2.0 は別リポジトリであり、跨リポジトリの
+// composite build は採らない設計決定 (build.gradle の compileOnly files(...) で
+// ビルド済みクラスディレクトリを参照する)。

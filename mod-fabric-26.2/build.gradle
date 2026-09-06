@@ -1,0 +1,100 @@
+// MoyMoy — Fabric 26.2 receiver-extension mod (MochiOS connector, DEV.md 7.3)。
+//
+// mod/ の Forge 1.20.1 版と同じ Java ソースを 26.2 へ忠実移植したもの。MochiOS の
+// connector mod ("mochi") が提供する MochiMod.MNN_SERVER と
+// MnnHandler / MnnRequest / MnnResponse に依存する。コネクタ境界を跨ぐ API 面は
+// 素の JDK 型のみ (Minecraft 型は一切跨がない) なので、connector の dev クラスを
+// compileOnly 依存として素直にコンパイルできる。
+//
+// 26.x のバニラは非難読化なので mappings 行は無く、plugin も `-remap` 無しの
+// `net.fabricmc.fabric-loom`、mod 依存は `modImplementation` でなく `implementation`
+// (fabric-example-mod 26.2 / MochiOS2.0/minecraft/fabric-26.2 と同形)。
+plugins {
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    // Loom が Minecraft / Fabric の maven を自動で足す。追加は不要。
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MochiOS のビルド済みクラスディレクトリ (deobf / dev)。
+//
+// MochiOS2.0 は別リポジトリなので composite build (includeBuild) は採らず、
+// ビルド出力のクラスディレクトリを直接 compileOnly で参照する。参照前に
+// MochiOS2.0/minecraft/fabric-26.2 を一度ビルドしておくこと (:connector-core は
+// その依存として一緒に建つ)。
+//
+// 参照先が 2 本要る理由:
+//   A) connector-core/build/classes/java/main
+//        jp.houlab.mochidsuki.mochi.connector.net.Mnn* (MnnHandler / MnnRequest /
+//        MnnResponse) は connector-core にしか無い。
+//   B) fabric-26.2/build/classes/java/main
+//        MochiMod.MNN_SERVER はこちら。
+// fabric-26.2 の build/classes/java/main には connector/net/ が入らない —
+// connector-core は本番 jar へ zipTree で畳み込まれるだけで、クラスディレクトリには
+// 届かないため。よって A だけでも B だけでもコンパイルは通らない。
+//
+// 既定値は rootDir (= MoyMoy2/mod-fabric-26.2) から ../../ = D:\IdeaProjects 起点。
+// チェックアウト位置が違う場合は -Pmochi_root=<MochiOS2.0/minecraft のパス> で上書きする
+// (Forge 版 mod/build.gradle の -Pmochi_forge_classes を置き換える位置づけ。あちらは
+// クラスディレクトリを直接指していたが、こちらは 2 本要るので共通の親を 1 本で指す)。
+def mochiRoot = project.findProperty('mochi_root') ?:
+        new File(project.rootDir, '../../MochiOS2.0/minecraft').canonicalPath
+
+def mochiConnectorCoreClasses = new File(mochiRoot as String, 'connector-core/build/classes/java/main')
+def mochiFabricClasses = new File(mochiRoot as String, 'fabric-26.2/build/classes/java/main')
+
+dependencies {
+    // To change the versions see the gradle.properties file
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // compileOnly である点が本質的に重要: connector-core のクラスを MoyMoy の jar へ
+    // 畳み込んではいけない。mochi 側の jar が既に同梱しており、同一 FQCN が別の
+    // ClassLoader 経路で二重ロードされる (MnnRequest が MnnRequest と等しくならない)。
+    // 実行時の提供元はサーバに並んで載る 'mochi' mod (fabric.mod.json の depends に宣言)。
+    compileOnly files(mochiConnectorCoreClasses, mochiFabricClasses)
+}
+
+// filesMatching のクロージャは実行時に走るため、その中の project.version は
+// Task.project アクセスになる (Gradle 9 で deprecated、Gradle 10 でエラー)。
+// 構成時に値を確定させてから渡す。
+def modVersion = project.version
+
+processResources {
+    inputs.property "version", modVersion
+
+    filesMatching("fabric.mod.json") {
+        expand "version": modVersion
+    }
+}
+
+// 日本語ロケール Windows で javac が windows-31j に落ちるのを防ぐ (ソースの日本語コメント)。
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 25
+    it.options.encoding = 'UTF-8'
+}
+
+java {
+    // MC 26.2 は Java 25 必須。デーモンの JDK に依存せずコンパイルが JDK 25 で走ることを
+    // 保証する。
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+// Forge 版 (mod/build.gradle) の minecraft{} / runs{} / jar manifest の Specification-* /
+// jar.finalizedBy('reobfJar') は Fabric には存在しないか不要。Loom が remapJar を
+// 自動で jar に接続する (26.x は非難読化なので実質コピー) ため何も足さない。

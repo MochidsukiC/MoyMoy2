@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "moymoy",
+  "version": "${version}",
+  "name": "MoyMoy",
+  "description": "MoyMoy — MochiOS in-world emerald wallet (DEV.md 7.3). A connector receiver extension that consumes a player's inventory emeralds to fund their moymoy.cs.mnn wallet balance, driven by the wallet backend as HTTP in MNN.",
+  "authors": [
+    "Mochidsuki"
+  ],
+  "license": "Proprietary",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "jp.houlab.mochidsuki.moymoy.MoyMoyMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "~26.2",
+    "java": ">=25",
+    "fabric-api": "*",
+    "mochi": ">=0.1.0"
+  }
+}

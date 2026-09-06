@@ -21,6 +21,17 @@
 /mod/bin/
 !/mod/gradle/wrapper/gradle-wrapper.jar
 
+# Gradle / Fabric mod (26.2 / Loom)
+/mod-fabric-26.2/.gradle/
+/mod-fabric-26.2/build/
+/mod-fabric-26.2/run/
+/mod-fabric-26.2/bin/
+/mod-fabric-26.2/out/
+/mod-fabric-26.2/logs/
+/mod-fabric-26.2/remappedSrc/
+/mod-fabric-26.2/src/generated/
+!/mod-fabric-26.2/gradle/wrapper/gradle-wrapper.jar
+
 # Node / app bundle build
 node_modules/
 /dist/*.tar
