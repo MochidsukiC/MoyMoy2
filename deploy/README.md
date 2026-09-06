@@ -36,15 +36,22 @@ tools\publish-moymoy.ps1 -Token $tok
 in-world の App Store（com.mochi.appstore）から「MoyMoy」をインストール → ホームに表示 → 起動。
 
 ## 3. MCサーバーサイドmod（オプショナル、チャージに必要）
+ビルドルートが2本ある（ForgeGradle 6/Gradle 8.8/JDK 17 と Loom/Gradle 9.5.1/JDK 25 は同居できないため）。対象 MC サーバーのバージョンに合わせて選ぶ。
+
+**Forge 1.20.1 版**:
 ```
 # MochiOS2.0 の forge を先にビルド（compileOnly 参照先）
-# mod をビルド
 cd mod ; .\gradlew build       # → build/libs/moymoy-0.1.0.jar
-
-# jar を mochi connector mod と一緒に MCサーバの mods/ へ置いて再起動。
-# コネクタが登録済み app_id を自動的に <appId>.<コネクタID>.mnn へ露出するので、
-# バックエンド側の設定・証明書発行は不要。
 ```
+
+**Fabric 26.2 版**（要 JDK 25）:
+```
+# MochiOS2.0 の minecraft/fabric-26.2 を先にビルド（compileOnly 参照先。connector-core も要る）
+cd mod-fabric-26.2 ; .\gradlew build   # → build/libs/moymoy-0.1.0+26.2.jar
+# 参照先のパスは既定で ../../MochiOS2.0/minecraft、-Pmochi_root=<パス> で上書き可
+```
+
+どちらの版でも、できた jar を mochi connector mod と一緒に MC サーバの `mods/` へ置いて再起動する。コネクタが登録済み app_id を自動的に `<appId>.<コネクタID>.mnn` へ露出するので、バックエンド側の設定・証明書発行は不要。
 バックエンドは `http://moymoy.<コネクタID>.mnn/` へ HTTP を投げる。宛先サーバは在席ディレクトリの都度解決ではなく、**ユーザーが承認した Hub 署名 attestation が名指ししたサーバ**（`emerald_ops.attester_id` に保存）で、再送も必ず同じサーバへ行く。mod の応答はその **HTTP レスポンス**として返る。
 
 mod 側は新 API（`MnnServer.serve` + `MnnRequest.caller()`）で受ける。`caller` は Hub が認証した送信元で、mod は **MoyMoy ウォレットバックエンド（`cs:app.moymoy`）以外からの消費要求を拒否する**。他の CS バックエンドや `user:` セッションはエメラルドを消費できない。

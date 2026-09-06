@@ -13,7 +13,7 @@ MochiOS2.0 プラットフォーム向けの電子マネー / ウォレット / 
 - **構成（3コンポーネント）**:
   - `server/moymoy-cs/` — Rust+axum バックエンド → `moymoy.cs.mnn`。**トンネル内蔵型SDK**(`mochi-hub-cs-sdk` の `CsTunnel::start`)。ウォレットの唯一の権威。SQLite 永続化。**MC mod 無しでも完全動作**。
   - `app-mobile/apps/com.mochi.moymoy/` — HTML/JS バンドル。`fetch("https://moymoy.cs.mnn/...")`。デザイン「MochiOS Mobile.html」駆動。
-  - `mod/` — Forge 1.20.1 MC サーバーサイドmod → `moymoy.mc.mnn`。エメラルド消費/付与の真実。connector の `MnnServer` API に `MnnHandler` を実装(`MoyMoyExtension`)、呼び出し元は `MnnRequest#caller()` で `cs:app.moymoy` に固定（旧 `CommandDispatch.Handler` の名前突合は認可でないため廃止）。**オプショナル**。
+  - MC サーバーサイドmod → `moymoy.mc.mnn`。エメラルド消費/付与の真実。connector の `MnnServer` API に `MnnHandler` を実装(`MoyMoyExtension`)、呼び出し元は `MnnRequest#caller()` で `cs:app.moymoy` に固定（旧 `CommandDispatch.Handler` の名前突合は認可でないため廃止）。**オプショナル**。ビルドルートは2本並存（§MC mod ビルド）: `mod/`（Forge 1.20.1）と `mod-fabric-26.2/`（Fabric 26.2）。ワイヤ契約（verb・フィールド名・status 値・`MAX_AMOUNT`/`MAX_WITHDRAW`・`ALLOWED_CALLER`）・`EmeraldUtil.java`・`MoyMoyExtension.java` は両版で同一（Fabric 版はバイト単位で一致）。
 - **エメラルドチャージ/出金**: チャージはアプリ起点＋ゲーム内 両対応、出金はアプリ起点のみ。双方向コマンドバス（backend が `cs_hosts:["moymoy"]` を claim、`reliable_send` 送信 / `run_inbound` 受信）。
 - **整合性**: 「消費の真実=mod / 残高の権威=backend」を `emerald_ops` 台帳 + 二層冪等キー(`idem_key`/`op_id`) + at-least-once 再送 + 冪等決済で eventually-consistent に。
 - **方針**: 旧 MoyMoy(`D:\IdeaProjects\MoyMoy`)はドメインの緩い参考のみ。MochiOS2.0 本体は原則無改変（app_backends 配置・mod jar 配置・`mcserver_id` 設定・証明書発行のみ。`hosted_app_ids` は廃止）。
@@ -82,13 +82,24 @@ mod との wire は台帳と異なり**物理エメラルドの個数**建て（
 - `emerald.withdraw {op_id, idem_key, target_uuid, amount}`（amount=物理エメラルド個数） → mod がエメラルド付与(`amount/9`ブロック+`amount%9`個、満杯時は足元ドロップ) → ack `{op_id, status, granted}`（`settled` とは別名。status: `ok`/`duplicate`(再付与せず同額を再ack)/`unknown`(claim済みだが付与を証明できず`stuck`・返金なし)/`player_offline`/`bad_request`/`unauthorized`/`internal_error`）
 - `inventory.query {req_id, target_uuid}` → mod が手持ちを返答 `{req_id, emeralds, blocks}`（charge画面のインベントリ表示用。任意）
 
+### MC mod ビルド（2本並存）
+ForgeGradle 6 / Gradle 8.8 / JDK 17（`mod/`）と Loom / Gradle 9.5.1 / JDK 25（`mod-fabric-26.2/`）は同居できないためビルドルートを分けている。
+
+- **`mod/`** — Forge 1.20.1。成果物 `mod/build/libs/moymoy-0.1.0.jar`。
+- **`mod-fabric-26.2/`** — MC 26.2 / Fabric Loader 0.19.3 / Fabric API 0.156.0+26.2 / Loom 1.17 / Gradle 9.5.1 / Java 25。成果物 `mod-fabric-26.2/build/libs/moymoy-0.1.0+26.2.jar`（remap 後 jar・`-dev` jar は無い。26.x のバニラは非難読化のため Loom は `remapJar` タスクを登録せず、この1本がロード可能な mod jar）。
+  - ビルド前提: MochiOS2.0 の `minecraft/fabric-26.2` を先にビルドしておくこと。`compileOnly` が `MochiOS2.0/minecraft/connector-core/build/classes/java/main`（`Mnn*`）と `MochiOS2.0/minecraft/fabric-26.2/build/classes/java/main`（`MochiMod.MNN_SERVER`）の2ディレクトリを参照する（Forge 版の `-Pmochi_forge_classes` に相当、`-Pmochi_root=<MochiOS2.0/minecraft のパス>` で上書き可）。
+  - エントリポイント: `fabric.mod.json` の `"main"` + `"environment": "*"`。`"server"`（`DedicatedServerModInitializer`）は専用サーバでしか呼ばれず統合サーバで機能が消えるため使わない（Forge の `@Mod` コンストラクタが両サイドで走っていたのと同じ挙動に揃えるため）。
+  - `mods.toml` の `ordering=AFTER` に相当するものは Fabric に無いが不要——`MochiMod.MNN_SERVER` は static final の即値で、`serve()` が connector の `setOnChange` を叩いて `served_hosts` を再広告するため初期化順に依存しない。
+  - **台帳の永続化が Forge 版と異なる**: `SavedData#save(CompoundTag)` は 26.2 に無く、`SavedDataType<T>(Identifier, Supplier, Codec, DataFixTypes)` + Codec 方式。`ops`/`grants` は `Codec.unboundedMap(STRING, INT)` を `optionalFieldOf(name, Map.of())` で2本束ねる（NBT 上の形 `{data:{ops,grants}}` は 1.20.1 と同一）。保存先は `server.getDataStorage()`（26.2 新設、ルート=`<world>/data`。`server.overworld().getDataStorage()` は `<world>/dimensions/minecraft/overworld/data` に移るため使わない）。実ファイルは `<world>/data/moymoy/emerald_ops.dat`。同期フラッシュは `SavedDataStorage#saveAndJoin()`。
+  - `EmeraldOpStore.migrateLegacyStore` が `SERVER_STARTING` で `serve()` より前に一度だけ走り、1.20.1 の `<world>/data/moymoy_emerald_ops.dat` を put-if-absent で新ストアへ合流させ、フラッシュ後に `.migrated` へリネームする（バニラの FileFix はバニラ名の `.dat` しか再配置しないため、これが無いと台帳が空で作り直され二重消費・二重発行になる）。**1.20.1 世代 `.dat` に対する実運用検証は未実施**（§TODO）。
+
 ### 出金整合とattestation（§出金整合、チャージの逆方向）
 出金 = エメ残高 → ゲーム内エメラルドで受け取る。チャージは「先に消費 → ack で入金」、出金は「先に引落(予約) → 付与要求 → ack で確定」と安全な失敗の向きが逆転する（付与を先にするとエメラルドが無から増えインフレする）。
 - 確定的失敗（`player_offline` 等・付与なし）は同一トランザクション内で即返金。付与されたか**不明**（`unknown`）な場合は返金しない（返金するとエメラルドと残高の両取りになる）ため `stuck` にして手動レビュー（R008 と同じ規律）。返金は state を非終端から動かした当のトランザクション内でのみ行い、UPDATE の変更行数でガードして reconcile と ack の同時到達による二重返金を構造的に防ぐ。
 - `reconcile` の dead-letter は方向別: チャージの一括 UPDATE には `direction='charge'` の絞りが入り、出金は1行ずつ処理（未送達 `pending` → 返金して `failed` ／曖昧な `sent` → 返金なしで `stuck`）。再送は台帳の `direction` で verb を分岐（出金 op をチャージとして再送するとプレイヤーのエメラルドを逆に没収するため必須）。
 - **認可**: `AttestPurpose::Withdraw`（purpose 文字列 `"withdraw"`）と request-hash ドメイン `moymoy.withdraw.v1` を新設。ドメイン分離＋challenge の purpose バインドにより、チャージ用 assertion で出金はできず逆も不可。
-- **上限**: 1操作あたり 20,736 エメ（=2,304 エメラルドブロック=インベントリ1個分）を backend（`MAX_WITHDRAW_PER_OP`、マイナーユニット建て）と mod（`MAX_WITHDRAW_PHYSICAL`、物理個数建て）が単位の異なる別々の定数として独立に強制（無制限だと mod 側で数百万スタックが生成されサーバースレッドを固めるため）。
-- **mod 側冪等**: `grants` コンパウンド（`op_id → -1`=claim済み未確定／`≥0`=確定付与額）で管理。チャージ用の `ops` は不変・後方互換。claim → ディスクへ同期フラッシュ → 付与 → 確定記録 → フラッシュ、の二相（付与は無から生成するため記録前クラッシュ＋リプレイでの二重生成を防ぐ必須要件）。判定〜claim〜付与〜確定は1回の `server.submit` 内で完結させ、同一 op の同時実行が両方とも「未 claim」を観測することを構造的に不可能にしている。
+- **上限**: 1操作あたり 20,736 エメ（=2,304 エメラルドブロック=インベントリ1個分）を backend（`wallet::MAX_WITHDRAW_PER_OP` マイナーユニット建て、`mc::MAX_WITHDRAW_PHYSICAL` 物理個数建て）と mod（`MoyMoyExtension.MAX_WITHDRAW`、物理個数建て）が単位の異なる別々の定数として独立に強制（無制限だと mod 側で数百万スタックが生成されサーバースレッドを固めるため）。
+- **mod 側冪等**: `grants` マップ（`op_id → -1`=claim済み未確定／`≥0`=確定付与額）で管理。オンディスク表現は Forge 版（NBT コンパウンド）と Fabric 版（Codec、§MC mod ビルド）で異なるが on-disk の形（`{data:{ops,grants}}`）は同一。チャージ用の `ops` は不変・後方互換。claim → ディスクへ同期フラッシュ → 付与 → 確定記録 → フラッシュ、の二相（付与は無から生成するため記録前クラッシュ＋リプレイでの二重生成を防ぐ必須要件）。判定〜claim〜付与〜確定は1回の `server.submit` 内で完結させ、同一 op の同時実行が両方とも「未 claim」を観測することを構造的に不可能にしている。
 - **不変条件の変更**: 従来「ウォレットから価値が外へ出る経路は無い」が成立していたが、出金ではこれは成立しない。代わりに ①出金は必ずセッション本人の操作、②金額と `idem_key` に束縛されたユーザー同意付き assertion を要する、③`AttestedFacts::account_id` は依然として認可に読まれない、④attester（サーバー運営者）は他人の残高を動かす手段を持たず宛先キャラを名乗れるのみ、が担保される。新たな信頼境界は「ユーザーが出金先 MC サーバーを信用する」こと。
 
 ### EC決済（MoyMoy Pay、v6・エスクロー v9〜v12）
@@ -188,7 +199,7 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 **単位の検査**: `api.rs` の `whole_emeralds()` — チャージ・出金は `%100 != 0` を **400** で拒否（エメラルドは不可分）。送金・決済承認には `%100` 検査が**無く**、1 マイナーユニット（0.01エメ）から通る。
 
 ### デプロイの制約
-**MoyMoy と PiggleShop2 は同時にしかデプロイできない**。`attest` の署名ハッシュと `amount_minor` 契約が、MoyMoy サーバー・MoyMoy アプリ・PiggleShop2 サーバー・PiggleShop2 クライアントの4成果物に跨るため。加えて v9〜v12（エスクロー・履行完了通知API）は MoyMoy-cs と PiggleShop2-cs 間の契約にも跨る。**逆マイグレーションは存在しない**——エスクローは実際に金を移すため、列を消すと保留中の金の行き先情報が失われる。**今回は PiggleShop2 側の MC mod が変わる（配送 claim を叩くようになる）ため、Minecraft サーバーの停止と mod 入れ替えが必要**（従来のv8リリース時点では「Minecraft サーバーと mod は停止も変更も不要」だったが、今回は当てはまらない。MoyMoy 自身の Forge mod は無変更）。**v9〜v12はコミット済み・本番未適用**。アプリの状態は**レジストリ登録済み（＝本番の利用者に届いている）が 0.6.0**、**GitHub リリース済みだがストア未登録が 0.7.0（エスクロー）と 0.8.0（Web 起点の戻り先 URL）**の二段になっている。この二つを分けて読むこと——0.8.0 を登録すると 0.7.0 のエスクロー一式も同時に本番へ出るため、登録は上記の同時デプロイ計画が整うまで行わない。**アプリの GitHub リリースはアプリストア公開より前に作る必要がある**——インストーラは manifest の `bundle.url` を見て直接 GitHub から取得し、ローカルのリポジトリは見ない（`MochiOS2.0/mobile/cef-host/src/app_install.rs:188-189`）。
+**MoyMoy と PiggleShop2 は同時にしかデプロイできない**。`attest` の署名ハッシュと `amount_minor` 契約が、MoyMoy サーバー・MoyMoy アプリ・PiggleShop2 サーバー・PiggleShop2 クライアントの4成果物に跨るため。加えて v9〜v12（エスクロー・履行完了通知API）は MoyMoy-cs と PiggleShop2-cs 間の契約にも跨る。**逆マイグレーションは存在しない**——エスクローは実際に金を移すため、列を消すと保留中の金の行き先情報が失われる。**今回は PiggleShop2 側の MC mod が変わる（配送 claim を叩くようになる）ため、Minecraft サーバーの停止と mod 入れ替えが必要**（従来のv8リリース時点では「Minecraft サーバーと mod は停止も変更も不要」だったが、今回は当てはまらない）。**MoyMoy 自身の MC サーバーサイドmodの入れ替えも本番デプロイに含まれ得る**——`mod-fabric-26.2/`（Fabric 26.2 移植、§MC mod ビルド）は追加済みだが、本番 MC サーバーを Forge 1.20.1 のまま運用するか 26.2 へ上げるかは未決定（§TODO）。**v9〜v12はコミット済み・本番未適用**。アプリの状態は**レジストリ登録済み（＝本番の利用者に届いている）が 0.6.0**、**GitHub リリース済みだがストア未登録が 0.7.0（エスクロー）と 0.8.0（Web 起点の戻り先 URL）**の二段になっている。この二つを分けて読むこと——0.8.0 を登録すると 0.7.0 のエスクロー一式も同時に本番へ出るため、登録は上記の同時デプロイ計画が整うまで行わない。**アプリの GitHub リリースはアプリストア公開より前に作る必要がある**——インストーラは manifest の `bundle.url` を見て直接 GitHub から取得し、ローカルのリポジトリは見ない（`MochiOS2.0/mobile/cef-host/src/app_install.rs:188-189`）。
 
 ---
 
@@ -199,8 +210,8 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 - **memo 未実装**: デザインの送金/支払いフローに memo 入力欄が無いため、API からも除外（受理して捨てる挙動は不採用）。必要時は transactions.memo への配線を追加。
 - **in-game チャットコマンドからの backend 報告は不可**: `mochi` connector(`MochiMod`)は `DISPATCH`(inbound ルーティング)のみ公開で、ハンドラ外からの unsolicited 送信API が無い。よってエメラルドチャージは**アプリ起点**で完結する。真の `/eme deposit` には mochi connector への outbound 送信API追加（承認の要る MochiOS2.0 改変）が必要。
 - エメラルドチャージの致命ウィンドウ（consume成功・ack喪失・SavedDataフラッシュ前クラッシュ）は台帳+reconciliation+`setDirty()`直後フラッシュで最小化（exactly-once は原理的限界）。
-- **出金 mod 側フラッシュのベストエフォート性**: `EmeraldOpStore.flush()` はベストエフォート。バニラの `SavedData#save(File)` は書き込み失敗をログのみで飲み込み dirty フラグを無条件でクリアするため、書き込み失敗直後にクラッシュすると claim が失われリプレイで二重付与が起こりうる（mod 側に検知手段なし）。
-- `.dat` 破損時にバニラの `DimensionDataStorage#get` が例外を握り潰しストアを丸ごと空扱いにする窓（`ops`/`grants` 共通、チャージにも元からある）。
+- **出金 mod 側フラッシュのベストエフォート性**: `EmeraldOpStore.flush()` はベストエフォート。バニラの保存経路（Forge 1.20.1: `SavedData#save(File)`、Fabric 26.2: `SavedDataStorage#collectDirtyTagsToSave`＋`tryWrite`）は書き込み失敗をログのみで飲み込み dirty フラグを無条件でクリアするため、書き込み失敗直後にクラッシュすると claim が失われリプレイで二重付与が起こりうる（mod 側に検知手段なし。両版で構造は同一）。
+- `.dat` 破損時にバニラの復元経路（Forge 1.20.1: `DimensionDataStorage#get`、Fabric 26.2: `SavedDataStorage#readSavedData`）が例外を握り潰しストアを丸ごと空扱いにする窓（`ops`/`grants` 共通、チャージにも元からある。両版で構造は同一）。
 - **出金の信頼境界**: 出金先 MC サーバーへの信用が新たに発生する。悪意あるサーバーは `ok` を返しつつ実際には付与しないことができ、機能の性質上これは回避ではなく同意の上で受容するリスク。
 - **決済の信頼境界（エスクロー導入で解消。新たな残存リスクに置換）**: v9〜v12のエスクロー導入により、加盟店の売上は承認と同時にはMoyMoy本社のエスクロー口座に保留され、加盟店へは履行完了報告後10分経過してはじめて送金される。従来ここに記載していた「加盟店売上を拘束しないため詐欺加盟店が集金直後にwithdrawで抜けると回収不能になる」リスクは解消済み。残存するのは別種のリスク: **park された資金（履行未報告のまま6時間経過したエスクロー）を加盟店へ払い出す経路が存在しない**——運用者にできるのは買い手へ返すことのみ（§エスクロー）。**park を知る手段は `warn!` ログとDB直接参照、および加盟店自身の売上ページのみ**——運用者向けの一覧は無い。
 - **`LockoutPolicy::Bypass`（加盟店の緊急停止）の増幅**: `/merchant/portal/status` で shop を disabled にする操作は口座ロックアウト中でも PIN を試させるが、`begin_pin_attempt` は Bypass でも `locked_until` への書き込み自体は行う（拒否判定だけスキップする）。セッションを奪った攻撃者が被害者の他エンドポイントを誤 PIN で継続的にロックできる増幅がある。auth の意味論変更になるため未対処。
@@ -247,8 +258,8 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 - **【LOW】`server/moymoy-cs/src/payments.rs:475` — 加盟店 status の検査が資金移動の述語に入っていない。**
   `approve` は Argon2id 検証の前に一度 `is_active()` を見るだけで、claim UPDATE の述語は `state='created' AND expires_unix_ms > now` しか見ない。PIN 検証中（数百ミリ秒）に停止された加盟店が、進行中の承認から集金できる。
 
-- **【MEDIUM】`mod/src/main/java/jp/houlab/mochidsuki/moymoy/MoyMoyExtension.java:234` — `emerald.charge` の重複排除が消費時点で耐久でもレース安全でもない。**
-  `store.recorded(opId)` を connector の IO スレッド上で `server.submit(...)` の前に見るため、同じ `op_id` の並行到着で二重消費の窓がある。
+- **【MEDIUM】`MoyMoyExtension.handleCharge`（`mod/`・`mod-fabric-26.2/` 両版で同一コード） — `emerald.charge` の重複排除が消費時点で耐久でもレース安全でもない。**
+  `store.recorded(opId)` を connector の IO スレッド上で `server.submit(...)` の前に見るため、同じ `op_id` の並行到着で二重消費の窓がある。同じ箇所で `EmeraldOpStore.get(server)` を `server.submit` の外（コネクタ IO スレッド）から呼んでおり、`SavedDataStorage` のキャッシュ（素の HashMap）をサーバスレッドと並行に触ってもいる。Fabric 移植とは別コミットで扱うと決めた既存欠陥（§TODO）。未知 verb の ack が withdraw 形（`granted`）に分岐しない点も同様に別コミット扱い。
 
 ## TODO
 
@@ -259,7 +270,8 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 - [x] レビュー指摘修正: 冪等の単一トランザクション化(TOCTOU二重支払い根絶)
 - [x] 段階2: フロントエンドバンドル（デザイン駆動）
 - [x] 段階3: コマンドバス + チャージ整合（emerald_ops 台帳）
-- [x] 段階3: MC サーバーサイドmod（Forge、moymoy-0.1.0.jar ビルド済）
+- [x] 段階3: MC サーバーサイドmod（Forge 1.20.1、`mod/build/libs/moymoy-0.1.0.jar` ビルド済）
+- [x] Fabric 26.2 移植（`mod-fabric-26.2/`、`moymoy-0.1.0+26.2.jar` ビルド済。§MC mod ビルド）。実サーバでのロード検証・1.20.1台帳の実マイグレーション検証は未実施（下記TODO）
 - [x] 段階4: 配置・公開ツール（tools/, deploy/, icon.png）
 - [x] **再設計**: 独立アカウント(handle+PIN)+セッション検証 — backend（`6b85dc5`、HTTPスモーク緑）
 - [x] **再設計**: マルチアカウント(1端末=複数口座)+1口座=複数MCキャラ — frontend（`9cc6c18`、Babel透過）
@@ -275,7 +287,7 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
   - [x] **① 症状の可視化**: 在庫クエリの「応答なし/未発見/真の0」を潰さず区別（`character_unreachable`/`character_offline`＋両側ログ）`f3e8f40`。
   - [x] **② backend cert**: `deploy-backend.ps1 -EnableCharge` で mc-pki CA から `--mcserver-id moymoy` leaf 発行＋`MOCHI_MC_CERT_DIR` 設定。`run/app_backends/moymoy` に適用済（`can_charge=true`）。
   - [x] **③ Hub の :7421 有効化（真の根本原因）**: Hub が `MOCHI_HUB_MC_PKI_DIR` 未設定で「MC command bus (mTLS :7421) disabled」→ backend が connect timeout を繰り返し在庫0。`run/` の起動元 `MochiOS2.0/tools/win-hub-dev.ps1` に `MOCHI_HUB_MC_PKI_DIR=<repo>\.devstack\mc-pki\ca`＋`MOCHI_HUB_MC_PKI_FLAT=1` を追加（backend cert と同一 CA）。**Hub 再起動が必要**。
-  - [ ] **④ MC サーバ側**: moymoy mod jar（`mod/build/libs/moymoy-*.jar`）＋ mochi connector mod を導入、`mochi-server.toml` の `mcserver_id` を非空に、mochi-mc-connector サイドカー稼働。※`hosted_app_ids` は**廃止**（自動広告）。
+  - [ ] **④ MC サーバ側**: moymoy mod jar（Forge 1.20.1なら `mod/build/libs/moymoy-0.1.0.jar`、Fabric 26.2なら `mod-fabric-26.2/build/libs/moymoy-0.1.0+26.2.jar`）＋ mochi connector mod を導入、`mochi-server.toml` の `mcserver_id` を非空に、mochi-mc-connector サイドカー稼働。※`hosted_app_ids` は**廃止**（自動広告）。
 - [ ] backend 再配置（`deploy-backend.ps1 -EnableCharge` で moymoy-cs＋MC証明書を Hub workdir へ）。EC決済 Phase 2 完了により、フロントエンドが壊れる懸念は解消したので実施可能
 - [ ] フル E2E（in-world で 0.2.2 再インストール → 口座開設(メール検証)→2FA→リカバリ→送金→チャージ の実機検証）
 - [ ] 承認ゲート保留: `MOYMOY_OTP_PEPPER` の本番 fail-closed 化 / `AccountInfo` の email 型統合 / refresh 失敗の UI エラー状態化 / `run_inbound` 切断理由の可視化（mc-sdk 共有層）
@@ -291,3 +303,7 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 - [x] 入金通知（OS push、schema v7）: backend の transfer/credit 両プリミティブでの outbox 書き込み・配送タスク・端末リンク／MoyMoy アプリの登録配線／MochiOS 側の送信元認可再設計・v0.5.2 リリース公開（backend `5cb6342` / app `90a4fb0` / fix `c66df2a` / release `dfa624b`）
 - [x] 入金通知の実機 E2E（送金 → 受取側端末の通知バナー到達を本番スタックで確認。初回失敗は Hub の staging コピー漏れ＝旧 allowlist が 404 を返したためで、機能側の欠陥ではなかった）
 - [ ] **本番デプロイ**: エスクロー(schema v9〜v12)・step-up帯変更(v11)は実装・コミット済みだが本番未適用。PiggleShop2側のMCサーバー停止・mod入れ替えを伴うため、両リポジトリの同時デプロイ計画が必要（§デプロイの制約）。
+- [ ] Fabric 26.2 版 mod の実サーバでのロード検証（`MochiMod.MNN_SERVER.serve()` の実バインド、`SERVER_STARTING` の順序、`/eme`、チャージ・出金の E2E）。現状 `./gradlew build` が通ることまでしか確認していない。
+- [ ] `EmeraldOpStore.migrateLegacyStore` を実際の 1.20.1 世代 `.dat` に対して実行した検証。未実行。本番ワールドを引き継ぐ場合は必須。
+- [ ] 本番 MC サーバーを Forge 1.20.1 のまま運用するか 26.2 へ上げるかの決定。上げる場合はワールドのバージョンアップと mod 入れ替えの計画が要る（PiggleShop2 側の MC mod 入れ替えと同時になる可能性）。
+- [ ] `mod/`（Forge 1.20.1 版）の廃止時期。MochiOS の fabric-26.2 が本番になった時点で削除できる。
