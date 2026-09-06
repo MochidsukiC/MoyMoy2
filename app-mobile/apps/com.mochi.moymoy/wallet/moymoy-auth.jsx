@@ -593,6 +593,16 @@ function AccountMenu({ open, accounts, activeId, onSwitch, onAdd, onLogout, onSe
    previously-charged UUID here would name a relationship nothing maintains. */
 function SettingsSheet({ open, account, seal, onLogout, onMerchant, onSeal, onClose }) {
   const [email, setEmail] = maState(null);
+  // 「アドレスが登録されている」と「そのアドレスが確認済み」は別物で、
+  // /auth/me も別のフィールドで返す。確認済みかどうかで PIN 再設定・2段階認証・
+  // 加盟店登録が通るかが決まる（サーバはいずれも email_verified を見る）ので、
+  // email の有無だけで ✓ を出すと、加盟店登録が弾かれた理由が利用者側から
+  // 一切読めなくなる。
+  //
+  // 既定は false、判定も `=== true`。email_verified を返さない古いサーバに
+  // 当たったときは「確認済み」と言い切らない側へ倒す — 誤って ✓ を出すと、
+  // 実際には失敗する操作を利用者に信じ込ませることになる。
+  const [verified, setVerified] = maState(false);
   const [failed, setFailed] = maState(false);
   maEffect(() => {
     if (!open) return;
@@ -601,7 +611,7 @@ function SettingsSheet({ open, account, seal, onLogout, onMerchant, onSeal, onCl
     MoyMoy.me()
       .then((r) => {
         if (!alive) return;
-        if (r.ok) setEmail(r.email || null);
+        if (r.ok) { setEmail(r.email || null); setVerified(r.email_verified === true); }
         else setFailed(true);
       })
       .catch((e) => { console.warn("MoyMoy: settings load (MoyMoy.me) failed", e); if (alive) setFailed(true); })
@@ -620,8 +630,23 @@ function SettingsSheet({ open, account, seal, onLogout, onMerchant, onSeal, onCl
             <div style={{ fontFamily: "var(--font-jp)", fontSize: 16, fontWeight: 700 }}>{account.display_name || ("@" + account.handle)}</div>
             <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--ink-soft)" }}>@{account.handle}</div>
             {email && (
-              <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--moy-deep)", marginTop: 4 }}>
-                ✓ {email}
+              <div style={{ marginTop: 4 }}>
+                <div style={{ fontFamily: "var(--font-mono)", fontSize: 11,
+                  color: verified ? "var(--moy-deep)" : "var(--ink-soft)" }}>
+                  {verified ? "✓ " : ""}{email}
+                </div>
+                {/* ✓ を消すだけだと「メールを登録していない」と見分けが付かず、
+                    次に何をすればよいか分からないままになる。未確認であることと、
+                    そのせいで何が使えないかを名指しする。 */}
+                {!verified && (
+                  <>
+                    <div className="eyebrow" style={{ color: "var(--carle-red)", marginTop: 5 }}>メール未確認</div>
+                    <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)",
+                      lineHeight: 1.7, marginTop: 3 }}>
+                      確認が済むまで PIN の再設定と加盟店の登録は使えません。
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
