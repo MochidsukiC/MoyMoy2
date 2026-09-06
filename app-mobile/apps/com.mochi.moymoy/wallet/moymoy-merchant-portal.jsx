@@ -23,6 +23,26 @@ const REASON_LABEL = {
   unnameable: "名前として識別できません",
 };
 
+/* 店名・ひとこと説明の長さを、サーバ (merchant.rs の sanitize_text) と同じ数え方で
+   測る。あちらは「NFKC を掛ける → その後で trim する → Unicode スカラー値を
+   `chars().count()` で数える」順であり、JS でこれに 1 対 1 で対応する式が
+   `Array.from(s.normalize("NFKC").trim()).length`。
+
+   素の `.length` は UTF-16 コード単位なので、二方向に食い違う:
+     - 過小: NFKC は縮むだけでなく伸びる。㈱→(株) は 1→3、㍿→株式会社 は 1→4、
+       ℡→TEL、㎡→m2、№→No、㌔→キロ。「㈱」+ あ×31 は `.length` では 32 でも
+       サーバでは 34 で、bad_name / too_long で弾かれる。日本の店名で日常的に踏む。
+     - 過大: サロゲートペアは 2 と数えるので、絵文字の店名は 16 個で頭打ちになる。
+       サーバは 32 個まで受理する。
+   Array.from はサロゲートペアを 1 個として数えるので `chars().count()` と一致する。
+
+   ここで数えるのは長さだけ。reserved_name / mixed_script / unnameable 等の判定は
+   サーバが権威で、UTS #39 の skeleton をブラウザで再現することはできない
+   （食い違えば嘘の警告になる）ので、こちらには持ち込まない。 */
+function moyTextLen(s) {
+  return Array.from(s.normalize("NFKC").trim()).length;
+}
+
 /* ─── 加盟店管理 (設定内) ─────────────────────────────────────────
    セッション + PIN でしか触れない側の操作。API キーが漏れてもここには届かず、
    セッションが漏れても PIN 無しではキーを再発行できない、という分離が
@@ -347,7 +367,23 @@ function MerchantPortal({ open, onClose }) {
     });
   }
 
-  const nameOk = form.name.trim().length >= 1 && form.name.trim().length <= 32;
+  // 送信可否はサーバと同じ数え方で決める（moyTextLen のコメント参照）。
+  const nameLen = moyTextLen(form.name);
+  const nameOk = nameLen >= 1 && nameLen <= 32;
+  // 「何か打ってあるのに送れない」状態。未入力での無効はボタンを見れば分かるので、
+  // 赤字を出すのはこちらのときだけ — 空欄の初期状態で警告を出さない。
+  const nameBad = form.name.trim() !== "" && !nameOk;
+  // sub は任意。trim 後が空なら「未指定」で、doRegister が undefined を送り、
+  // サーバも `sub_in.map(str::trim).filter(|s| !s.is_empty())` で None にするので
+  // エラーにならない。中身があるときだけ 48 スカラーの上限が掛かる。
+  // 下限 1 を残すのは、trim 後は空でなくても NFKC 後の trim で空になれば
+  // サーバが bad_sub / empty を返すため — その場合も送らせない。
+  const subTrimmed = form.sub.trim();
+  const subLen = subTrimmed ? moyTextLen(subTrimmed) : 0;
+  const subOk = subTrimmed === "" || (subLen >= 1 && subLen <= 48);
+  // 長すぎる sub は今まで nameOk に入っておらず、送信されてサーバに bad_sub で
+  // 弾かれていた。PIN を打たせてから失敗させることになるので、ここで止める。
+  const canRegister = nameOk && subOk;
 
   return (
     <>
@@ -462,22 +498,53 @@ function MerchantPortal({ open, onClose }) {
                 店名はあとから変更できません。お客さまの承認画面に出るのは、あなたの
                 @ID と、ここで決めた店名です。
               </div>
+              {/* maxLength は UTF-16 コード単位でしか数えられないので、本当の上限
+                  （NFKC 後のスカラー 32 / 48）を表現できない。32 のままだと絵文字の
+                  店名が 16 個で打ち止めになり、正当な名前を物理的に入力できない。
+                  外さずに残すのは、数 KB の貼り付けがそのまま state に入るのを
+                  止める暴走防止としてだけ。上限の 8 倍にしてあるので、
+                  スカラー 32 / 48 に届く前にこの値が効くことはない。判定は
+                  nameOk / subOk が持つ。 */}
               <div style={{ marginTop: 16 }}>
                 <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>店名（変更不可）</div>
                 <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}
-                  maxLength={32} aria-label="店名（登録後は変更できません）"
+                  maxLength={256} aria-label="店名（登録後は変更できません）"
                   placeholder="ピグルショップ" style={fieldStyle} />
-                <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", marginTop: 6 }}>
-                  32文字まで。運営を騙る語や、複数の文字体系を混ぜた紛らわしい名前は登録できません。
+                {/* maxLength を緩めた分、長すぎる名前は「打てるのにボタンだけ黙って
+                    無効」になりうる。既存の注記を赤にして理由を出す。文字数を出すのは、
+                    画面に見えている文字数と数え方（NFKC 後）が食い違うため。 */}
+                <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, marginTop: 6, lineHeight: 1.7,
+                  color: nameBad ? "var(--carle-red)" : "var(--ink-soft)",
+                  fontWeight: nameBad ? 700 : 400 }}>
+                  {nameBad
+                    ? "いま " + nameLen + " 文字です（㈱ などの記号は変換後の文字数で数えます）。32文字までにしてください。"
+                    : "32文字まで。運営を騙る語や、複数の文字体系を混ぜた紛らわしい名前は登録できません。"}
                 </div>
+                {/* 予約語とスクリプト混在の条件は、長さの警告が出ているあいだも
+                    消さない。上の行を差し替えるだけだと、名前を削って長さを直した
+                    利用者が、次に何で弾かれるかを知らないまま送信することになる。 */}
+                {nameBad && (
+                  <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, marginTop: 4, lineHeight: 1.7,
+                    color: "var(--ink-soft)" }}>
+                    運営を騙る語や、複数の文字体系を混ぜた紛らわしい名前は登録できません。
+                  </div>
+                )}
               </div>
               <div style={{ marginTop: 16 }}>
                 <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>ひとこと説明（任意）</div>
                 <input value={form.sub} onChange={(e) => setForm({ ...form, sub: e.target.value })}
-                  maxLength={48} aria-label="お店のひとこと説明（任意）"
+                  maxLength={384} aria-label="お店のひとこと説明（任意）"
                   placeholder="建材と装飾ブロックのお店" style={fieldStyle} />
+                {/* この欄には元々注記が無い。上限に触れたときだけ出す — 任意欄に
+                    常時「48文字まで」を置くと、店名の注記と競って読まれなくなる。 */}
+                {!subOk && (
+                  <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, marginTop: 6, lineHeight: 1.7,
+                    fontWeight: 700, color: "var(--carle-red)" }}>
+                    いま {subLen} 文字です。48文字までにするか、空欄にしてください。
+                  </div>
+                )}
               </div>
-              <button disabled={!nameOk} onClick={doRegister} style={{ ...ctaStyle(!nameOk), marginTop: 20 }}>
+              <button disabled={!canRegister} onClick={doRegister} style={{ ...ctaStyle(!canRegister), marginTop: 20 }}>
                 <EmeGem size={20} /> PIN で確認して登録
               </button>
             </>
