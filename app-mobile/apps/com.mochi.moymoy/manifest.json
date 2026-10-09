@@ -1,6 +1,6 @@
 {
   "id": "com.mochi.moymoy",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "schema_version": 1,
   "name": {
     "default": "MoyMoy",
@@ -51,6 +51,15 @@
     ],
     "min_runtime_version": "0.1.0"
   },
+  "release_notes": [
+    {
+      "version": "0.8.2",
+      "notes": {
+        "default": "アカウント切替の表示、送金先IDの入力規則と確認結果の案内を改善しました。履歴から取引の日時・種別・照会番号を確認できる詳細画面と、Piggle Shopを開く操作を追加しました。",
+        "ja": "アカウント切替の表示、送金先IDの入力規則と確認結果の案内を改善しました。履歴から取引の日時・種別・照会番号を確認できる詳細画面と、Piggle Shopを開く操作を追加しました。"
+      }
+    }
+  ],
   "supported_platforms": [
     "mc"
   ]
