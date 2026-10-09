@@ -692,7 +692,7 @@ function SettingsSheet({ open, account, seal, onLogout, onMerchant, onSeal, onCl
 }
 
 /* ─── root shell ─────────────────────────────────────────────────────── */
-function MoyMoyRoot({ onClose }) {
+function MoyMoyRoot() {
   const [phase, setPhase] = maState("loading"); // loading | auth | app
   const [accounts, setAccounts] = maState([]);
   const [activeId, setActiveId] = maState(null);
@@ -886,7 +886,6 @@ function MoyMoyRoot({ onClose }) {
   return (
     <MoyMoyApp
       key={activeId}
-      onClose={onClose}
       account={active}
       accounts={accounts}
       onSwitchAccount={switchTo}

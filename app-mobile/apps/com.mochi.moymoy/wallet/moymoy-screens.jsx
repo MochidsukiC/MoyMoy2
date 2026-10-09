@@ -512,8 +512,25 @@ function TargetRow({ item, onClick, trailing }) {
    受取先を指定できる `/wallet/pay` が廃止されたのはそのためで、この画面に
    金額入力を残すと、その廃止した経路をアプリ側に作り直すことになる。
    なので、ここは「どう支払うか」の説明と、最近の支払いの控えに徹する。 */
-function MoyPay({ txns = [] }) {
+function MoyPay({ txns = [], onTxn }) {
+  const [opening, setOpening] = msState(false);
+  const [launchErr, setLaunchErr] = msState("");
   const recent = txns.filter((t) => t.kind === "pay").slice(0, 6);
+  async function openShop() {
+    if (opening) return;
+    setOpening(true); setLaunchErr("");
+    const r = await MoyMoy.launchApp("com.mochi.piggleshop");
+    setOpening(false);
+    if (!r.accepted) {
+      const reasons = {
+        not_installed: "Piggle Shop がインストールされていません。App Store から追加してください。",
+        rate_limited: "少し時間をおいて、もう一度開いてください。",
+        no_host: "Minecraft 内の MochiOS から開いてください。",
+        not_foreground: "MoyMoy を前面にして、もう一度開いてください。",
+      };
+      setLaunchErr(reasons[r.reason] || "アプリを開けませんでした（" + r.reason + "）");
+    }
+  }
   const steps = [
     ["1", "お店のアプリで買う", "商品を選んで「MoyMoy で支払う」を選びます。"],
     ["2", "MoyMoy が開く", "お店・金額・内容が表示されます。表示内容は MoyMoy が記録したもので、お店のアプリからは書き換えられません。"],
@@ -529,6 +546,23 @@ function MoyPay({ txns = [] }) {
         <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 12,
           color: "var(--ink-soft)", lineHeight: 1.8 }}>
           MoyMoy 側から金額を入力して支払うことはできません。
+        </div>
+      </div>
+
+      <div style={{ marginTop: 18 }}>
+        <div className="h-section">対応店舗・アプリ</div>
+        <div style={{ marginTop: 10, padding: "12px 14px", border: "1.5px solid var(--ink)" }}>
+          <div style={{ fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14 }}>Piggle Shop</div>
+          <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)" }}>
+            ブロック・道具・装備のお買い物
+          </div>
+          <button disabled={opening} onClick={openShop} style={{ marginTop: 10, padding: "10px 14px",
+            border: "1.5px solid var(--ink)", background: "var(--moy)", color: "#fff",
+            fontFamily: "var(--font-jp)", fontWeight: 700, cursor: opening ? "default" : "pointer" }}>
+            {opening ? "開いています…" : "Piggle Shop を開く →"}
+          </button>
+          {launchErr && <div role="alert" style={{ marginTop: 8, fontFamily: "var(--font-jp)",
+            fontSize: 12, color: "var(--carle-red)" }}>{launchErr}</div>}
         </div>
       </div>
 
@@ -561,7 +595,7 @@ function MoyPay({ txns = [] }) {
         <div className="h-section">最近の支払い</div>
       </div>
       <div style={{ marginTop: 10, border: "1.5px solid var(--ink)" }}>
-        {recent.map((t, i) => <TxnRow key={t.id} t={t} last={i === recent.length - 1} />)}
+        {recent.map((t, i) => <TxnRow key={t.id} t={t} last={i === recent.length - 1} onClick={() => onTxn(t)} />)}
         {recent.length === 0 && (
           <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",
             fontSize: 13, color: "var(--ink-soft)" }}>まだ支払いはありません</div>
@@ -583,6 +617,7 @@ function MoySend({ friends = [], onPick }) {
     : friends;
 
   async function resolveAndPick() {
+    if (busy) return;
     const h = cleanHandle;
     if (!handleValid) { setErr("MoyMoy ID（半角英数字と _ の3〜20文字）を入力してください"); return; }
     setBusy(true); setErr("");
@@ -592,8 +627,10 @@ function MoySend({ friends = [], onPick }) {
         const name = r.account.display_name || ("@" + r.account.handle);
         onPick({ id: r.account.account_id, handle: r.account.handle, name,
           sub: "@" + r.account.handle, pal: "emerald", glyph: Array.from(name)[0] || "?" });
-      } else {
+      } else if (r.error === "not_found") {
         setErr("@" + h + " が見つかりません");
+      } else {
+        setErr(errLabel(r.error));
       }
     } catch (e) {
       console.warn("MoyMoy: handle lookup failed (network/server/parse)", e);
@@ -610,19 +647,30 @@ function MoySend({ friends = [], onPick }) {
             border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)",
             padding: "0 10px" }}>
             <span style={{ fontFamily: "var(--font-mono)", fontSize: 16, fontWeight: 700, color: "var(--ink-soft)" }}>@</span>
-            <input value={qy} onChange={e => { setQy(e.target.value); setErr(""); }}
+            <input value={qy} disabled={busy} onChange={e => { setQy(e.target.value); setErr(""); }}
               onKeyDown={e => { if (e.key === "Enter") resolveAndPick(); }}
+              aria-label="送金先の MoyMoy ID" aria-describedby="moy-send-rule moy-send-result"
+              aria-invalid={qy.trim() !== "" && !handleValid}
               placeholder="MoyMoy ID で送る"
-              style={{ flex: 1, padding: "12px 4px", border: "none", background: "transparent",
+              style={{ flex: 1, minWidth: 0, padding: "12px 4px", border: "none", background: "transparent",
               fontFamily: "var(--font-jp)", fontSize: 14, color: "var(--ink)", outline: "none" }} />
           </div>
           <button disabled={busy || !handleValid} onClick={resolveAndPick} style={{
             border: "1.5px solid #000", background: busy || !handleValid ? "#bdbdbd" : "var(--moy)",
             color: "#fff", boxShadow: busy || !handleValid ? "none" : "3px 3px 0 #0B5A33",
             cursor: busy || !handleValid ? "default" : "pointer", padding: "0 16px",
-            fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15 }}>送る</button>
+            fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15 }}>{busy ? "確認中…" : "送る"}</button>
         </div>
-        {err && <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, color: "var(--carle-red)" }}>{err}</div>}
+        <div id="moy-send-rule" style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 12,
+          color: "var(--ink-soft)", lineHeight: 1.7 }}>
+          ID は半角英数字・_ の3〜20文字です（@ は省略可）。ハイフンは使えません。
+        </div>
+        <div id="moy-send-result" role="status" aria-live="polite" style={{ marginTop: 4,
+          fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
+          color: err || (qy.trim() && !handleValid) ? "var(--carle-red)" : "var(--ink-soft)" }}>
+          {qy.trim() && !handleValid ? "ID の形式が違います。半角英数字・_ の3〜20文字に直してください。"
+            : err || (busy ? "送金先を確認しています…" : handleValid ? "形式は正しいです。「送る」で相手を確認します。" : "")}
+        </div>
       </div>
       <div style={{ padding: "4px 16px 8px" }}>
         <div className="h-section">最近の相手</div>
@@ -1047,7 +1095,7 @@ function MoyWithdraw({ balance, canCharge, invStatus, attesting, onConfirmCharac
 }
 
 /* ─── 履歴 ───────────────────────────────────────────────────────── */
-function MoyHistory({ txns }) {
+function MoyHistory({ txns, onTxn }) {
   const [filter, setFilter] = msState("all");
   const tabs = [["all", "すべて"], ["pay", "支払い"], ["send", "送金"], ["charge", "チャージ"], ["withdraw", "出金"]];
   const shown = filter === "all" ? txns : txns.filter(t => t.kind === filter);
@@ -1061,7 +1109,7 @@ function MoyHistory({ txns }) {
         ))}
       </div>
       <div style={{ border: "1.5px solid var(--ink)" }}>
-        {shown.map((t, i) => <TxnRow key={t.id} t={t} last={i === shown.length - 1} />)}
+        {shown.map((t, i) => <TxnRow key={t.id} t={t} last={i === shown.length - 1} onClick={() => onTxn(t)} />)}
         {shown.length === 0 && (
           <div style={{ padding: 24, textAlign: "center", fontFamily: "var(--font-jp)",
             fontSize: 13, color: "var(--ink-soft)" }}>取引はありません</div>
@@ -1072,6 +1120,37 @@ function MoyHistory({ txns }) {
 }
 
 /* ─── 確認シート ─────────────────────────────────────────────────── */
+function MoyTxnDetail({ txn, onClose }) {
+  const kind = { pay: "支払い", send: "送金", receive: "受取", charge: "チャージ", withdraw: "出金" }[txn.kind];
+  const date = new Date(txn.ts).toLocaleString("ja-JP", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    timeZoneName: "short",
+  });
+  return (
+    <div onClick={onClose} style={{ position: "absolute", inset: 0, zIndex: 110,
+      display: "flex", alignItems: "flex-end", background: "rgba(10,30,18,0.45)" }}>
+      <div role="dialog" aria-modal="true" aria-labelledby="moy-txn-title" className="slide-up"
+        onClick={e => e.stopPropagation()} style={{ width: "100%", boxSizing: "border-box", maxHeight: "80%",
+          overflow: "auto", background: "var(--bg-white)", borderTop: "1.5px solid var(--ink)", padding: "20px 18px 30px" }}>
+        <div id="moy-txn-title" className="h-section">取引詳細</div>
+        <div style={{ marginTop: 14, fontFamily: "var(--font-jp)", fontSize: 15, fontWeight: 700,
+          overflowWrap: "anywhere" }}>{txn.label}</div>
+        <div style={{ marginTop: 12 }}><Eme amount={txn.amount} size={32} sign /></div>
+        <dl style={{ margin: "18px 0", fontFamily: "var(--font-jp)", fontSize: 13, lineHeight: 1.8 }}>
+          <dt style={{ color: "var(--ink-soft)" }}>取引種別</dt><dd style={{ margin: "0 0 10px" }}>{kind}</dd>
+          <dt style={{ color: "var(--ink-soft)" }}>取引日時</dt><dd style={{ margin: "0 0 10px" }}>{date}</dd>
+          <dt style={{ color: "var(--ink-soft)" }}>照会番号</dt>
+          <dd style={{ margin: 0, fontFamily: "var(--font-mono)", overflowWrap: "anywhere", userSelect: "text" }}>{txn.id}</dd>
+        </dl>
+        <button autoFocus onClick={onClose} style={{ width: "100%", padding: 12, border: "1.5px solid var(--ink)",
+          background: "var(--moy)", color: "#fff", cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700 }}>
+          閉じる
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function MoyConfirmSheet({ kind, target, amount, balance, busy, error, onCancel, onConfirm }) {
   const verb = kind === "send" ? "送金" : kind === "charge" ? "チャージ" : kind === "withdraw" ? "出金" : "支払い";
   return (
@@ -1573,7 +1652,7 @@ function MoyPaymentResumeBar({ onResume }) {
 }
 
 /* ─── オーケストレータ (moymoy.cs.mnn 配線) ─────────────────────── */
-function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAccount, onLogoutAccount,
+function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLogoutAccount,
   pendingPayment, onPaymentDone }) {
   const [balance, setBalance] = msState(0);
   const [profile, setProfile] = msState({ holder: "PLAYER", number: "•••• •••• •••• ••••", expiry: "07/29" });
@@ -1591,6 +1670,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   const idemRef = msRef(null);
 
   const [tab, setTab] = msState("home");
+  const [selectedTxn, setSelectedTxn] = msState(null);
   const [emeMode, setEmeMode] = msState("charge"); // "charge" | "withdraw" — segment on the charge tab
   const [flow, setFlow] = msState(null);       // {kind, target}  amount-entry
   const [confirm, setConfirm] = msState(null);  // {kind, target, amount}
@@ -2034,11 +2114,11 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
   return (
     <div className="screen fade-in" style={{ position: "absolute", inset: 0, zIndex: 20,
       background: "var(--bg-white)", display: "flex", flexDirection: "column", ...rootStyle }}>
-      <MoyHeader onClose={onClose} account={account} onMenu={() => setMenuOpen(true)} />
+      <MoyHeader account={account} onMenu={() => setMenuOpen(true)} />
 
       <div style={{ flex: 1, overflow: "auto", position: "relative" }}>
-        {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={goFromHome} />}
-        {tab === "pay" && <MoyPay txns={txns} />}
+        {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={goFromHome} onTxn={setSelectedTxn} />}
+        {tab === "pay" && <MoyPay txns={txns} onTxn={setSelectedTxn} />}
         {tab === "send" && <MoySend friends={friends} onPick={t => setFlow({ kind: "send", target: t })} />}
         {tab === "charge" && (
           <>
@@ -2052,7 +2132,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
                   onConfirm={(amount) => { setErr(null); setConfirm({ kind: "withdraw", target: null, amount }); }} />}
           </>
         )}
-        {tab === "history" && <MoyHistory txns={txns} />}
+        {tab === "history" && <MoyHistory txns={txns} onTxn={setSelectedTxn} />}
       </div>
 
       <MoyBottomNav tab={tab} onTab={t => {
@@ -2063,6 +2143,7 @@ function MoyMoyApp({ onClose, account, accounts = [], onSwitchAccount, onAddAcco
       }} />
 
       {/* amount entry */}
+      {selectedTxn && <MoyTxnDetail txn={selectedTxn} onClose={() => setSelectedTxn(null)} />}
       {flow && (
         <MoyAmountEntry kind={flow.kind} target={flow.target} balance={balance}
           onCancel={() => setFlow(null)}

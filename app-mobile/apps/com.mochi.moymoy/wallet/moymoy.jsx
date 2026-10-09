@@ -319,7 +319,7 @@ function MoyBottomNav({ tab, onTab }) {
 }
 
 /* ─── ヘッダ ─────────────────────────────────────────────────────── */
-function MoyHeader({ onClose, account, onMenu }) {
+function MoyHeader({ account, onMenu }) {
   const initial = account
     ? (Array.from(account.display_name || account.handle || "?")[0] || "?")
     : null;
@@ -329,26 +329,23 @@ function MoyHeader({ onClose, account, onMenu }) {
       background: "var(--moy)", color: "#fff", borderBottom: "1.5px solid #000", position: "relative",
       overflow: "hidden" }}>
       <div className="paper-noise" style={{ opacity: 0.1 }} />
-      <button onClick={onClose} aria-label="close" style={{ position: "relative", zIndex: 1,
-        background: "transparent", border: "none", cursor: "pointer", color: "#fff",
-        display: "flex", alignItems: "center", gap: 7,
-        fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 700, letterSpacing: "0.16em" }}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-          <path d="M15 18l-6-6 6-6" />
-        </svg>
-        HOME
-      </button>
       <div style={{ position: "relative", zIndex: 1, display: "flex", alignItems: "center", gap: 7 }}>
         <EmeGem size={20} />
         <span style={{ fontFamily: "'Archivo', var(--font-sans)", fontWeight: 800, fontSize: 18,
           letterSpacing: "-0.02em" }}>MoyMoy</span>
       </div>
       {onMenu && account ? (
-        <button onClick={onMenu} aria-label="account" style={{ position: "relative", zIndex: 1,
-          width: 32, height: 32, flexShrink: 0, border: "1.5px solid #fff", background: "rgba(255,255,255,0.18)",
-          color: "#fff", cursor: "pointer", display: "grid", placeItems: "center",
-          fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15, padding: 0 }}>
-          {initial}
+        <button onClick={onMenu} aria-label="アカウントの切替・追加" style={{ position: "relative", zIndex: 1,
+          maxWidth: 112, minHeight: 36, flexShrink: 0, border: "1.5px solid #fff", background: "rgba(255,255,255,0.18)",
+          color: "#fff", cursor: "pointer", display: "flex", alignItems: "center", gap: 5,
+          fontFamily: "var(--font-jp)", fontWeight: 800, padding: "4px 6px" }}>
+          <span style={{ fontSize: 15 }}>{initial}</span>
+          <span style={{ minWidth: 0, textAlign: "left" }}>
+            <span style={{ display: "block", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {account.display_name || account.handle}
+            </span>
+            <span style={{ display: "block", fontSize: 9 }}>アカウント切替</span>
+          </span>
         </button>
       ) : (
         <div style={{ width: 32 }} />
@@ -358,7 +355,7 @@ function MoyHeader({ onClose, account, onMenu }) {
 }
 
 /* ─── ホーム画面 ─────────────────────────────────────────────────── */
-function MoyHome({ balance, txns, profile, onTab }) {
+function MoyHome({ balance, txns, profile, onTab, onTxn }) {
   return (
     <div style={{ padding: "18px 18px 120px" }}>
       {/* balance hero */}
@@ -405,7 +402,7 @@ function MoyHome({ balance, txns, profile, onTab }) {
       </div>
       <div style={{ marginTop: 10, border: "1.5px solid var(--ink)" }}>
         {txns.slice(0, 4).map((t, i) => (
-          <TxnRow key={t.id} t={t} last={i === Math.min(3, txns.length - 1)} />
+          <TxnRow key={t.id} t={t} last={i === Math.min(3, txns.length - 1)} onClick={() => onTxn(t)} />
         ))}
         {txns.length === 0 && (
           <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",
@@ -417,7 +414,7 @@ function MoyHome({ balance, txns, profile, onTab }) {
 }
 
 /* ─── 取引行 (履歴で共用) ───────────────────────────────────────── */
-function TxnRow({ t, last }) {
+function TxnRow({ t, last, onClick }) {
   const incoming = t.amount > 0;
   const meta = {
     pay:      { glyph: "◈", pal: "emerald", tag: "支払い" },
@@ -427,7 +424,9 @@ function TxnRow({ t, last }) {
     withdraw: { glyph: "↑", pal: "orange", tag: "出金" },
   }[t.kind] || { glyph: "◈", pal: "emerald", tag: "" };
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",
+    <button type="button" onClick={onClick} aria-label={t.label + "の取引詳細"}
+      style={{ display: "flex", width: "100%", textAlign: "left", border: "none", cursor: "pointer",
+      alignItems: "center", gap: 12, padding: "12px 14px",
       borderBottom: last ? "none" : "1px solid rgba(0,0,0,0.08)", background: "var(--bg-white)" }}>
       <div style={{ width: 38, height: 38, flexShrink: 0 }}>
         <CrystalIcon palette={meta.pal} glyph={meta.glyph} size={38} />
@@ -440,7 +439,7 @@ function TxnRow({ t, last }) {
       </div>
       <Eme amount={t.amount} size={16} sign gem={false} suffix={false}
         color={incoming ? "var(--moy-deep)" : "var(--ink)"} weight={700} />
-    </div>
+    </button>
   );
 }
 

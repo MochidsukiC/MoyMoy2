@@ -41,19 +41,10 @@
          it can wrap MoyMoyApp. -->
     <script type="text/babel" src="wallet/moymoy-auth.jsx"></script>
 
-    <!-- Mount. MoyMoyRoot gates the wallet behind handle+PIN auth; the header
-         HOME button asks the OS to exit back to the launcher. -->
+    <!-- Mount. MoyMoyRoot gates the wallet behind handle+PIN auth. -->
     <script type="text/babel" data-presets="react">
-      function exitToHome() {
-        try {
-          if (window.mochi && mochi.os) {
-            if (mochi.os.exit) return mochi.os.exit();
-            if (mochi.os.home) return mochi.os.home();
-          }
-        } catch (e) { /* in-world only */ }
-      }
       const root = ReactDOM.createRoot(document.getElementById("root"));
-      root.render(<MoyMoyRoot onClose={exitToHome} />);
+      root.render(<MoyMoyRoot />);
     </script>
   </body>
 </html>
