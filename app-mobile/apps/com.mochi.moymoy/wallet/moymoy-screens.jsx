@@ -72,13 +72,14 @@ function EmeBlockMini({ size = 34 }) {
 }
 
 /* ─── テンキー ───────────────────────────────────────────────────── */
-function MoyKeypad({ onPress }) {
-  const keys = ["1","2","3","4","5","6","7","8","9","00","0","⌫"];
+function MoyKeypad({ onPress, decimal = false, keepInputFocus = false }) {
+  const keys = ["1","2","3","4","5","6","7","8","9",decimal ? "." : "00","0","⌫"];
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 1,
       background: "var(--ink)", border: "1.5px solid var(--ink)" }}>
       {keys.map(k => (
-        <button key={k} onClick={() => onPress(k)} style={{
+        <button key={k} onMouseDown={keepInputFocus ? e => e.preventDefault() : undefined}
+          onClick={() => onPress(k)} style={{
           height: 58, background: "var(--bg-white)", border: "none", cursor: "pointer",
           fontFamily: "var(--font-mono)", fontWeight: 700, fontSize: k === "⌫" ? 20 : 24,
           color: "var(--ink)", letterSpacing: "0.02em" }}>{k}</button>
@@ -606,18 +607,28 @@ function MoyPay({ txns = [], onTxn }) {
 }
 
 /* ─── 送る (MoyMoy ID 指定 + 最近の相手) ────────────────────────── */
-function MoySend({ friends = [], onPick }) {
+function MoySend({ account, friends = [], onPick }) {
   const [qy, setQy] = msState("");
   const [busy, setBusy] = msState(false);
   const [err, setErr] = msState("");
   const cleanHandle = qy.trim().replace(/^@/, "");
   const handleValid = /^[A-Za-z0-9_]{3,20}$/.test(cleanHandle);
+  const self = cleanHandle.toLowerCase() === account.handle.toLowerCase();
+  const canResolve = handleValid && !self;
   const shown = qy
     ? friends.filter(f => (f.name + " " + (f.sub || "") + " " + (f.handle || "")).toLowerCase().includes(cleanHandle.toLowerCase()))
     : friends;
 
+  function pick(target) {
+    if (target.id === account.account_id || target.handle.toLowerCase() === account.handle.toLowerCase()) {
+      setErr("自分自身には送れません。別の MoyMoy ID を指定してください。");
+      return;
+    }
+    onPick(target);
+  }
+
   async function resolveAndPick() {
-    if (busy) return;
+    if (busy || self) return;
     const h = cleanHandle;
     if (!handleValid) { setErr("MoyMoy ID（半角英数字と _ の3〜20文字）を入力してください"); return; }
     setBusy(true); setErr("");
@@ -625,7 +636,7 @@ function MoySend({ friends = [], onPick }) {
       const r = await MoyMoy.lookup(h);
       if (r.ok && r.account) {
         const name = r.account.display_name || ("@" + r.account.handle);
-        onPick({ id: r.account.account_id, handle: r.account.handle, name,
+        pick({ id: r.account.account_id, handle: r.account.handle, name,
           sub: "@" + r.account.handle, pal: "emerald", glyph: Array.from(name)[0] || "?" });
       } else if (r.error === "not_found") {
         setErr("@" + h + " が見つかりません");
@@ -650,15 +661,15 @@ function MoySend({ friends = [], onPick }) {
             <input value={qy} disabled={busy} onChange={e => { setQy(e.target.value); setErr(""); }}
               onKeyDown={e => { if (e.key === "Enter") resolveAndPick(); }}
               aria-label="送金先の MoyMoy ID" aria-describedby="moy-send-rule moy-send-result"
-              aria-invalid={qy.trim() !== "" && !handleValid}
+              aria-invalid={qy.trim() !== "" && (!handleValid || self)}
               placeholder="MoyMoy ID で送る"
               style={{ flex: 1, minWidth: 0, padding: "12px 4px", border: "none", background: "transparent",
               fontFamily: "var(--font-jp)", fontSize: 14, color: "var(--ink)", outline: "none" }} />
           </div>
-          <button disabled={busy || !handleValid} onClick={resolveAndPick} style={{
-            border: "1.5px solid #000", background: busy || !handleValid ? "#bdbdbd" : "var(--moy)",
-            color: "#fff", boxShadow: busy || !handleValid ? "none" : "3px 3px 0 #0B5A33",
-            cursor: busy || !handleValid ? "default" : "pointer", padding: "0 16px",
+          <button disabled={busy || !canResolve} onClick={resolveAndPick} style={{
+            border: "1.5px solid #000", background: busy || !canResolve ? "#bdbdbd" : "var(--moy)",
+            color: "#fff", boxShadow: busy || !canResolve ? "none" : "3px 3px 0 #0B5A33",
+            cursor: busy || !canResolve ? "default" : "pointer", padding: "0 16px",
             fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15 }}>{busy ? "確認中…" : "送る"}</button>
         </div>
         <div id="moy-send-rule" style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 12,
@@ -667,8 +678,9 @@ function MoySend({ friends = [], onPick }) {
         </div>
         <div id="moy-send-result" role="status" aria-live="polite" style={{ marginTop: 4,
           fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
-          color: err || (qy.trim() && !handleValid) ? "var(--carle-red)" : "var(--ink-soft)" }}>
-          {qy.trim() && !handleValid ? "ID の形式が違います。半角英数字・_ の3〜20文字に直してください。"
+          color: err || self || (qy.trim() && !handleValid) ? "var(--carle-red)" : "var(--ink-soft)" }}>
+          {self ? "自分自身には送れません。別の MoyMoy ID を指定してください。"
+            : qy.trim() && !handleValid ? "ID の形式が違います。半角英数字・_ の3〜20文字に直してください。"
             : err || (busy ? "送金先を確認しています…" : handleValid ? "形式は正しいです。「送る」で相手を確認します。" : "")}
         </div>
       </div>
@@ -677,7 +689,7 @@ function MoySend({ friends = [], onPick }) {
       </div>
       <div style={{ borderTop: "1.5px solid var(--ink)", borderBottom: "1.5px solid var(--ink)" }}>
         {shown.map(f => (
-          <TargetRow key={f.id} item={f} onClick={() => onPick(f)}
+          <TargetRow key={f.id} item={f} onClick={() => pick(f)}
             trailing={<span style={{ fontFamily: "var(--font-mono)", fontSize: 18, color: "var(--moy-deep)" }}>›</span>} />
         ))}
         {shown.length === 0 && (
@@ -697,24 +709,72 @@ function MoySend({ friends = [], onPick }) {
    ユーザーが打てる最大金額という業務上の意味は変えていない。 */
 const MOY_MAX_AMOUNT_MINOR = 999999900;
 
+function useMoyAmountInput(decimal = false) {
+  const [text, setText] = msState("");
+  const inputRef = msRef(null);
+  const caretRef = msRef(null);
+  const valid = (decimal ? /^\d*(?:\.\d{0,2})?$/ : /^\d*$/).test(text);
+  const [whole, cents = ""] = text.split(".");
+  const amount = valid ? Number(whole) * 100 + Number(cents.padEnd(2, "0")) : null;
+  const error = !valid
+    ? decimal ? "金額は半角数字と小数点で、小数2桁まで入力してください。" : "金額は半角数字の整数で入力してください。"
+    : amount > MOY_MAX_AMOUNT_MINOR ? "入力上限は " + formatEme(MOY_MAX_AMOUNT_MINOR) + " エメです。" : "";
+  msEffect(() => {
+    if (caretRef.current !== null) {
+      inputRef.current.focus();
+      inputRef.current.setSelectionRange(caretRef.current, caretRef.current);
+      caretRef.current = null;
+    }
+  }, [text]);
+  function press(key) {
+    const input = inputRef.current;
+    const focused = document.activeElement === input;
+    let start = focused ? input.selectionStart : text.length;
+    const end = focused ? input.selectionEnd : text.length;
+    if (key === "⌫" && start === end) start = Math.max(0, start - 1);
+    const insert = key === "⌫" ? "" : key;
+    caretRef.current = start + insert.length;
+    setText(text.slice(0, start) + insert + text.slice(end));
+    input.focus();
+  }
+  function setAmount(value) {
+    caretRef.current = null;
+    setText(formatEme(value).replace(/,/g, "").replace(/\.00$/, ""));
+  }
+  return { text, amount, error, decimal, inputRef, press, setAmount,
+    onChange: e => { caretRef.current = null; setText(e.target.value); } };
+}
+
+function MoyAmountInput({ entry, id, label, size, color }) {
+  return (
+    <div style={{ width: "100%", maxWidth: 400, margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "center", gap: 8,
+        color: color || "var(--ink)" }}>
+        <EmeGem size={size * 0.62} style={{ alignSelf: "center", flexShrink: 0 }} />
+        <input ref={entry.inputRef} value={entry.text} onChange={entry.onChange}
+          type="text" inputMode={entry.decimal ? "decimal" : "numeric"}
+          aria-label={label} aria-describedby={id + "-rule"} aria-invalid={!!entry.error}
+          placeholder={entry.decimal ? "0.00" : "0"}
+          style={{ width: 0, flex: 1, minWidth: 0, padding: "2px 4px", border: "none",
+            borderBottom: "1.5px solid var(--ink)", background: "transparent", color: "inherit",
+            fontFamily: "'Archivo', var(--font-sans)", fontWeight: 800, fontSize: size,
+            letterSpacing: "-0.03em", fontVariantNumeric: "tabular-nums", textAlign: "right" }} />
+        <span style={{ fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: size * 0.34,
+          opacity: 0.8, flexShrink: 0 }}>エメ</span>
+      </div>
+      <div id={id + "-rule"} role="status" style={{ marginTop: 6, fontFamily: "var(--font-jp)",
+        fontSize: 11, lineHeight: 1.6, textAlign: "center",
+        color: entry.error ? "var(--carle-red)" : "var(--ink-soft)" }}>
+        {entry.error || (entry.decimal ? "0.01エメ単位（小数2桁まで）で入力できます。" : "1エメ単位（整数）で入力してください。")}
+      </div>
+    </div>
+  );
+}
+
 /* ─── 金額入力 (支払う / 送る 共用) ─────────────────────────────── */
 function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
-  // amt は 1/100 エメ単位 (minor) の整数。キーパッドの入力自体は従来どおり
-  // 「整数エメ」で、ここで内部だけ ×100 して保持する — ユーザーの打鍵の
-  // 感覚は変えない。全額ボタンは balance (minor) をそのまま渡すので端数
-  // （セント）を持つことがあり、そこから桁を打ち足すときは
-  // Math.floor(v / 100) でいったんエメの位に戻してから積み増す。
-  const [amt, setAmt] = msState(0);
-  const press = (k) => {
-    setAmt(v => {
-      const eme = Math.floor(v / 100);
-      if (k === "⌫") return Math.floor(eme / 10) * 100;
-      const add = k === "00" ? "00" : k;
-      const nextEme = Number(String(eme) + add);
-      const next = nextEme * 100;
-      return next > MOY_MAX_AMOUNT_MINOR ? v : next;
-    });
-  };
+  const entry = useMoyAmountInput(true);
+  const { amount: amt, setAmount: setAmt, error: amountError } = entry;
   const over = amt > balance;
   const verb = kind === "send" ? "送る" : "支払う";
   return (
@@ -744,7 +804,8 @@ function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
       <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center",
         justifyContent: "center", padding: "10px 22px" }}>
         <div className="eyebrow" style={{ color: "var(--moy-deep)" }}>{verb}金額</div>
-        <Eme amount={amt} size={58} color={over ? "var(--carle-red)" : "var(--ink)"} />
+        <MoyAmountInput entry={entry} id="moy-send-amount" label={verb + "金額"} size={48}
+          color={over || amountError ? "var(--carle-red)" : "var(--ink)"} />
         <div style={{ marginTop: 10, fontFamily: "var(--font-mono)", fontSize: 11,
           color: over ? "var(--carle-red)" : "var(--ink-soft)", letterSpacing: "0.04em" }}>
           {over ? "残高が不足しています" : `利用可能残高  ${formatEme(balance)} エメ`}
@@ -752,7 +813,7 @@ function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
         {/* quick chips — 値は minor (+100 / +500 / +1000 エメ 相当)。 */}
         <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
           {[10000, 50000, 100000].map(q => (
-            <button key={q} onClick={() => setAmt(v => Math.min(MOY_MAX_AMOUNT_MINOR, v + q))} style={{
+            <button key={q} disabled={!!amountError} onClick={() => setAmt(Math.min(MOY_MAX_AMOUNT_MINOR, amt + q))} style={{
               border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "2px 2px 0 var(--ink)",
               padding: "7px 12px", cursor: "pointer", fontFamily: "var(--font-mono)", fontSize: 12, fontWeight: 700 }}>
               +{formatEme(q)}
@@ -766,11 +827,11 @@ function MoyAmountEntry({ kind, target, balance, onCancel, onNext }) {
 
       {/* keypad + cta */}
       <div style={{ padding: "0 16px 24px" }}>
-        <MoyKeypad onPress={press} />
-        <button disabled={amt <= 0 || over} onClick={() => onNext(amt)} style={{
+        <MoyKeypad onPress={entry.press} decimal keepInputFocus />
+        <button disabled={!!amountError || amt <= 0 || over} onClick={() => onNext(amt)} style={{
           width: "100%", marginTop: 12, padding: "16px", border: "1.5px solid #000",
-          background: amt <= 0 || over ? "#bdbdbd" : "var(--moy)", color: "#fff",
-          boxShadow: amt <= 0 || over ? "none" : "4px 4px 0 #0B5A33", cursor: amt <= 0 || over ? "default" : "pointer",
+          background: !!amountError || amt <= 0 || over ? "#bdbdbd" : "var(--moy)", color: "#fff",
+          boxShadow: !!amountError || amt <= 0 || over ? "none" : "4px 4px 0 #0B5A33", cursor: !!amountError || amt <= 0 || over ? "default" : "pointer",
           fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 17, letterSpacing: "0.04em",
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
           <EmeGem size={20} /> {verb}内容を確認
@@ -807,21 +868,8 @@ function MoyCharge({ balance, inv, canCharge, invStatus, attesting, onConfirmCha
   // minor に直したもの。amt もこの後ずっと minor で持つので、以降
   // available と amt はどちらも同じ単位で比較・加算できる。
   const available = (inv.emeralds + inv.blocks * 9) * 100;
-  // amt は 1/100 エメ単位 (minor)。エメラルドは不可分なので、キーパッドは
-  // 従来どおり「整数エメ」だけを積み増せるようにする — Math.floor(v / 100) で
-  // 常にエメの位に戻してから桁を足すため、amt が 100 の倍数以外になることは
-  // 構造的に無く、サーバーの 400 に頼らず 1 エメ未満の入力を防げる。
-  const [amt, setAmt] = msState(0);
-  const press = (k) => {
-    setAmt(v => {
-      const eme = Math.floor(v / 100);
-      if (k === "⌫") return Math.floor(eme / 10) * 100;
-      const add = k === "00" ? "00" : k;
-      const nextEme = Number(String(eme) + add);
-      const next = nextEme * 100;
-      return next > MOY_MAX_AMOUNT_MINOR ? v : next;
-    });
-  };
+  const entry = useMoyAmountInput();
+  const { amount: amt, setAmount: setAmt, error: amountError } = entry;
   const over = amt > available;
 
   if (!canCharge) {
@@ -912,27 +960,28 @@ function MoyCharge({ balance, inv, canCharge, invStatus, attesting, onConfirmCha
 
       <div style={{ marginTop: 18, textAlign: "center" }}>
         <div className="eyebrow" style={{ color: "var(--moy-deep)" }}>チャージ金額</div>
-        <Eme amount={amt} size={48} color={over ? "var(--carle-red)" : "var(--ink)"} />
+        <MoyAmountInput entry={entry} id="moy-charge-amount" label="チャージ金額" size={48}
+          color={over || amountError ? "var(--carle-red)" : "var(--ink)"} />
         <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 11,
           color: over ? "var(--carle-red)" : "var(--ink-soft)" }}>
-          {over ? "手持ちのエメラルドが不足しています" : `チャージ後  ${formatEme(balance + amt)} エメ`}
+          {amountError ? "入力金額を確認してください" : over ? "手持ちのエメラルドが不足しています" : `チャージ後  ${formatEme(balance + amt)} エメ`}
         </div>
       </div>
       <div style={{ display: "flex", gap: 8, marginTop: 14, justifyContent: "center", flexWrap: "wrap" }}>
         {/* 900 = 9エメ (1ブロック分)、6400 = 64エメ (1スタック分)。minor 換算。 */}
-        <button onClick={() => setAmt(v => Math.min(available, v + 900))} style={chipStyle}>＋1ブロック</button>
-        <button onClick={() => setAmt(v => Math.min(available, v + 6400))} style={chipStyle}>＋1スタック</button>
+        <button disabled={!!amountError} onClick={() => setAmt(Math.min(available, amt + 900))} style={chipStyle}>＋1ブロック</button>
+        <button disabled={!!amountError} onClick={() => setAmt(Math.min(available, amt + 6400))} style={chipStyle}>＋1スタック</button>
         <button onClick={() => setAmt(available)} style={{ border: "1.5px solid var(--moy-deep)",
           background: "var(--moy-mint)", padding: "7px 12px", cursor: "pointer", color: "var(--moy-deep)",
           fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700 }}>全部</button>
       </div>
 
       <div style={{ marginTop: 16 }}>
-        <MoyKeypad onPress={press} />
-        <button disabled={amt <= 0 || over} onClick={() => onConfirm(amt)} style={{
+        <MoyKeypad onPress={entry.press} keepInputFocus />
+        <button disabled={!!amountError || amt <= 0 || over} onClick={() => onConfirm(amt)} style={{
           width: "100%", marginTop: 12, padding: "16px", border: "1.5px solid #000",
-          background: amt <= 0 || over ? "#bdbdbd" : "var(--moy)", color: "#fff",
-          boxShadow: amt <= 0 || over ? "none" : "4px 4px 0 #0B5A33", cursor: amt <= 0 || over ? "default" : "pointer",
+          background: !!amountError || amt <= 0 || over ? "#bdbdbd" : "var(--moy)", color: "#fff",
+          boxShadow: !!amountError || amt <= 0 || over ? "none" : "4px 4px 0 #0B5A33", cursor: !!amountError || amt <= 0 || over ? "default" : "pointer",
           fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 17, letterSpacing: "0.04em",
           display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
           <EmeGem size={20} /> エメラルドをチャージ
@@ -2119,7 +2168,7 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
       <div style={{ flex: 1, overflow: "auto", position: "relative" }}>
         {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={goFromHome} onTxn={setSelectedTxn} />}
         {tab === "pay" && <MoyPay txns={txns} onTxn={setSelectedTxn} />}
-        {tab === "send" && <MoySend friends={friends} onPick={t => setFlow({ kind: "send", target: t })} />}
+        {tab === "send" && <MoySend account={account} friends={friends} onPick={t => setFlow({ kind: "send", target: t })} />}
         {tab === "charge" && (
           <>
             <MoyEmeModeSwitch mode={emeMode} onMode={setEmeMode} />
