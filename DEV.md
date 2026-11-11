@@ -267,6 +267,7 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 ### 本番の所在と手順
 - **所在**: EC2 `13.114.100.18`（ubuntu、SSH 鍵は運用者の手元）。`mochi-hub --dev --headless`（systemd `mochi-hub`、env `/etc/mochi/hub-stack.env`、state `/var/lib/mochi`、Postgres で durable）の launcher が `/opt/mochi/bin/app_backends/moymoy/moymoy-cs`（Linux ELF）を起動する。MC は Fabric 26.2（mc1 / school / Velocity）。実験環境で利用者は実験アカウントのみ。ローカルの `MochiOS2.0\run` は本番ではない。
 - **2026-11-12 デプロイ実績**: 本番 DB は v12（エスクロー適用済み）だった → v14 版へ入れ替え（schema v13/v14 適用、9 口座・合計 236.00 エメ・取引 3 件・お店 5 件が前後で不変、quick_check ok）。ユーザーが本番で正常動作を確認。
+- **0.9.1（2026-11-12）**: bf32fb5（`os.qr.onPresentEnded` 対応、JS のみ・scope 追加なし）をアプリだけ再リリース。GitHub `v0.9.1`（tag → b47d83a）、bundle sha256 `dde6c4f3…`・427520 bytes を実資産と照合済み。本番ストアへ登録済み（registry 201、read-back 一致）。サーバー入れ替えなし。
 - **Linux ビルド**: WSL で `CARGO_TARGET_DIR=/root/moymoy-linux-target cargo build --release`。
 - **移行リハーサル**: 本番ホストで SQLite backup API のコピーに新バイナリを loopback・TLS/トンネル無しで起動して検証。
 - **入れ替え**: backup API で DB 退避（`/home/ubuntu/deploy/moymoy-0.9.0/backup-pre-v13/`）→ バイナリを atomic mv → moymoy-cs の PID だけ SIGTERM（launcher が 2 秒以内に再起動、Hub 再起動不要）。
