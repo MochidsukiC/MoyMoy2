@@ -358,6 +358,17 @@ pub const STATIC_QR_PREFIX: &str = "sq_";
 /// physical blocks, so the URL has to be one that does not move.
 const STATIC_QR_URL_BASE: &str = "https://moymoy.cs.mnn/qr/s/";
 
+/// Where one intent's (dynamic) QR resolves to a landing page — `qr.rs` serves
+/// `GET /qr/i/:intent_id`. Fixed rather than configured, like
+/// [`STATIC_QR_URL_BASE`], for the same reason: a printed or displayed code has to
+/// name a host that does not move.
+const INTENT_QR_URL_BASE: &str = "https://moymoy.cs.mnn/qr/i/";
+
+/// The URL to encode in the QR for the intent `intent_id`.
+pub fn intent_qr_url(intent_id: &str) -> String {
+    format!("{INTENT_QR_URL_BASE}{intent_id}")
+}
+
 /// A fresh static QR code. Unguessable (128 bits) so codes cannot be enumerated
 /// into a list of shops, though it is not a secret once printed.
 fn gen_static_qr_code() -> String {
@@ -855,10 +866,12 @@ pub enum IssueGuard {
 /// *ask* for money, and an intent that was created and abandoned still went in
 /// front of a customer.
 ///
-/// **Both counts are over `source = 'api'` only.** A bill a customer created by
-/// scanning the shop's static QR code is not the shop asking for anything; if it
-/// counted, anybody holding the printed code could use up the shop's ceilings
-/// just by creating bills (see [`payments::create`]). `close` deliberately does
+/// **Both counts are over `source IN ('api', 'portal')` only.** A bill the shop's
+/// owner issues from the portal is the shop asking for money exactly as its
+/// backend is, so it counts. A bill a customer created by scanning the shop's
+/// static QR code is not the shop asking for anything; if it counted, anybody
+/// holding the printed code could use up the shop's ceilings just by creating
+/// bills (see [`payments::create`]). `close` deliberately does
 /// NOT filter by source — a customer may be looking at a static-QR bill, and
 /// closing the shop under them is the same harm as for any other.
 pub fn check_issuance(
@@ -869,7 +882,8 @@ pub fn check_issuance(
 ) -> rusqlite::Result<IssueGuard> {
     let open: i64 = tx.query_row(
         "SELECT COUNT(*) FROM payment_intents \
-         WHERE merchant_id = ?1 AND state = ?2 AND expires_unix_ms > ?3 AND source = 'api'",
+         WHERE merchant_id = ?1 AND state = ?2 AND expires_unix_ms > ?3 \
+           AND source IN ('api', 'portal')",
         params![m.merchant_id, crate::payments::STATE_CREATED, now],
         |r| r.get(0),
     )?;
@@ -880,7 +894,8 @@ pub fn check_issuance(
     }
     let issued: i64 = tx.query_row(
         "SELECT COALESCE(SUM(amount), 0) FROM payment_intents \
-         WHERE merchant_id = ?1 AND created_unix_ms > ?2 AND source = 'api'",
+         WHERE merchant_id = ?1 AND created_unix_ms > ?2 \
+           AND source IN ('api', 'portal')",
         params![m.merchant_id, now - 24 * 60 * 60 * 1000],
         |r| r.get(0),
     )?;
@@ -1350,6 +1365,9 @@ pub(crate) async fn portal_list(
 pub(crate) struct PortalSalesQuery {
     merchant_id: String,
     limit: Option<i64>,
+    /// `all` (default) | `open` | `held` | `paid` | `expired` | `canceled` | `declined` —
+    /// see [`payments::SalesFilter`].
+    state: Option<String>,
 }
 
 /// What has been paid to one of this account's shops, and how much of it MoyMoy
@@ -1378,7 +1396,25 @@ pub(crate) async fn portal_sales(
     State(st): State<AppState>,
     acct: AuthedAccount,
     Query(q): Query<PortalSalesQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // Refused as a `400` before anything is read: an unrecognised filter is the
+    // caller's mistake, and answering it with the unfiltered list would show a
+    // shop every bill under a heading that says it is looking at a few.
+    let filter = match q.state.as_deref() {
+        None => payments::SalesFilter::All,
+        Some(s) => match payments::SalesFilter::parse(s) {
+            Some(f) => f,
+            None => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false, "error": "bad_state",
+                        "detail": "`state` must be one of all, open, held, paid, expired, canceled, declined",
+                    })),
+                ))
+            }
+        },
+    };
     let value = blocking(st.pool, move |conn| {
         // Ownership decides visibility, and a shop that is not this account's
         // reads as one that does not exist — the discipline every other
@@ -1394,6 +1430,7 @@ pub(crate) async fn portal_sales(
             &m,
             q.limit.unwrap_or(payments::SALES_DEFAULT_LIMIT),
             now_ms(),
+            filter,
         )?;
         let mut page = page;
         if let Some(obj) = page.as_object_mut() {
@@ -1402,7 +1439,7 @@ pub(crate) async fn portal_sales(
         Ok(page)
     })
     .await?;
-    Ok(Json(value))
+    Ok(ok_json(value))
 }
 
 #[derive(Deserialize)]
@@ -1504,6 +1541,169 @@ pub(crate) async fn portal_fulfill(
     Ok((value.0, Json(value.1)))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct PortalIntentCreateReq {
+    merchant_id: String,
+    idem_key: String,
+    /// Optional in the struct, and `amount` accepted only to be refused, for the
+    /// reasons [`IntentCreateReq::amount_minor`] gives; both go through
+    /// [`amount_minor_of`].
+    amount_minor: Option<i64>,
+    amount: Option<i64>,
+    description: String,
+    order_ref: Option<String>,
+    expires_in_secs: Option<i64>,
+}
+
+/// Issue a bill (a payment intent) from the portal, on the owner's say-so, and
+/// hand back the URL its QR encodes.
+///
+/// **Session only, no PIN** (an explicit decision). Creating a bill moves no
+/// money: the customer still has to approve it with their own PIN, and it is
+/// bounded by the same open-intent and daily ceilings as the API-key route (this
+/// counts as `source = 'portal'`, which `check_issuance` includes). Asking for a
+/// PIN to say "please pay me" is the habit-forming prompt `payments::decline`
+/// argues against; and what a stolen session can do here — issue bills inside the
+/// shop's ceilings that a customer must still choose to pay — is no more than the
+/// shop's own API key already can.
+///
+/// The checks, the idempotency scope, the rate-limit key and every refusal are
+/// `/merchant/v1/intent/create`'s ([`intent_create`]); the work is the same
+/// [`payments::create`]. The success body adds `qr_url`, and is what idempotency
+/// stores, so a replay carries it too.
+pub(crate) async fn portal_intent_create(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalIntentCreateReq>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if req.idem_key.trim().is_empty() {
+        return Err(ApiError::bad_request("idem_key required"));
+    }
+    // Before the rate limiter and the idempotency replay, as in `intent_create`.
+    let amount_minor = match amount_minor_of(req.amount_minor, req.amount) {
+        Ok(a) => a,
+        Err(refused) => return Ok(refused),
+    };
+    let rate = st.rate.clone();
+    let (status, value) = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Ownership decides visibility (see `portal_sales`), and it is decided
+        // BEFORE the rate limiter: the limiter key is the shop's, so counting an
+        // outsider's calls against it would let anybody exhaust a stranger's
+        // budget. A closed shop reads as unknown, a stopped one as not active
+        // (the split `issue_static_qr` makes).
+        let Some(m) = get(&tx, &req.merchant_id)?
+            .filter(|m| m.owner_account_id.as_deref() == Some(acct.account_id.as_str()))
+            .filter(|m| m.status != STATUS_DELETED)
+        else {
+            return Ok::<(StatusCode, Value), ApiError>((
+                StatusCode::OK,
+                json!({ "ok": false, "error": "unknown_merchant" }),
+            ));
+        };
+        if !m.is_active() {
+            return Ok((
+                StatusCode::OK,
+                json!({ "ok": false, "error": "merchant_not_active" }),
+            ));
+        }
+        // The same key as `intent_create`: one budget of creates per shop,
+        // however it is spent.
+        if let Err(retry_after_ms) = rate.check(
+            &format!("mint:{}", m.merchant_id),
+            RL_INTENT_CREATE.0,
+            RL_INTENT_CREATE.1,
+            now_ms(),
+        ) {
+            let (s, Json(v)) = rate_limited(retry_after_ms);
+            return Ok((s, v));
+        }
+        let scope = payments::intent_scope(&m.merchant_id);
+        if let Some(prev) = db::idem_get(&tx, &req.idem_key, &scope)? {
+            return Ok((StatusCode::OK, replay(prev)));
+        }
+        let out = payments::create(
+            &tx,
+            &m,
+            &NewIntent {
+                idem_key: &req.idem_key,
+                amount: amount_minor,
+                description: &req.description,
+                order_ref: req.order_ref.as_deref(),
+                // A portal bill opens the wallet app on nothing in particular,
+                // and is addressed to whoever scans it.
+                launch_app_id: None,
+                payer_hint_account_id: None,
+                expires_in_secs: req.expires_in_secs,
+                source: payments::IntentSource::Portal,
+            },
+        )?;
+        let v = match created_or_refusal(out)? {
+            Created::Intent(i) => {
+                let v = json!({
+                    "ok": true, "intent_id": i.intent_id, "state": i.state,
+                    "amount_minor": i.amount, "expires_unix_ms": i.expires_unix_ms,
+                    "qr_url": intent_qr_url(&i.intent_id),
+                });
+                db::idem_put(&tx, &req.idem_key, &scope, &v.to_string())?;
+                v
+            }
+            Created::Refused(v) => v,
+        };
+        tx.commit()?;
+        Ok((StatusCode::OK, v))
+    })
+    .await?;
+    Ok((status, Json(value)))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PortalIntentCancelReq {
+    merchant_id: String,
+    intent_id: String,
+}
+
+/// Withdraw one of this account's shops' unanswered bills from the portal.
+///
+/// **Session only, no PIN**, for the reason `payments::cancel` needs none from an
+/// API key: it only withdraws a request for money, and an intent that has been
+/// paid stays paid. The body is [`payments::cancel`]'s, unchanged.
+pub(crate) async fn portal_intent_cancel(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalIntentCancelReq>,
+) -> Result<Json<Value>, ApiError> {
+    if req.intent_id.trim().is_empty() {
+        return Err(ApiError::bad_request("intent_id required"));
+    }
+    let watch = st.watch.clone();
+    let intent_id = req.intent_id.clone();
+    let result = blocking(st.pool, move |conn| {
+        // Ownership decides visibility (see `portal_sales`). `payments::cancel`
+        // then filters on the merchant itself, so another shop's intent reads as
+        // `unknown_intent`.
+        let owned = get(conn, &req.merchant_id)?
+            .filter(|m| m.owner_account_id.as_deref() == Some(acct.account_id.as_str()))
+            .filter(|m| m.status != STATUS_DELETED);
+        let Some(m) = owned else {
+            return Ok::<(Value, bool), ApiError>((
+                json!({ "ok": false, "error": "unknown_merchant" }),
+                false,
+            ));
+        };
+        let v = payments::cancel(conn, &req.intent_id, &m.merchant_id)?;
+        Ok((v, true))
+    })
+    .await;
+    // After the commit (`cancel` runs in autocommit) and whatever its outcome, as
+    // in `intent_cancel`: a long-poll on this intent re-reads the row when woken.
+    // Not for a shop that was never this account's — nothing was attempted.
+    if matches!(result, Ok((_, true))) {
+        watch.notify(&intent_id);
+    }
+    Ok(Json(result?.0))
+}
+
 // ── merchant API (Bearer moy_sk_…) ───────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1583,6 +1783,44 @@ pub(crate) fn amount_minor_of(
     }
 }
 
+/// What [`payments::create`] decided, as the two create endpoints
+/// ([`intent_create`], [`portal_intent_create`]) need it.
+enum Created {
+    Intent(Box<payments::Intent>),
+    /// The `{ok:false, error, …}` body to send; nothing is stored for replay.
+    Refused(Value),
+}
+
+/// Map every refusal of [`payments::create`] to its JSON body, once, so the API
+/// key route and the portal route cannot drift apart.
+fn created_or_refusal(out: CreateOutcome) -> Result<Created, ApiError> {
+    Ok(match out {
+        CreateOutcome::Ok(i) => Created::Intent(Box::new(i)),
+        CreateOutcome::BadAmount => {
+            Created::Refused(json!({ "ok": false, "error": "bad_amount" }))
+        }
+        CreateOutcome::BadDescription(e) => Created::Refused(
+            json!({ "ok": false, "error": "bad_description", "reason": e.code() }),
+        ),
+        CreateOutcome::BadOrderRef(e) => Created::Refused(
+            json!({ "ok": false, "error": "bad_order_ref", "reason": e.code() }),
+        ),
+        CreateOutcome::BadTtl => Created::Refused(json!({
+            "ok": false, "error": "bad_expires_in_secs",
+            "min": payments::MIN_TTL_SECS, "max": payments::MAX_TTL_SECS,
+        })),
+        CreateOutcome::Capped(IssueGuard::TooManyOpen { limit }) => Created::Refused(
+            json!({ "ok": false, "error": "too_many_open_intents", "limit": limit }),
+        ),
+        CreateOutcome::Capped(IssueGuard::DailyCapExceeded { limit, issued }) => Created::Refused(
+            json!({ "ok": false, "error": "daily_issue_cap", "limit": limit, "issued": issued }),
+        ),
+        CreateOutcome::Capped(IssueGuard::Ok) => {
+            return Err(ApiError::internal("issuance guard reported Ok as a refusal"))
+        }
+    })
+}
+
 pub(crate) async fn intent_create(
     State(st): State<AppState>,
     m: MerchantAuth,
@@ -1640,8 +1878,8 @@ pub(crate) async fn intent_create(
                 source: payments::IntentSource::Api,
             },
         )?;
-        let v = match out {
-            CreateOutcome::Ok(i) => {
+        let v = match created_or_refusal(out)? {
+            Created::Intent(i) => {
                 // `amount_minor` on the way out as well as in: an integrator that
                 // reads back `amount` gets nothing rather than a number in a unit
                 // it would misread. The reply is frozen for replay, so v8 renames
@@ -1653,26 +1891,7 @@ pub(crate) async fn intent_create(
                 db::idem_put(&tx, &req.idem_key, &scope, &v.to_string())?;
                 v
             }
-            CreateOutcome::BadAmount => json!({ "ok": false, "error": "bad_amount" }),
-            CreateOutcome::BadDescription(e) => {
-                json!({ "ok": false, "error": "bad_description", "reason": e.code() })
-            }
-            CreateOutcome::BadOrderRef(e) => {
-                json!({ "ok": false, "error": "bad_order_ref", "reason": e.code() })
-            }
-            CreateOutcome::BadTtl => json!({
-                "ok": false, "error": "bad_expires_in_secs",
-                "min": payments::MIN_TTL_SECS, "max": payments::MAX_TTL_SECS,
-            }),
-            CreateOutcome::Capped(IssueGuard::TooManyOpen { limit }) => {
-                json!({ "ok": false, "error": "too_many_open_intents", "limit": limit })
-            }
-            CreateOutcome::Capped(IssueGuard::DailyCapExceeded { limit, issued }) => {
-                json!({ "ok": false, "error": "daily_issue_cap", "limit": limit, "issued": issued })
-            }
-            CreateOutcome::Capped(IssueGuard::Ok) => {
-                return Err(ApiError::internal("issuance guard reported Ok as a refusal"))
-            }
+            Created::Refused(v) => v,
         };
         tx.commit()?;
         Ok(v)

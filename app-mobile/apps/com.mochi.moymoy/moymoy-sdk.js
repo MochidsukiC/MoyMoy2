@@ -702,9 +702,14 @@
       }),
     // Sales + escrow status. Read-only, session-only (no PIN) — same trust
     // level as merchantList. `limit` is optional; the server clamps it
-    // (default 50 / max 200) and echoes the effective value back.
-    merchantSales: (merchantId, limit) =>
-      getJson("/merchant/portal/sales", { merchant_id: merchantId, limit }),
+    // (default 50 / max 200) and echoes the effective value back. `state` is
+    // optional too: all (default) | held | open | paid | expired | canceled |
+    // declined. `held` is a paid bill still waiting for the shop's "handed over"
+    // report; `open` is a bill nobody has paid yet. An unknown value is a 400
+    // `bad_state`, which this call (no `domainErrors`) surfaces as a thrown error.
+    // The totals in the answer cover every bill, whatever the filter.
+    merchantSales: (merchantId, limit, state) =>
+      getJson("/merchant/portal/sales", { merchant_id: merchantId, limit, state }),
     // (Re)issue the shop's static QR. Session + PIN. Re-issuing invalidates the
     // old code, so callers must say so before asking for the PIN.
     portalStaticQr: (merchantId, pin) =>
@@ -719,6 +724,28 @@
         fulfilled_amount_minor: fulfilledAmountMinor,
         reason: reason || undefined,
       }, undefined, true),
+    // Issue a bill (payment intent) from the portal, for a QR the shop shows
+    // itself. Session only — NO PIN: it only creates a request that the PAYER must
+    // still approve with their own PIN. `input` = {amountMinor, description,
+    // orderRef?, expiresInSecs?}. Pass a stable `idemKey` per identical input so a
+    // retry after a lost response replays the same bill; DIFFERENT input must use
+    // a new key. Success carries `qr_url`; refusals (too_many_open_intents,
+    // daily_issue_cap, bad_*, ...) come back as `{ok:false, error, ...}`.
+    portalIntentCreate: (merchantId, input, idemKey) =>
+      postJson("/merchant/portal/intent/create", {
+        merchant_id: merchantId,
+        amount_minor: input.amountMinor,
+        description: input.description,
+        order_ref: input.orderRef || undefined,
+        expires_in_secs: input.expiresInSecs,
+        idem_key: idemKey || newIdem(),
+      }, undefined, true),
+    // Withdraw an unpaid bill. Session only — NO PIN (it can only stop a request,
+    // never move money). A bill that was paid in the meantime answers
+    // `{ok:false, error:"already_paid", state}` rather than being cancelled.
+    portalIntentCancel: (merchantId, intentId) =>
+      postJson("/merchant/portal/intent/cancel",
+        { merchant_id: merchantId, intent_id: intentId }, undefined, true),
 
     // ── OS launch intent ──
     // Consume the payload another app launched us with. Single-use: a second call

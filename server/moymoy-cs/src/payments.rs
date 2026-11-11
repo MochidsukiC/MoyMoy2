@@ -112,6 +112,9 @@ pub enum IntentSource {
     Api,
     /// Created by a customer's wallet from a shop's static QR code.
     StaticQr,
+    /// Created by the shop's owner from the portal (session). The shop chose to
+    /// issue it, so it counts against the issuance ceilings exactly like `Api`.
+    Portal,
 }
 
 impl IntentSource {
@@ -120,6 +123,7 @@ impl IntentSource {
         match self {
             IntentSource::Api => "api",
             IntentSource::StaticQr => "static_qr",
+            IntentSource::Portal => "portal",
         }
     }
 
@@ -127,6 +131,7 @@ impl IntentSource {
         match s {
             "api" => Some(IntentSource::Api),
             "static_qr" => Some(IntentSource::StaticQr),
+            "portal" => Some(IntentSource::Portal),
             _ => None,
         }
     }
@@ -289,7 +294,7 @@ pub struct NewIntent<'a> {
     pub payer_hint_account_id: Option<&'a str>,
     pub expires_in_secs: Option<i64>,
     /// Who is creating it. `StaticQr` exempts the create from the shop's
-    /// issuance ceilings — see [`create`].
+    /// issuance ceilings; `Api` and `Portal` are counted — see [`create`].
     pub source: IntentSource,
 }
 
@@ -311,7 +316,9 @@ pub enum CreateOutcome {
 /// ## A static-QR intent is not counted against the shop's ceilings
 ///
 /// `source == StaticQr` skips [`merchant::check_issuance`] (and
-/// `check_issuance` itself counts only `source = 'api'` rows). The ceilings exist
+/// `check_issuance` itself counts only `source IN ('api', 'portal')` rows — a bill
+/// the shop's owner issues from the portal is the shop asking for money, the same
+/// as one its backend issues). The ceilings exist
 /// to bound how fast a SHOP can ask for money. A static-QR bill is created by a
 /// customer, not by the shop; if it counted, anybody holding the printed code
 /// could fill the shop's open-intent ceiling by creating bills and stop the shop
@@ -342,7 +349,7 @@ pub fn create(
         return Ok(CreateOutcome::BadTtl);
     }
     let now = now_ms();
-    if req.source == IntentSource::Api {
+    if matches!(req.source, IntentSource::Api | IntentSource::Portal) {
         match merchant::check_issuance(tx, m, req.amount, now)? {
             IssueGuard::Ok => {}
             capped => return Ok(CreateOutcome::Capped(capped)),
@@ -616,6 +623,71 @@ pub fn fulfill(
 pub const SALES_DEFAULT_LIMIT: i64 = 50;
 pub const SALES_MAX_LIMIT: i64 = 200;
 
+/// Which of a shop's intents the sales page lists (the portal's `state` query).
+///
+/// The names are the states a shop SEES — [`Intent::effective_state`] — not the
+/// stored ones: a `created` intent past its deadline is `expired` here whether or
+/// not the sweep has rewritten it, and is not `open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SalesFilter {
+    All,
+    /// Still payable: `created` and not past its deadline.
+    Open,
+    /// Paid, its money still in escrow, and the shop has not reported on it:
+    /// exactly the intents for which [`escrow_stage`] says `"held"` (so a parked,
+    /// fulfilled or released one is NOT here). These are the orders waiting on the
+    /// shop to say it handed the goods over.
+    Held,
+    /// Past its deadline, swept or not.
+    Expired,
+    /// Exactly this stored state (`paid`, `canceled`, `declined`).
+    State(&'static str),
+}
+
+impl SalesFilter {
+    /// The portal's `state` value, or `None` for anything unrecognised.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "all" => Some(SalesFilter::All),
+            "open" => Some(SalesFilter::Open),
+            "held" => Some(SalesFilter::Held),
+            "expired" => Some(SalesFilter::Expired),
+            "paid" => Some(SalesFilter::State(STATE_PAID)),
+            "canceled" => Some(SalesFilter::State(STATE_CANCELED)),
+            "declined" => Some(SalesFilter::State(STATE_DECLINED)),
+            _ => None,
+        }
+    }
+
+    /// The `AND …` fragment for the sales query, and whether it uses `?3` (now).
+    fn sql(self) -> (String, bool) {
+        match self {
+            SalesFilter::All => (String::new(), false),
+            SalesFilter::Open => (
+                format!(" AND state = '{STATE_CREATED}' AND expires_unix_ms > ?3"),
+                true,
+            ),
+            // `escrow_stage`'s `held` arm, written as columns: escrowed, not
+            // fulfilled, not released — and not parked (parked outranks the
+            // match there, and with `released` NULL it is just `parked IS NULL`).
+            SalesFilter::Held => (
+                " AND escrowed_unix_ms IS NOT NULL AND fulfilled_unix_ms IS NULL \
+                  AND released_unix_ms IS NULL AND escrow_parked_unix_ms IS NULL"
+                    .to_string(),
+                false,
+            ),
+            SalesFilter::Expired => (
+                format!(
+                    " AND (state = '{STATE_EXPIRED}' \
+                          OR (state = '{STATE_CREATED}' AND expires_unix_ms <= ?3))"
+                ),
+                true,
+            ),
+            SalesFilter::State(s) => (format!(" AND state = '{s}'"), false),
+        }
+    }
+}
+
 /// Everything a shop's owner sees about what has been paid to it.
 ///
 /// ## `held_total_minor` is DERIVED, not a balance
@@ -636,6 +708,7 @@ pub fn sales_page(
     m: &MerchantRow,
     limit: i64,
     now: i64,
+    filter: SalesFilter,
 ) -> Result<Value, ApiError> {
     let limit = limit.clamp(1, SALES_MAX_LIMIT);
     // One more than asked for, purely to answer "is there more?". A page that
@@ -650,13 +723,23 @@ pub fn sales_page(
         // agrees with "newest first" rather than being an arbitrary tiebreak on a
         // random id. The plan still drives the primary ordering off
         // `idx_intents_merchant_time`; only the tie groups are sorted.
+        //
+        // The filter is a fixed fragment chosen from [`SalesFilter`], never text
+        // from the caller; `?3` is `now` and is bound only by the fragments that
+        // mention it (SQLite counts a statement's parameters by the highest index
+        // it uses, and rusqlite refuses a mismatch).
+        let (clause, uses_now) = filter.sql();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {INTENT_COLS} FROM payment_intents WHERE merchant_id = ?1 \
+            "SELECT {INTENT_COLS} FROM payment_intents WHERE merchant_id = ?1{clause} \
              ORDER BY created_unix_ms DESC, rowid DESC LIMIT ?2"
         ))?;
-        let v = stmt
-            .query_map(params![m.merchant_id, limit + 1], row_to_intent)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let v = if uses_now {
+            stmt.query_map(params![m.merchant_id, limit + 1, now], row_to_intent)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![m.merchant_id, limit + 1], row_to_intent)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
         v
     };
     let truncated = rows.len() as i64 > limit;
@@ -671,12 +754,21 @@ pub fn sales_page(
             // sales wants to tell a till-side QR payment from an API-created bill.
             if let Some(obj) = row.as_object_mut() {
                 obj.insert("source".to_string(), json!(i.source.as_db()));
+                // The URL its QR encodes — only while the bill can still be
+                // paid. Keyed off the EFFECTIVE state, like `state` itself, so a
+                // bill past its deadline stops offering a code before the sweep
+                // has rewritten the row.
+                let qr_url = (i.effective_state(now) == STATE_CREATED)
+                    .then(|| merchant::intent_qr_url(&i.intent_id));
+                obj.insert("qr_url".to_string(), json!(qr_url));
             }
             Ok(row)
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
 
-    // Counted from the intents, not from any balance — see the note above.
+    // Counted from the intents, not from any balance — see the note above. Over
+    // ALL of the shop's intents whatever `filter` is: the held money does not
+    // shrink because the owner is looking at only the open bills.
     let (held_count, held_total): (i64, i64) = conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payment_intents \
          WHERE merchant_id = ?1 AND escrowed_unix_ms IS NOT NULL AND released_unix_ms IS NULL",
@@ -3062,7 +3154,7 @@ mod tests {
 
         let page = {
             let conn = pool.get().unwrap();
-            sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms()).unwrap()
+            sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms(), SalesFilter::All).unwrap()
         };
 
         // Held = escrowed and not yet released, whatever stage they are at: the
@@ -3105,18 +3197,18 @@ mod tests {
         }
         let conn = pool.get().unwrap();
 
-        let page = sales_page(&conn, &m, 2, now_ms()).unwrap();
+        let page = sales_page(&conn, &m, 2, now_ms(), SalesFilter::All).unwrap();
         assert_eq!(page["sales"].as_array().unwrap().len(), 2);
         assert_eq!(page["limit"], json!(2));
         assert_eq!(page["truncated"], json!(true));
 
         // Asking for everything there is says so too.
-        let all = sales_page(&conn, &m, 50, now_ms()).unwrap();
+        let all = sales_page(&conn, &m, 50, now_ms(), SalesFilter::All).unwrap();
         assert_eq!(all["sales"].as_array().unwrap().len(), 5);
         assert_eq!(all["truncated"], json!(false));
 
         // The ceiling is the wallet's, not the caller's.
-        let huge = sales_page(&conn, &m, 10_000, now_ms()).unwrap();
+        let huge = sales_page(&conn, &m, 10_000, now_ms(), SalesFilter::All).unwrap();
         assert_eq!(huge["limit"], json!(SALES_MAX_LIMIT));
     }
 
@@ -3126,7 +3218,7 @@ mod tests {
         // has never traded is a page the UI has to special-case.
         let (pool, _intent_id, m) = fixture(300, 1_000);
         let conn = pool.get().unwrap();
-        let page = sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms()).unwrap();
+        let page = sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms(), SalesFilter::All).unwrap();
         assert_eq!(page["held_count"], json!(0));
         assert_eq!(page["held_total_minor"], json!(0));
     }
@@ -3339,7 +3431,7 @@ mod tests {
 
         let page = {
             let conn = pool.get().unwrap();
-            sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms()).unwrap()
+            sales_page(&conn, &m, SALES_DEFAULT_LIMIT, now_ms(), SalesFilter::All).unwrap()
         };
         assert_eq!(page["held_count"], json!(1));
         assert_eq!(page["held_total_minor"], json!(300));

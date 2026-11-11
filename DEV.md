@@ -33,7 +33,7 @@ UIフロー:
 - **pay**: 近くの加盟店選択 → 金額 → 確認 → 完了、というデザイン当初の直接送金フローは v6 で廃止（`/wallet/pay` 削除、§EC決済）。決済は加盟店が発行する PaymentIntent の承認画面に置き換わった（実装済み、§EC決済）。
 - **charge**: チャージ/出金セグメント切替。チャージはインベントリ(手持ちエメラルド + ブロック、9エメラルド=1ブロック)を換算 → 金額 → 確認 → 完了、エメラルド消費し残高加算。出金は金額 → 着金先キャラクター確認 → 完了、残高減で mod がエメラルド付与（§出金整合）。いずれも**MC mod 依存**。
 - **history**: 全取引リスト(フィルタ: すべて/支払い/送金/チャージ/出金)。ボトムナビには無く、ホームのクイックアクション「履歴」または「最近の取引」の「すべて →」から開く。
-- **shop**: 加盟店管理（`MerchantPortal` を `inline` で埋め込み。登録・キー・店頭 QR・売上と「渡した」報告）。設定シートの「加盟店管理」もこのタブへ移動する。
+- **shop**: 加盟店管理（`MerchantPortal` を `inline` で埋め込み。登録・キー・店頭 QR・売上と「渡した」報告・請求管理）。お店の一覧・詳細に「渡し待ち N 件」を出し、請求管理ページ（§QR 決済）へ導く。設定シートの「加盟店管理」もこのタブへ移動する。
 
 ### アカウントモデル（v2・独立アカウント + PIN）
 **独立した MoyMoy アカウント（電子マネー型）**。`account_id` はサーバ生成 UUID で、Minecraft UUID とは独立。
@@ -62,7 +62,8 @@ UIフロー:
 - `POST /wallet/link {mochi_account_id}` → 入金通知の送り先デバイス登録（session, §入金通知）
 - `POST /wallet/_dev/credit {handle, amount}` → dev 専用クレジット（`MOYMOY_DEV_CREDIT=1` ゲート）
 - **EC決済（MoyMoy Pay、v6）**: `GET /wallet/payment/intent?intent_id=`（承認画面が表示する唯一の情報源）／ `POST /wallet/payment/approve {intent_id, pin}`（常に PIN 必須）／ `POST /wallet/payment/decline {intent_id}`（PIN不要）。`POST /wallet/pay` は廃止（下記§EC決済）
-- **QR 決済（v13）**: 公開（セッション不要）`GET /qr/i/:intent_id`・`GET /qr/s/:code`（着地ページ HTML。形式不正は 404 `not found` text/plain）・`GET /qr/launch.js` ／ ウォレット（セッション）`GET /wallet/qr/static?code=` → `{ok:true, merchant:<merchant_face>}` または `{ok:false, error:"unknown_static_qr"}`、`POST /wallet/qr/static/intent {code, amount_minor, idem_key}` → `{ok, intent_id, amount_minor, expires_unix_ms}`（失敗: `unknown_static_qr` / `bad_amount`、旧 `amount` は 400 `unsupported_amount_unit`、`amount_minor` 無しは 400 `missing_amount_minor`、レート制限 429 `rate_limited`） ／ 加盟店管理（セッション+PIN）`POST /merchant/portal/static-qr {merchant_id, pin}` → `{ok, static_qr_code, static_qr_url}`（失敗: `unknown_merchant` / `merchant_not_active`、PIN 系は他の portal と同じ） ／ 加盟店管理（**セッションのみ・PIN なし**）`POST /merchant/portal/fulfill {merchant_id, intent_id, fulfilled_amount_minor, reason?}`（本体・ステータスは `/merchant/v1/intent/fulfill` と同一、他人の店は `unknown_merchant`） ／ 加盟店 API（Bearer）`GET /merchant/v1/intent/wait?intent_id=&timeout_secs=` → `{ok, intent, timed_out}`（`intent` は `intent/get` と同じ形。§QR 決済）。売上ページ（`/merchant/portal/sales`）の各行に `source`（`api`/`static_qr`）、加盟店一覧に `static_qr_url` が付く。
+- **QR 決済（v13）**: 公開（セッション不要）`GET /qr/i/:intent_id`・`GET /qr/s/:code`（着地ページ HTML。形式不正は 404 `not found` text/plain）・`GET /qr/launch.js` ／ ウォレット（セッション）`GET /wallet/qr/static?code=` → `{ok:true, merchant:<merchant_face>}` または `{ok:false, error:"unknown_static_qr"}`、`POST /wallet/qr/static/intent {code, amount_minor, idem_key}` → `{ok, intent_id, amount_minor, expires_unix_ms}`（失敗: `unknown_static_qr` / `bad_amount`、旧 `amount` は 400 `unsupported_amount_unit`、`amount_minor` 無しは 400 `missing_amount_minor`、レート制限 429 `rate_limited`） ／ 加盟店管理（セッション+PIN）`POST /merchant/portal/static-qr {merchant_id, pin}` → `{ok, static_qr_code, static_qr_url}`（失敗: `unknown_merchant` / `merchant_not_active`、PIN 系は他の portal と同じ） ／ 加盟店管理（**セッションのみ・PIN なし**）`POST /merchant/portal/fulfill {merchant_id, intent_id, fulfilled_amount_minor, reason?}`（本体・ステータスは `/merchant/v1/intent/fulfill` と同一、他人の店は `unknown_merchant`） ／ 加盟店 API（Bearer）`GET /merchant/v1/intent/wait?intent_id=&timeout_secs=` → `{ok, intent, timed_out}`（`intent` は `intent/get` と同じ形。§QR 決済）。売上ページ（`/merchant/portal/sales`）の各行に `source`（`api`/`static_qr`/`portal`）、加盟店一覧に `static_qr_url` が付く。
+- **請求管理（ポータル、セッションのみ・PIN なし）**: `POST /merchant/portal/intent/create {merchant_id, amount_minor, description, idem_key, order_ref?, expires_in_secs?}` → 成功 `{ok:true, intent_id, state, amount_minor, expires_unix_ms, qr_url}`（`qr_url` = `/qr/i/<intent_id>` の完全 URL。冪等リプレイにも載る）。本体・検査・冪等スコープ・レート制限（店ごと、API キー経路と共有の作成枠）・拒否理由は `/merchant/v1/intent/create` と同一（旧 `amount` は 400 `unsupported_amount_unit`、`amount_minor` 無しは 400 `missing_amount_minor`）。他人の店・閉店は `unknown_merchant`、停止中は `merchant_not_active`。`launch_app_id`・宛先指定は無く、読み取った誰でも払える。`POST /merchant/portal/intent/cancel {merchant_id, intent_id}` → `payments::cancel` の応答そのまま（`already_paid` / `not_cancelable` / `unknown_intent` 等）。`GET /merchant/portal/sales?merchant_id=&limit=&state=` の `state` は `all`（既定）/`open`（支払可能）/`held`（`escrow_stage=="held"` と同条件=渡し待ち）/`paid`/`expired`（期限超過は未 sweep でも含む）/`canceled`/`declined`、不明値は `bad_state`。各行の `qr_url` は実効状態が `created` の間のみ URL、他は `null`。`held_count`/`held_total_minor` は `state` に関係なく店全体の値。
 - **加盟店 API（v6）**: `/merchant/v1/*`（`Authorization: Bearer moy_sk_…`、intent の作成・照会・取消・**履行完了報告**(`intent/fulfill`, v9〜。移動可能な金額はゼロのまま——加盟店が受け取る額を減らす方向にのみ作用する)）／ `/merchant/portal/*`（セッション+PIN、登録・キー再発行・停止・閉店・上限変更・一覧。**例外: `/merchant/portal/sales`（売上ページ、v11）はセッションのみで PIN を課さない**——`portal_list` が既にセッションのみであることとの整合、および読むだけの操作にまで PIN を課すと PIN を何にでも打つ習慣を教えるため）。詳細は§EC決済・§エスクロー。`/merchant/v1` の金額フィールドは **`amount_minor`**（v8）。旧 `amount` キーは `unsupported_amount_unit`、両方無しは `missing_amount_minor`（いずれも400、レート制限・冪等リプレイより前段で弾く）。改名自体が安全機構——キーを使い回すと片側のデプロイ遅延時に単位ズレが検知されずに通ってしまうため（§金額の単位）
 
 ### 運用者面（`/admin/api/*`、第2リスナー）
@@ -173,12 +174,19 @@ QR を読んで MoyMoy で払う経路。実装は `server/moymoy-cs/src/qr.rs`�
 
 **静的 QR**（決定）: 店頭据え置きで客が金額を入力する。`/wallet/pay` 廃止（§EC決済）の決定を、この経路に限って覆した。ただし宛先は QR が決め、客が決めるのは金額だけで、承認は既存の PIN/段階認証/エスクロー経路。
 - 発行は `POST /merchant/portal/static-qr`（セッション+PIN）。再発行は上書きで旧コードは即失効（印刷物の紛失・汚損の失効手段）。店が `active` のときのみ。閉店（`close`）で `static_qr_code` は NULL に解放される。停止中・閉店・未発行コードは `unknown_static_qr` で区別が付かない。
-- 客が作る請求（`source='static_qr'`）は、店の発行上限（未決済件数・24h 発行額）に**数えない**。数えると、コードを持つ誰もが請求を作るだけで店を止められるため。`check_issuance` は `source='api'` のみ集計し、`payments::create` は StaticQr で上限判定を通らない。`close` の未決済検査は source を問わない（客が見ている請求の下で店を閉じる害は同じ）。代わりに客側の抑止: 1 客 1 店 1 件（新しく作ると同客同店の旧 `created` 請求を cancel、同一トランザクション）、TTL 300 秒、口座ごと 10 回/60 秒。請求の宛先は作成した客のみ（`payer_hint_account_id`）、`description` は固定文言「店頭 QR でのお支払い」。
+- 客が作る請求（`source='static_qr'`）は、店の発行上限（未決済件数・24h 発行額）に**数えない**。数えると、コードを持つ誰もが請求を作るだけで店を止められるため。`check_issuance` は `source IN ('api','portal')` のみ集計し（portal は下記請求管理）、`payments::create` は StaticQr で上限判定を通らない。`close` の未決済検査は source を問わない（客が見ている請求の下で店を閉じる害は同じ）。代わりに客側の抑止: 1 客 1 店 1 件（新しく作ると同客同店の旧 `created` 請求を cancel、同一トランザクション）、TTL 300 秒、口座ごと 10 回/60 秒。請求の宛先は作成した客のみ（`payer_hint_account_id`）、`description` は固定文言「店頭 QR でのお支払い」。
 - 店の見せ方は `payments::merchant_face`（承認画面と同一関数）なので、店名・`@owner`・新規店シグナルがスキャン直後の画面と承認画面でずれない。
 
 **エスクロー**: 動的・静的とも履行報告必須（既存どおり、6 時間未報告で park）。静的 QR は MC 側に履行報告者が居ないため、加盟店管理画面の売上ページ（`FulfillPanel`）から `POST /merchant/portal/fulfill` で「渡した」報告をする。**PIN なし・セッションのみ**（決定）: 報告は受取額を減らす方向にしか効かず他人の金は動かせない。受容リスクは §問題。
 
 **アプリ（0.9.0）**: `moymoy-sdk.js` の `readLaunchIntent` が `static_qr`（`kind:"static_qr"`）を受理、`MoyStaticQrPay`（金額入力）、`MoyPay` の QR 読み取りボタン（`mochi.os.qr.scan`、manifest の権限 `qr.scan`）、`MoyStaticQrSection`（加盟店管理の発行・URL 表示）、売上ページの `FulfillPanel`。
+
+**請求管理ページ**（アプリで作る請求、`source='portal'`。マイグレーション不要、`source` に CHECK 制約なし）: 店頭販売は商品を手渡しするため、店が手動で決済を完了（履行報告）できる導線を最優先にする。
+- 画面（`moymoy-merchant-portal.jsx` の `MoyBillsPage`）: フィルタチップ 渡し待ち（**既定**）/未払い/支払済み/期限切れ/取消/すべて、「新しい請求」`MoyNewBillForm`（金額・説明 1〜120・任意の注文参照 64・有効期限 5/10/30 分、再試行は入力が同じなら同じ `idem_key`）、作成後は結果カード（QR URL・`/mochi qr label` コマンドのコピー）で「未払い」へ切替、行 `MoyBillRow`（取消・`source` 表示 api/店頭 QR/アプリ）、`MoyHeldAlert`（お店一覧・詳細の「渡し待ち N 件」、件数が取れない時は 0 件と区別して表示）。
+- 履行報告 `FulfillPanel`: held 行は「**全額渡した**」1 タップ（確認なし）、一部は副リンク「一部だけ渡した…」。
+- 作成・取消・履行報告は**セッションのみ・PIN なし**（決定。どれもお金を動かさない。請求は依頼にすぎず、動くのは客が自分の PIN で承認した時だけ）。
+- `source='portal'` は店の発行上限（未決済件数・24h 発行額）に**数える**（店自身が作るため）。`check_issuance` は `source IN ('api','portal')`。客が作る `static_qr` は従来どおり除外。
+- Minecraft 内ではスマホ画面の QR を読めないため、アプリで作った請求は `/qr/i/<id>` URL と `/mochi qr label` コマンドで GM が QR ブロックにする前提。@handle 宛に請求を送る機能（request/approve）は作らない決定を維持。
 
 **制約**: QR ブロックは MochiOS の Fabric 26.2 版のみの機能（Forge 1.20.1 では使えない）。in-world 実機検証は未実施（§TODO）。
 
@@ -261,6 +269,7 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
   - 静的 QR の貼り替え詐欺（偽の QR を貼って客を別の店へ払わせる）の防御は、スキャン直後と承認画面に出る店名・`@owner` 表示を客が見ることに依存する。着地ページは店名を出さない。
   - 店オーナーは自店の静的 QR で請求を作れるが、承認時に `self_transfer` で拒否される（金は動かない）。
   - `/merchant/v1/intent/wait` の最大 25 秒の接続が MNN トンネル・クライアント側タイムアウトで切られないかは**未検証**（切られても `timed_out` 相当で再投げすれば足りるが、実機で確認していない）。
+- **「渡した」報告後も店への入金は支払いから 10 分後**（`RELEASE_GATE_MS` は支払い=エスクロー到達基準）。店頭販売向けに短縮するかは未決（短縮すると返金余地が減るため別途相談）。
 - **SDK `readAnswer` の既存の潜在不具合**: 401・429 以外の 4xx は本文を読まずに throw するため、`/wallet/charge` の `bad_amount` 等のドメインエラーが「通信に失敗しました」に化ける。QR の新 4 関数（`staticQrInfo`/`staticQrIntent`/`portalStaticQr` と履行報告）のみ `domainErrors` で opt-in して回避済み。既存経路は未修正。
 - **CodeX 再レビュー（反映済）**: v2 再設計に recursive-codex-reviewer を実施。妥当指摘を反映 — backend `382acc2`（冪等の複合PK化で二重決済防止 / `user_version` を tx 内へ移しマイグレーション原子化 / 握り潰しログ化 ほか）、frontend `ffb40c8`（`me()` を ok/expired/unknown で識別し一時エラーで口座を消さない / アンマウントガード / 401 即時処理 ほか）。
 - **承認ゲート保留（共有層に跨る設計課題・未着手）**: 着手前に設計案の承認が必要。
@@ -344,5 +353,6 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 - [ ] `EmeraldOpStore.migrateLegacyStore` を実際の 1.20.1 世代 `.dat` に対して実行した検証。未実行。本番ワールドを引き継ぐ場合は必須。
 - [ ] 本番 MC サーバーを Forge 1.20.1 のまま運用するか 26.2 へ上げるかの決定。上げる場合はワールドのバージョンアップと mod 入れ替えの計画が要る（PiggleShop2 側の MC mod 入れ替えと同時になる可能性）。
 - [ ] QR 決済の in-world 実機検証（Fabric 26.2 の QR ブロック → 着地ページ → アプリ起動 → 承認 → `intent/wait` の完了通知、静的 QR の発行〜売上ページの履行報告まで）。
+- [ ] 請求管理の in-world 確認（アプリで請求作成 → `/mochi qr label` で QR ブロック化 → 客が読んで承認 → 渡し待ちに出る → 「全額渡した」報告）。
 - [ ] QR 決済の契約テスト（`write-tests` skill に従い Codex が作成）。
 - [ ] `mod/`（Forge 1.20.1 版）の廃止時期。MochiOS の fabric-26.2 が本番になった時点で削除できる。
