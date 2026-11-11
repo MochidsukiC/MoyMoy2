@@ -508,14 +508,23 @@ function TargetRow({ item, onClick, trailing }) {
 }
 
 /* ─── 支払う ─────────────────────────────────────────────────────
-   支払いはこの画面からは始まらない。金額と宛先を決めるのはお店であり、
-   ウォレットはお店が発行した請求を承認するだけ — クライアントが金額と
-   受取先を指定できる `/wallet/pay` が廃止されたのはそのためで、この画面に
-   金額入力を残すと、その廃止した経路をアプリ側に作り直すことになる。
-   なので、ここは「どう支払うか」の説明と、最近の支払いの控えに徹する。 */
+   支払いの入口は 2 つあり、どちらも「受取先を決めるのはお店側」である点は同じ:
+     ① お店のアプリ — お店が金額と受取先を決めた請求（PaymentIntent）を発行し、
+        ウォレットはそれを承認するだけ。
+     ② お店の QR — 店頭の QR ブロックが指す静的 QR。QR にあるのは受取先だけで、
+        金額は支払う本人が入力する。入力した金額はサーバが請求に変えて、①と
+        同じ承認画面を通る。
+   クライアントが金額と受取先を両方指定できる `/wallet/pay` が廃止されたのは
+   そのためで、この画面に「宛先を選んで金額を入力する」導線を作ると、その廃止した
+   経路をアプリ側に作り直すことになる。QR の宛先は QR 自身が決め、受取先の表示は
+   サーバ応答から描く（moymoy-screens.jsx の MoyStaticQrPay）。
+   なので、ここは「どう支払うか」の説明と、QR 読み取りの起動と、最近の支払いの
+   控えに徹する。 */
 function MoyPay({ txns = [], onTxn }) {
   const [opening, setOpening] = msState(false);
   const [launchErr, setLaunchErr] = msState("");
+  const [scanning, setScanning] = msState(false);
+  const [scanMsg, setScanMsg] = msState(null); // {ok: boolean, text: string} | null
   const recent = txns.filter((t) => t.kind === "pay").slice(0, 6);
   async function openShop() {
     if (opening) return;
@@ -532,21 +541,82 @@ function MoyPay({ txns = [], onTxn }) {
       setLaunchErr(reasons[r.reason] || "アプリを開けませんでした（" + r.reason + "）");
     }
   }
-  const steps = [
-    ["1", "お店のアプリで買う", "商品を選んで「MoyMoy で支払う」を選びます。"],
-    ["2", "MoyMoy が開く", "お店・金額・内容が表示されます。表示内容は MoyMoy が記録したもので、お店のアプリからは書き換えられません。"],
-    ["3", "PIN で承認", "内容を確かめて PIN を入力すると支払いが完了し、お店に戻ります。"],
+  /* QR 読み取りの起動。スキャナはホスト（Minecraft 内の MochiOS）のもので、
+     `ok:true` は「読み取りモードの要求を受け付けた」という意味でしかなく、読み取った
+     結果はこの呼び出しの戻り値ではなく、ブラウザ経由の launch intent として届く。
+     ユーザー操作（このボタン）の中でだけ呼ぶ — OS は前面にいるアプリ以外の
+     要求を断る。 */
+  async function scanQr() {
+    if (scanning) return;
+    if (!(window.mochi && mochi.os && mochi.os.qr && mochi.os.qr.scan)) {
+      setScanMsg({ ok: false, text: "Minecraft 内の MochiOS から使えます。" });
+      return;
+    }
+    setScanning(true); setScanMsg(null);
+    try {
+      const r = await mochi.os.qr.scan();
+      if (r && r.ok) {
+        setScanMsg({ ok: true, text: "スマホを持って QR ブロックを右クリックしてください（60 秒以内）。" });
+      } else {
+        const reasons = {
+          rate_limited: "少し時間をおいて、もう一度お試しください。",
+          not_foreground: "MoyMoy を前面にして、もう一度お試しください。",
+          not_phone_open: "スマホを開いた状態で、もう一度お試しください。",
+        };
+        const reason = r && r.reason;
+        setScanMsg({ ok: false, text: reasons[reason] || "QR の読み取りを始められませんでした（" + (reason || "不明") + "）。" });
+      }
+    } catch (e) {
+      console.error("MoyMoy: os.qr.scan failed", e);
+      const code = e && e.code;
+      setScanMsg({ ok: false, text: code === "UNIMPLEMENTED"
+        ? "この環境では QR の読み取りを使えません。Minecraft 内の MochiOS から使えます。"
+        : code === "SCOPE_DENIED"
+        ? "アプリの設定が不足しています（qr.scan）。アプリを更新してください。"
+        : "QR の読み取りを始められませんでした（" + ((e && (e.message || e.code)) || "不明") + "）。" });
+    }
+    setScanning(false);
+  }
+  const routes = [
+    ["お店のアプリで払う", [
+      ["1", "お店のアプリで買う", "商品を選んで「MoyMoy で支払う」を選びます。"],
+      ["2", "MoyMoy が開く", "お店・金額・内容が表示されます。表示内容は MoyMoy が記録したもので、お店のアプリからは書き換えられません。"],
+      ["3", "PIN で承認", "内容を確かめて PIN を入力すると支払いが完了し、お店に戻ります。"],
+    ]],
+    ["お店の QR で払う", [
+      ["1", "QR を読み取る", "上の「QR を読み取って支払う」を押し、スマホを持って店頭の QR ブロックを右クリックします。"],
+      ["2", "金額を入力", "支払い先のお店が表示されます。お店と相手を確かめて、支払う金額を入力します。"],
+      ["3", "PIN で承認", "内容を確かめて PIN を入力すると支払いが完了します。"],
+    ]],
   ];
   return (
     <div style={{ padding: "18px 16px 120px" }}>
       <div style={{ textAlign: "center" }}>
         <EmeGem size={44} style={{ margin: "0 auto 10px" }} />
         <div style={{ fontFamily: "var(--font-jp)", fontSize: 16, fontWeight: 800, color: "var(--ink)" }}>
-          お支払いはお店のアプリから
+          お支払いはお店のアプリか、お店の QR から
         </div>
         <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 12,
           color: "var(--ink-soft)", lineHeight: 1.8 }}>
-          MoyMoy 側から金額を入力して支払うことはできません。
+          MoyMoy の中で支払い先を選ぶことはできません。支払い先はお店のアプリか、お店の QR が決めます。
+        </div>
+      </div>
+
+      <div style={{ marginTop: 18 }}>
+        <div className="h-section">お店の QR コード</div>
+        <div style={{ marginTop: 10, padding: "12px 14px", border: "1.5px solid var(--ink)" }}>
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+            店頭の QR ブロックで、お店ごとの QR コードを読み取って支払えます。
+            お店が金額を決める QR と、自分で金額を入力する QR があります。
+          </div>
+          <button disabled={scanning} onClick={scanQr} style={{ marginTop: 10, padding: "10px 14px",
+            border: "1.5px solid var(--ink)", background: "var(--moy)", color: "#fff",
+            fontFamily: "var(--font-jp)", fontWeight: 700, cursor: scanning ? "default" : "pointer" }}>
+            {scanning ? "準備しています…" : "QR を読み取って支払う →"}
+          </button>
+          {scanMsg && <div role={scanMsg.ok ? "status" : "alert"} style={{ marginTop: 8,
+            fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: scanMsg.ok ? 700 : 400, lineHeight: 1.7,
+            color: scanMsg.ok ? "var(--moy-deep)" : "var(--carle-red)" }}>{scanMsg.text}</div>}
         </div>
       </div>
 
@@ -567,21 +637,26 @@ function MoyPay({ txns = [], onTxn }) {
         </div>
       </div>
 
-      <div style={{ marginTop: 18, border: "1.5px solid var(--ink)" }}>
-        {steps.map(([n, title, body], i) => (
-          <div key={n} style={{ display: "flex", gap: 12, padding: "12px 14px", background: "var(--bg-white)",
-            borderBottom: i === steps.length - 1 ? "none" : "1px solid rgba(0,0,0,0.08)" }}>
-            <span style={{ flexShrink: 0, width: 26, height: 26, display: "grid", placeItems: "center",
-              background: "var(--moy-mint)", border: "1.5px solid var(--moy-deep)", color: "var(--moy-deep)",
-              fontFamily: "var(--font-mono)", fontSize: 13, fontWeight: 700 }}>{n}</span>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 700, color: "var(--ink)" }}>{title}</div>
-              <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)",
-                lineHeight: 1.7, marginTop: 2 }}>{body}</div>
-            </div>
+      {routes.map(([routeTitle, steps]) => (
+        <div key={routeTitle} style={{ marginTop: 18 }}>
+          <div className="h-section">{routeTitle}</div>
+          <div style={{ marginTop: 10, border: "1.5px solid var(--ink)" }}>
+            {steps.map(([n, title, body], i) => (
+              <div key={n} style={{ display: "flex", gap: 12, padding: "12px 14px", background: "var(--bg-white)",
+                borderBottom: i === steps.length - 1 ? "none" : "1px solid rgba(0,0,0,0.08)" }}>
+                <span style={{ flexShrink: 0, width: 26, height: 26, display: "grid", placeItems: "center",
+                  background: "var(--moy-mint)", border: "1.5px solid var(--moy-deep)", color: "var(--moy-deep)",
+                  fontFamily: "var(--font-mono)", fontSize: 13, fontWeight: 700 }}>{n}</span>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 700, color: "var(--ink)" }}>{title}</div>
+                  <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)",
+                    lineHeight: 1.7, marginTop: 2 }}>{body}</div>
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        </div>
+      ))}
 
       {/* 承認画面と同じ文言をここにも置く。ユーザーが「MoyMoy はこう振る舞う」と
           知っている状態を作るのが、偽の PIN 画面に対する最後の防御になる。 */}
@@ -1327,6 +1402,13 @@ const ERR_LABEL = {
   bad_status: "指定された状態が不正です",
   email_verification_required: "加盟店の登録にはメールアドレスの確認が必要です",
   rate_limited: "操作が続けて行われました。しばらく待ってからお試しください",
+  // ── 店頭 QR（静的 QR）・履行の報告 ──
+  unknown_static_qr: "この QR コードは使えません。お店に確認してください。",
+  merchant_not_active: "このお店は現在稼働していないため、店頭 QR を発行できません",
+  already_fulfilled: "この注文はすでに報告済みです",
+  not_held: "この注文はもう履行を報告できる状態ではありません",
+  bad_fulfilled_amount: "報告する金額が不正です。0 から支払い金額までで指定してください",
+  bad_reason: "理由に使えない文字が含まれているか、長すぎます",
 };
 function errLabel(code) {
   return ERR_LABEL[code] || "処理に失敗しました（" + (code || "error") + "）";
@@ -1360,8 +1442,10 @@ function errLabelFor(res) {
 
 /* ─── EC 決済の承認オーバーレイ ───────────────────────────────────
    表示する金額・加盟店・注文内容は、すべて `GET /wallet/payment/intent` の
-   応答だけから来る。起動してきたアプリから読むのは intent_id と return_url の
-   2つだけで、それ以外は読まずに捨ててある（moymoy-sdk.js の readLaunchIntent）。
+   応答だけから来る。起動してきたアプリから読むのは intent_id（店頭 QR の起動なら
+   その代わりに QR コード static_qr）と return_url だけで、それ以外は読まずに捨てて
+   ある（moymoy-sdk.js の readLaunchIntent）。店頭 QR の起動は、金額入力のあと
+   サーバが作った請求の intent_id でこの画面に入る（MoyStaticQrPay）。
    return_url はこの画面には一切届かない — OS が attest した origin と同一ホスト
    であることを確かめたうえで、戻り先として OS へ返すだけの値である。
    ここが崩れると「見えている内容と請求内容が違う」決済が作れてしまう。 */
@@ -1686,6 +1770,193 @@ function MoyPaymentApproval({ pending, intent, loading, error, required, balance
   );
 }
 
+/* ─── 店頭 QR（静的 QR）: 受取先の確認 → 金額入力 ───────────────────
+   QR コードが運んでくるのは「どのお店か」だけで、金額はここで本人が入力する。
+   だからこの画面は 2 つのことを守る:
+     ① 受取先の表示は `GET /wallet/qr/static` の応答だけから描く。launch の
+        params から読んでいるのはコード（照会キー）だけで、店名も @handle も
+        そこには無い。表示に使う部品は承認画面と同じ MoyMerchantFace — 偽装の
+        しやすい店名より @handle を主表示にする序列を、ここでも崩さない。
+     ② 入力した金額は「次へ」でサーバへ送り、請求（intent）に変えてもらう。
+        支払いの確定は既存の承認画面（PIN・段階認証）に渡し、ここでは何も
+        動かさない — 残高が動く操作はこの画面には 1 つも無い。 */
+function MoyStaticQrPay({ pending, balance, onCancel, onIntent, onExpired }) {
+  const code = pending.static_qr;
+  const [merchant, setMerchant] = msState(null);
+  const [loading, setLoading] = msState(true);
+  const [loadErr, setLoadErr] = msState(null);   // {code}
+  const [reloadN, setReloadN] = msState(0);
+  const [busy, setBusy] = msState(false);
+  const [err, setErr] = msState(null);           // {code, retry_after_ms}
+  const entry = useMoyAmountInput(true);
+  const { amount: amt, error: amountError } = entry;
+  const over = amt > balance;
+  // 直近に送った (金額, idem_key)。通信が切れて応答を取り逃したときの再試行は
+  // 同じ金額なら同じ鍵で送り直し、サーバが同じ intent を返す。金額を変えたら
+  // 必ず新しい鍵にする — 鍵を使い回すと古い金額の請求が返りうる。
+  const attemptRef = msRef(null);
+  const aliveRef = msRef(true);
+
+  msEffect(() => {
+    aliveRef.current = true;
+    setLoading(true); setLoadErr(null);
+    (async () => {
+      try {
+        const r = await MoyMoy.staticQrInfo(code);
+        if (!aliveRef.current) return;
+        if (r.ok && r.merchant) setMerchant(r.merchant);
+        else if (r.error === "unauthorized") { onExpired(); return; }
+        else setLoadErr({ code: r.error || "error" });
+      } catch (e) {
+        console.error("MoyMoy: static QR info failed", e);
+        if (aliveRef.current) setLoadErr({ code: "network" });
+      }
+      if (aliveRef.current) setLoading(false);
+    })();
+    return () => { aliveRef.current = false; };
+  }, [code, reloadN]);
+
+  const canNext = !!merchant && !busy && !amountError && amt > 0 && !over;
+
+  async function next() {
+    if (!canNext) return;
+    if (!attemptRef.current || attemptRef.current.amount !== amt) {
+      attemptRef.current = { amount: amt, key: MoyMoy.newIdem() };
+    }
+    setBusy(true); setErr(null);
+    try {
+      const r = await MoyMoy.staticQrIntent(code, amt, attemptRef.current.key);
+      if (!aliveRef.current) return;
+      if (r.ok && typeof r.intent_id === "string" && r.intent_id) {
+        // 以降は既存の承認画面。この画面は親が差し替える。
+        onIntent(r.intent_id);
+        return;
+      }
+      if (r.ok) {
+        console.error("MoyMoy: static QR intent answered ok without an intent_id", r);
+        setErr({ code: "error" });
+      } else if (r.error === "unauthorized") { onExpired(); return; }
+      else setErr({ code: r.error || "error", retry_after_ms: r.retry_after_ms });
+    } catch (e) {
+      console.error("MoyMoy: static QR intent failed", e);
+      if (!aliveRef.current) return;
+      setErr({ code: "network" });
+    }
+    setBusy(false);
+  }
+
+  return (
+    <div className="fade-in" style={{ position: "absolute", inset: 0, zIndex: 150,
+      background: "var(--bg-white)", display: "flex", flexDirection: "column" }}>
+      <div style={{ flexShrink: 0, padding: "56px 18px 14px", background: "var(--moy)", color: "#fff",
+        borderBottom: "1.5px solid #000", position: "relative", overflow: "hidden" }}>
+        <div className="paper-noise" style={{ opacity: 0.1 }} />
+        <div style={{ position: "relative", zIndex: 1, display: "flex", alignItems: "center", gap: 10 }}>
+          <EmeGem size={26} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontFamily: "'Archivo', var(--font-sans)", fontWeight: 800, fontSize: 21,
+              letterSpacing: "-0.02em" }}>お店の QR で支払う</div>
+            <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, opacity: 0.9 }}>MoyMoy</div>
+          </div>
+          <button onClick={busy ? undefined : onCancel} aria-label="close" style={{ flexShrink: 0,
+            background: "transparent", border: "1.5px solid rgba(255,255,255,0.7)", color: "#fff",
+            width: 32, height: 32, cursor: busy ? "default" : "pointer", display: "grid",
+            placeItems: "center", fontFamily: "var(--font-mono)", fontSize: 16, fontWeight: 700,
+            padding: 0 }}>×</button>
+        </div>
+      </div>
+
+      <div style={{ flex: 1, overflow: "auto", padding: "16px 18px 12px" }}>
+        {/* 起動元は OS が刻んだ値。承認画面と同じ位置・同じ書式で出す。 */}
+        <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)",
+          letterSpacing: "0.04em", borderBottom: "1px solid rgba(0,0,0,0.12)", paddingBottom: 8,
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          FROM {pending.from || "(不明)"}
+        </div>
+
+        {loading && (
+          <div style={{ padding: "48px 0", textAlign: "center" }}>
+            <EmeGem size={44} style={{ margin: "0 auto 14px", opacity: 0.5 }} />
+            <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, color: "var(--ink-soft)" }}>
+              お店を確認しています…
+            </div>
+          </div>
+        )}
+
+        {!loading && !merchant && (
+          <div style={{ padding: "40px 0", textAlign: "center" }}>
+            <EmeGem size={44} style={{ margin: "0 auto 14px", opacity: 0.4 }} />
+            <div role="alert" style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 700,
+              color: "var(--carle-red)", lineHeight: 1.7 }}>{errLabel(loadErr && loadErr.code)}</div>
+            {loadErr && loadErr.code === "network" && (
+              <button onClick={() => setReloadN((n) => n + 1)} style={{ marginTop: 14, padding: "10px 18px",
+                border: "1.5px solid var(--ink)", background: "var(--bg-white)", cursor: "pointer",
+                fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14 }}>もう一度読み込む</button>
+            )}
+          </div>
+        )}
+
+        {!loading && merchant && (
+          <>
+            {!merchant.owner_handle && (
+              <MoyWarnBanner>
+                このお店の所有者アカウントを確認できません。心当たりがなければ
+                支払わないでください。
+              </MoyWarnBanner>
+            )}
+            <div style={{ marginTop: 14 }}>
+              <MoyMerchantFace face={merchant} />
+            </div>
+
+            <div style={{ marginTop: 20, textAlign: "center" }}>
+              <div className="eyebrow" style={{ color: "var(--moy-deep)" }}>支払う金額</div>
+              <MoyAmountInput entry={entry} id="moy-static-amount" label="支払う金額" size={44}
+                color={over || amountError ? "var(--carle-red)" : "var(--ink)"} />
+              <div style={{ marginTop: 8, fontFamily: "var(--font-mono)", fontSize: 11,
+                color: over ? "var(--carle-red)" : "var(--ink-soft)", letterSpacing: "0.04em" }}>
+                {over ? "残高が不足しています" : `利用可能残高  ${formatEme(balance)} エメ`}
+              </div>
+            </div>
+            <div style={{ marginTop: 10, fontFamily: "var(--font-jp)", fontSize: 11,
+              color: "var(--ink-soft)", lineHeight: 1.7, textAlign: "center" }}>
+              金額はあなたが入力します。お店の表示と合っているか確かめてください。
+            </div>
+
+            {err && (
+              <div role="alert" style={{ marginTop: 12, padding: "10px 12px", border: "1.5px solid var(--carle-red)",
+                background: "rgba(227,38,54,0.08)", fontFamily: "var(--font-jp)", fontSize: 12,
+                fontWeight: 700, color: "var(--carle-red)", textAlign: "center", lineHeight: 1.6 }}>
+                {errLabelFor(err)}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {!loading && merchant && (
+        <div style={{ flexShrink: 0, padding: "0 16px 24px" }}>
+          <MoyKeypad onPress={entry.press} decimal keepInputFocus />
+          <button disabled={!canNext} onClick={next} style={{
+            width: "100%", marginTop: 12, padding: "16px", border: "1.5px solid #000",
+            background: canNext ? "var(--moy)" : "#bdbdbd", color: "#fff",
+            boxShadow: canNext ? "4px 4px 0 #0B5A33" : "none", cursor: canNext ? "pointer" : "default",
+            fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 17, letterSpacing: "0.04em",
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            <EmeGem size={20} /> {busy ? "請求を作っています…" : "次へ（内容を確認）"}
+          </button>
+        </div>
+      )}
+      {!loading && !merchant && (
+        <div style={{ flexShrink: 0, padding: "0 16px 24px" }}>
+          <button onClick={onCancel} style={{ width: "100%", padding: "14px", border: "1.5px solid var(--ink)",
+            background: "var(--bg-white)", cursor: "pointer", fontFamily: "var(--font-jp)",
+            fontWeight: 700, fontSize: 15 }}>閉じる</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* 支払いを保持したままチャージへ寄り道しているときのバー。 */
 function MoyPaymentResumeBar({ onResume }) {
   return (
@@ -1702,7 +1973,7 @@ function MoyPaymentResumeBar({ onResume }) {
 
 /* ─── オーケストレータ (moymoy.cs.mnn 配線) ─────────────────────── */
 function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLogoutAccount,
-  pendingPayment, onPaymentDone }) {
+  pendingPayment: rootPending, onPaymentDone }) {
   const [balance, setBalance] = msState(0);
   const [profile, setProfile] = msState({ holder: "PLAYER", number: "•••• •••• •••• ••••", expiry: "07/29" });
   const [txns, setTxns] = msState([]);
@@ -1752,6 +2023,26 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
   // 決済は PIN 必須なので最初の投稿には必ず PIN が乗る。第二要素が要ることは
   // `otp_required` が返って初めて分かるので、そこで引き上げる。
   const [payRequired, setPayRequired] = msState("pin");
+
+  // ── 店頭 QR（静的 QR）──
+  // root が持つ起動要求 (`rootPending`) は 2 種類ある。`kind:"intent"` は従来どおり
+  // 請求が出来ている状態で、そのまま承認画面の対象になる。`kind:"static_qr"` は
+  // まだ請求が無く、金額入力 (MoyStaticQrPay) → サーバが請求を作る → 承認画面、
+  // と進む。請求が出来た時点で同じ起動要求 (from / origin / return_url / age_ms
+  // / taken_at) に intent_id を足した `kind:"intent"` として見せるので、以下の
+  // 承認・却下・お店へ戻る処理は静的 QR を知らずにそのまま動く。
+  //
+  // 請求の記録は起動要求ごとに紐づける（taken_at が合うときだけ有効）。別の QR を
+  // 読み直した、あるいは閉じて開き直したあとに、前の請求が蘇らないようにするため。
+  const [staticIntent, setStaticIntent] = msState(null); // {takenAt, intentId} | null
+  const staticLinked = !!(rootPending && rootPending.kind === "static_qr" &&
+    staticIntent && staticIntent.takenAt === rootPending.taken_at);
+  // 承認画面が扱う起動要求。静的 QR で請求がまだ無いあいだは null。
+  const pendingPayment = !rootPending ? null
+    : rootPending.kind !== "static_qr" ? rootPending
+    : staticLinked ? { ...rootPending, kind: "intent", intent_id: staticIntent.intentId }
+    : null;
+  const staticAmountStage = !!rootPending && rootPending.kind === "static_qr" && !staticLinked;
 
   // A session that expired mid-use ⇒ drop this account and re-authenticate.
   function onExpired() {
@@ -2242,6 +2533,14 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
       )}
       {pendingPayment && payMin && <MoyPaymentResumeBar onResume={payResume} />}
 
+      {/* 店頭 QR: 金額入力。請求が出来たら上の承認画面に引き継がれる (zIndex 同じ 150)。
+          key は起動要求ごと — 別の QR に切り替わったら入力欄ごと作り直す。 */}
+      {staticAmountStage && (
+        <MoyStaticQrPay key={"sq-" + rootPending.taken_at} pending={rootPending} balance={balance}
+          onCancel={clearPayment} onExpired={onExpired}
+          onIntent={(intentId) => setStaticIntent({ takenAt: rootPending.taken_at, intentId })} />
+      )}
+
       {/* complete */}
       {complete && (
         <CompleteOverlay {...complete} sound onClose={() => setComplete(null)} />
@@ -2271,5 +2570,6 @@ Object.assign(window, {
   MoyKeypad, MineSlot, EmeBlockMini, MoyPay, MoySend, MoyAmountEntry, MoyEmeModeSwitch,
   MoyCharge, MoyWithdraw, MoyHistory, MoyConfirmSheet, MoyMoyApp,
   MoyPinStep, MoyStepUp, maskEmail, MoySealBadge, MoySealSetup,
-  MoyPaymentApproval, MoyPaymentResumeBar, errLabel, errLabelFor,
+  MoyPaymentApproval, MoyPaymentResumeBar, MoyStaticQrPay, errLabel, errLabelFor,
+  MoyMerchantFace, MoyAmountInput, useMoyAmountInput,
 });

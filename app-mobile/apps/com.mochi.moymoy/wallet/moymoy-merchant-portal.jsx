@@ -1,4 +1,4 @@
-/* global React, CrystalIcon, EmeGem, formatEme, formatCount, MoyMoy, MoyPinStep, errLabelFor, msState, msEffect, msRef, fieldStyle, ctaStyle */
+/* global React, CrystalIcon, EmeGem, formatEme, formatCount, MoyMoy, MoyPinStep, MoyAmountInput, useMoyAmountInput, errLabelFor, msState, msEffect, msRef, fieldStyle, ctaStyle */
 /* =====================================================================
    MoyMoy — 加盟店管理 (設定内)
 
@@ -87,8 +87,161 @@ function EscrowStageBadge({ stage }) {
   );
 }
 
+/* 履行の報告（「渡した」）。held の行にだけ出す。
+   PIN は求めない: この報告は加盟店が受け取る額を減らす方向にしか効かず
+   （サーバ側の取り決め）、読むだけの売上ページと同じ「セッションのみ」の信頼
+   水準に置いてある。そのかわり取り消せないので、送る前に「入金される額 / 買い手へ
+   返金される額」を必ず見せる。
+
+   結果は行ごとにこの部品の state に持つ。報告後に売上を取り直しても行（key =
+   intent_id）は作り直されないので、「報告しました」の表示は残る。 */
+const MOY_MAX_FULFIL_REASON = 120;
+
+function FulfillPanel({ merchantId, sale, held, onReported }) {
+  const [open, setOpen] = msState(false);
+  const [partial, setPartial] = msState(false);
+  const [reason, setReason] = msState("");
+  const [busy, setBusy] = msState(false);
+  const [result, setResult] = msState(null); // {ok, text} | null
+  const entry = useMoyAmountInput(true);
+  const aliveRef = msRef(true);
+  msEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+
+  const full = sale.amount_minor;
+  const reasonLen = moyTextLen(reason);
+  const reasonOk = reasonLen <= MOY_MAX_FULFIL_REASON;
+  // 一部報告の金額は 0〜支払い額（サーバの bad_fulfilled_amount と同じ範囲）。
+  // 空欄や「.」だけは数字が無いので、0 と読み替えて送らず入力待ちにする。
+  const partialOk = /\d/.test(entry.text) && !entry.error && entry.amount !== null && entry.amount <= full;
+  const amountOk = !partial || partialOk;
+  const fulfilled = partial ? (partialOk ? entry.amount : 0) : full;
+  const canSend = !busy && amountOk && reasonOk;
+
+  async function send() {
+    if (!canSend) return;
+    setBusy(true); setResult(null);
+    let text;
+    let ok = false;
+    // サーバ側で状態が変わっている応答 (報告済み / もう held ではない) のあとも
+    // 売上を取り直す — 手元の行が古いままだと「渡した」が出続ける。
+    let refresh = false;
+    try {
+      const r = await MoyMoy.portalFulfill(merchantId, sale.intent_id, fulfilled, reason.trim());
+      if (r.ok) {
+        ok = true; refresh = true;
+        const refunded = typeof r.refund_amount_minor === "number" ? r.refund_amount_minor : full - fulfilled;
+        const paid = typeof r.fulfilled_amount_minor === "number" ? r.fulfilled_amount_minor : fulfilled;
+        text = "履行を報告しました。入金される額 " + formatEme(paid) + " エメ" +
+          (refunded > 0 ? "、買い手への返金 " + formatEme(refunded) + " エメ" : "") + "。";
+      } else if (r.error === "already_fulfilled") {
+        refresh = true;
+        text = errLabelFor({ code: r.error }) +
+          (typeof r.fulfilled_amount_minor === "number" ? "（入金される額 " + formatEme(r.fulfilled_amount_minor) + " エメ）" : "") + "。";
+      } else if (r.error === "not_held") {
+        refresh = true;
+        const stage = ESCROW_STAGE[r.escrow_stage];
+        text = errLabelFor({ code: r.error }) + (stage ? "（現在: " + stage.label + "）" : "") + "。";
+      } else if (r.error === "bad_reason") {
+        text = errLabelFor({ code: r.error }) +
+          (r.max_chars ? "（" + r.max_chars + "文字まで）" : "") +
+          (r.reason_code && REASON_LABEL[r.reason_code] ? "（" + REASON_LABEL[r.reason_code] + "）" : "");
+      } else {
+        text = errLabelFor({ code: r.error, retry_after_ms: r.retry_after_ms });
+      }
+    } catch (e) {
+      console.error("MoyMoy: merchant fulfil failed", e);
+      text = errLabelFor({ code: "network" });
+    }
+    if (!aliveRef.current) return;
+    setBusy(false);
+    setResult({ ok, text });
+    if (ok || refresh) setOpen(false);
+    if (refresh && onReported) onReported();
+  }
+
+  if (!held && !result) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      {result && (
+        <div role={result.ok ? "status" : "alert"} style={{ marginBottom: 8, padding: "8px 10px",
+          border: "1.5px solid " + (result.ok ? "var(--moy-deep)" : "var(--carle-red)"),
+          background: result.ok ? "var(--moy-mint)" : "rgba(227,38,54,0.08)",
+          color: result.ok ? "var(--moy-deep)" : "var(--carle-red)",
+          fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, lineHeight: 1.6 }}>{result.text}</div>
+      )}
+      {held && !open && (
+        <button onClick={() => setOpen(true)} style={{ width: "100%", padding: "11px",
+          border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)", color: "var(--moy-deep)",
+          cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 14 }}>
+          渡した（履行を報告する）
+        </button>
+      )}
+      {held && open && (
+        <div style={{ border: "1.5px solid var(--ink)", padding: "12px", background: "var(--bg-white)" }}>
+          <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 800, color: "var(--ink)" }}>
+            商品を渡したことを報告します
+          </div>
+          <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr", border: "1.5px solid var(--ink)" }}>
+            {[[false, "全額渡した"], [true, "一部だけ渡した"]].map(([isPartial, label], i) => (
+              <button key={label} disabled={busy} onClick={() => setPartial(isPartial)} style={{
+                padding: "9px 0", border: "none", borderLeft: i === 0 ? "none" : "1.5px solid var(--ink)",
+                background: partial === isPartial ? "var(--moy-deep)" : "var(--bg-white)",
+                color: partial === isPartial ? "#fff" : "var(--ink)", cursor: busy ? "default" : "pointer",
+                fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 13 }}>{label}</button>
+            ))}
+          </div>
+          {partial && (
+            <div style={{ marginTop: 12 }}>
+              <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>実際に渡した分の金額</div>
+              <MoyAmountInput entry={entry} id={"moy-fulfil-" + sale.intent_id} label="実際に渡した分の金額" size={30} />
+              <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)",
+                textAlign: "center", lineHeight: 1.6 }}>
+                0 から {formatEme(full)} エメまで。差額は買い手へ返金されます。
+              </div>
+            </div>
+          )}
+          <div style={{ marginTop: 12 }}>
+            <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>理由（任意）</div>
+            <input value={reason} disabled={busy} onChange={(e) => setReason(e.target.value)}
+              maxLength={MOY_MAX_FULFIL_REASON * 3} aria-label="報告の理由（任意・120文字まで）"
+              placeholder="例: 在庫切れのため一部のみ" style={fieldStyle} />
+            <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, lineHeight: 1.6,
+              color: reasonOk ? "var(--ink-soft)" : "var(--carle-red)", fontWeight: reasonOk ? 400 : 700 }}>
+              {reasonLen} / {MOY_MAX_FULFIL_REASON} 文字{reasonOk ? "" : "。長すぎます"}
+            </div>
+          </div>
+          <div style={{ marginTop: 12, padding: "8px 10px", border: "1px dashed rgba(0,0,0,0.28)",
+            fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink)", lineHeight: 1.7 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>入金される額</span>
+              <span style={{ fontWeight: 700 }}>{amountOk ? formatEme(fulfilled) + " エメ" : "—"}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>買い手への返金</span>
+              <span style={{ fontWeight: 700 }}>{amountOk ? formatEme(full - fulfilled) + " エメ" : "—"}</span>
+            </div>
+          </div>
+          <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, fontWeight: 700,
+            color: "var(--carle-red)", lineHeight: 1.6 }}>
+            報告は取り消せません。内容を確かめてから送ってください。
+          </div>
+          <button disabled={!canSend} onClick={send} style={{ ...ctaStyle(!canSend), marginTop: 10 }}>
+            {busy ? "報告しています…" : "この内容で報告する"}
+          </button>
+          <button disabled={busy} onClick={() => setOpen(false)} style={{ width: "100%", marginTop: 6,
+            padding: "10px", border: "none", background: "transparent", cursor: busy ? "default" : "pointer",
+            fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 600, color: "var(--ink-soft)" }}>やめる</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* 1件の売上行。金額はすべて minor — formatEme を必ず経由する。 */
-function SalesRow({ sale, last }) {
+function SalesRow({ sale, last, merchantId, onReported }) {
   const escrow = sale.escrow || { stage: "none" };
   // 部分履行（一部だけ届けられず差額が返金された）かどうかは、返金額の
   // 有無で判定する。fulfilled_amount_minor だけでは「満額履行」と区別できない。
@@ -102,8 +255,15 @@ function SalesRow({ sale, last }) {
             whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
             {sale.description || "（内容の記載なし）"}
           </div>
-          <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)", marginTop: 2 }}>
-            {moyDateLabel(sale.created_unix_ms)}
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)", marginTop: 2,
+            display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>{moyDateLabel(sale.created_unix_ms)}</span>
+            {/* 店頭 QR 経由の売上。API 経由 (source: "api") は従来どおり何も付けない。 */}
+            {sale.source === "static_qr" && (
+              <span style={{ border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)",
+                color: "var(--moy-deep)", padding: "0 5px", fontFamily: "var(--font-jp)", fontSize: 10,
+                fontWeight: 700, whiteSpace: "nowrap" }}>店頭 QR</span>
+            )}
           </div>
         </div>
         <div style={{ textAlign: "right", flexShrink: 0 }}>
@@ -116,11 +276,14 @@ function SalesRow({ sale, last }) {
 
       {escrow.stage === "held" && (
         <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.6 }}>
-          買い手はすでに支払い済みです。お店の側で履行を報告すると、
+          買い手はすでに支払い済みです。商品を渡して履行を報告すると、
           {escrow.release_due_unix_ms ? moyDateLabel(escrow.release_due_unix_ms) + " 以降に" : "しばらくして"}
           この口座へ入金されます。
         </div>
       )}
+      {/* 「渡した」。held のときだけ押せる。報告後の結果表示は、売上を取り直して
+          stage が変わったあとも残す（FulfillPanel が result を持つ）。 */}
+      <FulfillPanel merchantId={merchantId} sale={sale} held={escrow.stage === "held"} onReported={onReported} />
       {/* parked: 6時間の報告期限を過ぎても履行報告が無く、かつ（旧仕様と違い）
           自動返金もされずに止まっている状態。ここに書けるのは事実だけ:
           代金は消えていないこと、自動では動かないこと、いま報告しても
@@ -220,6 +383,123 @@ function MoyApiKeyReveal({ apiKey, onClose }) {
   );
 }
 
+/* クリップボードへ書く。失敗は握りつぶさない — 呼び出し側が画面に出す。
+   `navigator.clipboard` が無い・拒否された環境では例外になる（どちらも同じ catch）。 */
+async function moyCopyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    console.error("MoyMoy: clipboard write failed", e);
+    return false;
+  }
+}
+
+function MoyCopyButton({ text, label }) {
+  const [state, setState] = msState(null); // "ok" | "fail" | null
+  const aliveRef = msRef(true);
+  msEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+  async function copy() {
+    const ok = await moyCopyText(text);
+    if (aliveRef.current) setState(ok ? "ok" : "fail");
+  }
+  return (
+    <>
+      <button onClick={copy} style={{ marginTop: 6, padding: "8px 14px", border: "1.5px solid var(--ink)",
+        background: "var(--bg-white)", cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700,
+        fontSize: 13 }}>{label || "コピー"}</button>
+      {state === "ok" && (
+        <span role="status" style={{ marginLeft: 10, fontFamily: "var(--font-jp)", fontSize: 12,
+          fontWeight: 700, color: "var(--moy-deep)" }}>コピーしました</span>
+      )}
+      {state === "fail" && (
+        <div role="alert" style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
+          color: "var(--carle-red)", lineHeight: 1.6 }}>
+          コピーできませんでした。上の文字を長押しして選択してください。
+        </div>
+      )}
+    </>
+  );
+}
+
+/* コマンドの引用符つき引数に入れる文字列。Minecraft（Brigadier）の引用文字列は
+   `\"` と `\\` を解釈するので、店名の `"` と `\` をエスケープしておかないと、
+   店名の途中で引数が終わってコマンドが壊れる。 */
+function moyQuoteArg(s) {
+  return '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+/* 店ごとの「店頭 QR（静的 QR）」。発行・作り直しは PIN 付きの操作で、PIN の
+   集め方は他の操作（キー再発行など）と同じく親の askPin が持つ。ここは表示だけ。
+   URL は発行直後も一覧 (`static_qr_url`) から取り直して出す。 */
+function MoyStaticQrSection({ merchant, onIssue }) {
+  const url = merchant.static_qr_url || null;
+  const active = merchant.status === "active";
+  const command = url ? "/mochi qr label " + moyQuoteArg(merchant.name) + " " + url : "";
+  return (
+    <div style={{ marginTop: 22 }}>
+      <div className="h-section">店頭 QR（静的 QR）</div>
+      <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11,
+        color: "var(--ink-soft)", lineHeight: 1.7 }}>
+        店頭の QR ブロックに設定する QR コードです。お客さまは読み取ると、このお店の名前を
+        確かめたうえで、自分で金額を入力して支払います。
+      </div>
+
+      {!url && (
+        <button disabled={!active} onClick={() => onIssue(merchant, false)} style={{ width: "100%", marginTop: 10,
+          padding: "14px", border: "1.5px solid var(--ink)", background: active ? "var(--bg-white)" : "#e6e6e6",
+          boxShadow: active ? "3px 3px 0 var(--ink)" : "none", cursor: active ? "pointer" : "default",
+          fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15 }}>
+          店頭 QR を発行する
+        </button>
+      )}
+      {!url && !active && (
+        <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+          稼働中のお店だけ発行できます。
+        </div>
+      )}
+
+      {url && (
+        <>
+          <div style={{ marginTop: 10, padding: "10px 12px", border: "1.5px solid var(--ink)",
+            background: "var(--bg-white)", fontFamily: "var(--font-mono)", fontSize: 12,
+            wordBreak: "break-all", userSelect: "all" }}>{url}</div>
+          <MoyCopyButton text={url} label="URL をコピー" />
+
+          <div style={{ marginTop: 14, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, color: "var(--ink)" }}>
+            QR ブロックに設定する（ゲームマスター向け）
+          </div>
+          <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+            QR ブロックを設置する権限のある人が、次のコマンドを実行します。
+          </div>
+          <div style={{ marginTop: 6, padding: "10px 12px", border: "1.5px solid var(--ink)",
+            background: "rgba(0,0,0,0.04)", fontFamily: "var(--font-mono)", fontSize: 12,
+            wordBreak: "break-all", userSelect: "all" }}>{command}</div>
+          <MoyCopyButton text={command} label="コマンドをコピー" />
+          <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+            QR ブロックは Fabric 26.2 版のサーバーでのみ使えます。
+          </div>
+
+          <button disabled={!active} onClick={() => onIssue(merchant, true)} style={{ width: "100%", marginTop: 14,
+            padding: "13px", border: "1.5px solid var(--carle-red)", background: "rgba(227,38,54,0.06)",
+            cursor: active ? "pointer" : "default", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14,
+            color: "var(--carle-red)" }}>
+            作り直す（古い QR は使えなくなります）
+          </button>
+        </>
+      )}
+      {!url && (
+        <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+          QR ブロックは Fabric 26.2 版のサーバーでのみ使えます。
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MerchantPortal({ open, onClose }) {
   const [list, setList] = msState([]);
   const [loading, setLoading] = msState(true);
@@ -238,6 +518,26 @@ function MerchantPortal({ open, onClose }) {
   const [sales, setSales] = msState(null);
   const [salesLoading, setSalesLoading] = msState(false);
   const aliveRef = msRef(true);
+  // 非同期の売上取り直しが返ってきたとき、まだ同じ店の売上ページを見ているかの照合用。
+  const selectedRef = msRef(null);
+  selectedRef.current = selected;
+
+  // 履行を報告したあと、行を消さずに売上だけ取り直す。読み込み表示や
+  // `setSales(null)` を挟むと一覧全体が一度消えて、報告した行の結果表示も
+  // 見えなくなる。失敗したときは一覧を差し替えず、上のバナーに出す。
+  async function refreshSales() {
+    const id = selectedRef.current;
+    if (!id) return;
+    try {
+      const r = await MoyMoy.merchantSales(id);
+      if (!aliveRef.current || selectedRef.current !== id) return;
+      if (r.ok) setSales(r);
+      else setErr({ code: r.error || "error" });
+    } catch (e) {
+      console.error("MoyMoy: merchant sales refresh failed", e);
+      if (aliveRef.current) setErr({ code: "network" });
+    }
+  }
 
   async function reload() {
     try {
@@ -336,6 +636,20 @@ function MerchantPortal({ open, onClose }) {
         if (r.ok) setRevealed({ merchant_id: m.merchant_id, api_key: r.api_key });
         return r;
       },
+    });
+  }
+
+  // 発行 / 作り直し。作り直すと古い QR は無効になり、すでに店頭に設定した
+  // ものも使えなくなる — PIN を求める前に、その場で何が起きるかを書く。
+  // 成功したら runAsk が一覧を取り直すので、新しい URL はそこから表示される。
+  function doStaticQr(m, reissue) {
+    askPin({
+      title: "PIN で確認",
+      sub: reissue
+        ? m.name + " の店頭 QR を作り直します（古い QR は使えなくなります）"
+        : m.name + " の店頭 QR を発行します",
+      cta: reissue ? "作り直す" : "発行する",
+      run: (pin) => MoyMoy.portalStaticQr(m.merchant_id, pin),
     });
   }
 
@@ -619,6 +933,8 @@ function MerchantPortal({ open, onClose }) {
                 </button>
               ) : null}
 
+              <MoyStaticQrSection merchant={current} onIssue={doStaticQr} />
+
               <div style={{ marginTop: 22 }}>
                 <div className="h-section">発行上限の変更</div>
                 <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11,
@@ -712,13 +1028,19 @@ function MerchantPortal({ open, onClose }) {
                     )}
                   </div>
 
-                  {/* 履行の報告はポータルからはできない（現状は加盟店 API キー経由）。
-                      ボタンを置かない代わりに、ここで理由を明示しておく — でないと
-                      「何もできない画面」に見える。 */}
+                  {/* 履行の報告は、この画面（「渡した」）とお店の連携（API キー）の両方
+                      からできる。報告を忘れると 6 時間で凍結されて入金されない、という
+                      期限は店頭 QR の運用で特に踏みやすいので、ここで明示する。 */}
                   <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11,
                     color: "var(--ink-soft)", lineHeight: 1.7 }}>
-                    履行の報告は、このアプリではなくお店の連携（API キー）側から行います。
+                    商品を渡したら、下の取引の「渡した」を押して報告してください。
+                    お店の連携（API キー）から自動で報告している場合は、この操作は要りません。
                     報告後、10分ほどでこの口座へ入金されます。
+                  </div>
+                  <div style={{ marginTop: 8, padding: "9px 12px", border: "1.5px solid var(--carle-red)",
+                    background: "rgba(227,38,54,0.06)", fontFamily: "var(--font-jp)", fontSize: 12,
+                    fontWeight: 700, color: "var(--carle-red)", lineHeight: 1.7 }}>
+                    報告しないまま 6 時間経つと凍結され、お店には入金されません。
                   </div>
 
                   {sales.truncated && (
@@ -734,7 +1056,8 @@ function MerchantPortal({ open, onClose }) {
                   </div>
                   <div style={{ marginTop: 10, border: "1.5px solid var(--ink)" }}>
                     {(sales.sales || []).map((s, i) => (
-                      <SalesRow key={s.intent_id} sale={s} last={i === sales.sales.length - 1} />
+                      <SalesRow key={s.intent_id} sale={s} last={i === sales.sales.length - 1}
+                        merchantId={selected} onReported={refreshSales} />
                     ))}
                     {(!sales.sales || sales.sales.length === 0) && (
                       <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",
@@ -763,4 +1086,5 @@ function MerchantPortal({ open, onClose }) {
   );
 }
 
-Object.assign(window, { MerchantPortal, MoyApiKeyReveal, moyDateLabel, EscrowStageBadge, SalesRow });
+Object.assign(window, { MerchantPortal, MoyApiKeyReveal, moyDateLabel, EscrowStageBadge, SalesRow,
+  FulfillPanel, MoyStaticQrSection });

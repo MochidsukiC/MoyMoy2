@@ -44,8 +44,14 @@
 //!   POST /merchant/portal/close    {merchant_id, pin}              (auth + PIN)
 //!   GET  /merchant/portal/list                                     (auth)
 //!   GET  /merchant/portal/sales?merchant_id=&limit=                (auth)
+//!   POST /merchant/portal/static-qr {merchant_id, pin}             (auth + PIN)
+//!   POST /merchant/portal/fulfill {merchant_id, intent_id, fulfilled_amount_minor, reason?} (auth)
+//!   GET  /wallet/qr/static?code=                                   (auth)
+//!   POST /wallet/qr/static/intent {code, amount_minor, idem_key}   (auth)
+//!   GET  /qr/i/:intent_id, /qr/s/:code, /qr/launch.js              (public landing pages)
 //!   POST /merchant/v1/intent/create {…}                            (API key)
 //!   GET  /merchant/v1/intent?intent_id=                            (API key)
+//!   GET  /merchant/v1/intent/wait?intent_id=&timeout_secs=         (API key, long-poll)
 //!   POST /merchant/v1/intent/fulfill {intent_id, fulfilled_amount_minor, reason?} (API key)
 //!   POST /merchant/v1/intent/cancel {intent_id}                    (API key)
 //!
@@ -79,6 +85,7 @@ use crate::mc;
 use crate::merchant::{self, RateLimiter};
 use crate::otp::{self, CreateOtp, Mailer, PendingSignup, VerifyOtp};
 use crate::payments;
+use crate::qr;
 use crate::riskauth::{self, PinBackoff, Requirement};
 use crate::wallet::{self, TxResult};
 
@@ -98,6 +105,8 @@ pub struct AppState {
     pub rate: Arc<RateLimiter>,
     /// Per-session PIN backoff for the money paths.
     pub pin_backoff: Arc<PinBackoff>,
+    /// Wake-ups for merchants long-polling an intent (`/merchant/v1/intent/wait`).
+    pub watch: Arc<crate::watch::IntentWatch>,
 }
 
 impl AppState {
@@ -157,6 +166,15 @@ pub fn router(state: AppState) -> Router {
         .route("/wallet/payment/intent", get(payments::payment_intent))
         .route("/wallet/payment/approve", post(payments::payment_approve))
         .route("/wallet/payment/decline", post(payments::payment_decline))
+        // QR payments, customer side: whose static code is this, and start a
+        // payment from it. Approval is the unchanged route above.
+        .route("/wallet/qr/static", get(qr::static_qr_lookup))
+        .route("/wallet/qr/static/intent", post(qr::static_qr_intent))
+        // QR landing pages (PUBLIC, no session): a QR opens one of these, and the
+        // button launches the MoyMoy app. They show nothing about the payment.
+        .route("/qr/i/:intent_id", get(qr::landing_intent))
+        .route("/qr/s/:code", get(qr::landing_static))
+        .route("/qr/launch.js", get(qr::launch_js))
         // Merchant portal (session + PIN): the credential-issuing half.
         .route("/merchant/portal/register", post(merchant::portal_register))
         .route("/merchant/portal/key", post(merchant::portal_rotate_key))
@@ -165,9 +183,12 @@ pub fn router(state: AppState) -> Router {
         .route("/merchant/portal/close", post(merchant::portal_close))
         .route("/merchant/portal/list", get(merchant::portal_list))
         .route("/merchant/portal/sales", get(merchant::portal_sales))
+        .route("/merchant/portal/static-qr", post(merchant::portal_static_qr))
+        .route("/merchant/portal/fulfill", post(merchant::portal_fulfill))
         // Merchant API (Bearer moy_sk_…): intents only, never a balance.
         .route("/merchant/v1/intent/create", post(merchant::intent_create))
         .route("/merchant/v1/intent", get(merchant::intent_get))
+        .route("/merchant/v1/intent/wait", get(merchant::intent_wait))
         .route("/merchant/v1/intent/fulfill", post(merchant::intent_fulfill))
         .route("/merchant/v1/intent/cancel", post(merchant::intent_cancel))
         // Dev-only funding affordance (MC-less E2E). Gated by MOYMOY_DEV_CREDIT=1;

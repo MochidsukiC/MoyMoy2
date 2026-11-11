@@ -179,8 +179,30 @@
   // on it turned a legitimate "you registered a shop 3 minutes ago, wait 7 more"
   // into 「通信に失敗しました」 — reporting a cause the app had already been told
   // was something else. Handled alongside 401 for the same reason.
-  async function readAnswer(res, what) {
+  //
+  // `domainErrors` is opt-in and only the QR / fulfil endpoints pass it. Those
+  // answer a refusal with a 4xx whose body is the reason (`already_fulfilled`
+  // 409, `bad_fulfilled_amount` 400, ...), and the default branch below throws on
+  // every non-OK status without reading the body — which would turn each of
+  // them into 「通信に失敗しました」 and lose the one fact the caller needs. With
+  // the flag set, a 4xx whose body is `{ok:false, error:<string>}` is returned
+  // as that answer; anything else (a 5xx, an HTML error page, a body that is not
+  // that shape) still throws exactly as before. Existing callers do not pass it,
+  // so their behavior is unchanged.
+  async function readAnswer(res, what, domainErrors) {
     if (res.status === 401) return { ok: false, error: "unauthorized", status: 401 };
+    if (domainErrors && res.status >= 400 && res.status < 500 && res.status !== 429) {
+      let body = null;
+      try {
+        body = await res.json();
+      } catch (e) {
+        console.error("moymoy " + what + " → HTTP " + res.status + " but the body did not parse", e);
+      }
+      if (body && body.ok === false && typeof body.error === "string") {
+        return Object.assign({}, body, { status: res.status });
+      }
+      throw new Error("moymoy " + what + " → HTTP " + res.status);
+    }
     if (res.status === 429) {
       try {
         return await res.json();
@@ -197,22 +219,22 @@
     return res.json();
   }
 
-  async function getJson(path, params, session) {
+  async function getJson(path, params, session, domainErrors) {
     const query = qstr(params || {});
     const res = await fetch(base() + path + (query ? "?" + query : ""), {
       method: "GET",
       headers: authHeaders(session),
     });
-    return readAnswer(res, "GET " + path);
+    return readAnswer(res, "GET " + path, domainErrors);
   }
 
-  async function postJson(path, body, session) {
+  async function postJson(path, body, session, domainErrors) {
     const res = await fetch(base() + path, {
       method: "POST",
       headers: Object.assign({ "Content-Type": "application/json" }, authHeaders(session)),
       body: JSON.stringify(body || {}),
     });
-    return readAnswer(res, "POST " + path);
+    return readAnswer(res, "POST " + path, domainErrors);
   }
 
   const newIdem = () =>
@@ -383,12 +405,21 @@
    * Reduce one OS launch intent to the only fields this app is willing to act on.
    *
    * `params` is whatever the LAUNCHING app chose to put there, and next to none
-   * of it is trusted: `intent_id` and `return_url` are lifted out, every other
-   * key is dropped unread. The approval screen's amount, merchant and
-   * description come from `GET /wallet/payment/intent` — the backend's own
-   * record — so a shop cannot make the screen say one thing while billing
-   * another (WYSIWYS), and `return_url` never reaches the screen at all: it is
-   * checked against `origin` and then only ever handed back to the OS.
+   * of it is trusted: `intent_id` (or `static_qr`) and `return_url` are lifted
+   * out, every other key is dropped unread. The approval screen's amount,
+   * merchant and description come from `GET /wallet/payment/intent` — the
+   * backend's own record — so a shop cannot make the screen say one thing while
+   * billing another (WYSIWYS), and `return_url` never reaches the screen at all:
+   * it is checked against `origin` and then only ever handed back to the OS.
+   *
+   * Two kinds of launch are accepted, told apart by which key is present:
+   *  - `{intent_id}`  → `kind:"intent"`: a payment the shop already created.
+   *  - `{static_qr}`  → `kind:"static_qr"`: the code printed on a shop-side QR
+   *    (`/qr/s/<code>`). It carries no amount; the payer types one, and the
+   *    backend turns code + amount into an intent that goes through the same
+   *    approval screen. The code is only a lookup key — the shop's name on
+   *    screen comes from `GET /wallet/qr/static`, never from here.
+   * Both keys present is ambiguous and is dropped (null) rather than guessed at.
    *
    * `from`, `origin` and `age_ms` DO come from here, and only from here: the OS
    * stamps `from` with the attested sender id and `origin` with the attested
@@ -399,13 +430,20 @@
     if (!raw || typeof raw !== "object") return null;
     const params = raw.params;
     const id = params && typeof params.intent_id === "string" ? params.intent_id.trim() : "";
+    const staticQr = params && typeof params.static_qr === "string" ? params.static_qr.trim() : "";
+    // Neither key, or both: nothing this app can act on, or no way to know which
+    // the sender meant. Safe side — no screen, same as an unrelated launch.
+    if ((id === "") === (staticQr === "")) return null;
     // Prefix and length only. Deliberately NOT a charset rule: `payments.rs`
     // mints `pi_` + URL-safe base64, and pinning the alphabet here would couple
     // the app to an encoding it does not own — the day that changes, every
     // payment would vanish silently, because a rejected id produces no screen
     // and no error. Whether an id exists is the backend's call (`unknown_intent`),
-    // and `qstr` escapes whatever we pass.
-    if (id.indexOf("pi_") !== 0 || id.length > 128) return null;
+    // and `qstr` escapes whatever we pass. A static QR code (`sq_…`) is held to
+    // the same rule for the same reason (`unknown_static_qr` is the backend's).
+    const kind = id !== "" ? "intent" : "static_qr";
+    const key = id !== "" ? id : staticQr;
+    if (key.indexOf(kind === "intent" ? "pi_" : "sq_") !== 0 || key.length > 128) return null;
     const from = typeof raw.from === "string" ? raw.from : "";
     // Attested by the host, so it is carried through exactly as stamped. Absent
     // on an app→app launch, and that absence is load-bearing rather than a gap:
@@ -419,13 +457,15 @@
     // backend and stands with or without a way back to the page that started it.
     // Losing the return button is the entire consequence.
     const returnUrl = webReturnUrl(params && params.return_url, origin);
-    return {
-      intent_id: id,
+    const common = {
       from,
       origin,
       return_url: returnUrl,
       age_ms: Number.isFinite(age) && age >= 0 ? age : 0,
     };
+    return kind === "intent"
+      ? Object.assign({ kind: "intent", intent_id: id }, common)
+      : Object.assign({ kind: "static_qr", static_qr: staticQr }, common);
   }
 
   // ── host attestation ────────────────────────────────────────────────────────
@@ -626,6 +666,21 @@
     // "no" is how people are taught to type their PIN into whatever asks.
     paymentDecline: (intentId) => postJson("/wallet/payment/decline", { intent_id: intentId }),
 
+    // ── static (shop-side) QR, payer side ──
+    // The shop's face for a scanned code. Same fields and meaning as the
+    // `merchant` part of `paymentIntent`, so the same component draws it. The
+    // code from the launch params is only a lookup key; what is shown is this.
+    staticQrInfo: (code) => getJson("/wallet/qr/static", { code }, undefined, true),
+
+    // Turn a static QR + a payer-typed amount (minor units) into an ordinary
+    // intent, then approve it through `paymentIntent` / `paymentApprove`.
+    // Pass a stable `idemKey` per (code, amount) attempt so a retry after a lost
+    // response replays the same intent instead of minting a second one; a
+    // DIFFERENT amount must use a new key.
+    staticQrIntent: (code, amountMinor, idemKey) =>
+      postJson("/wallet/qr/static/intent",
+        { code, amount_minor: amountMinor, idem_key: idemKey || newIdem() }, undefined, true),
+
     // ── merchant portal (session + PIN) ──
     // The credential-issuing half. Separate from the API-key half on purpose: a
     // leaked key cannot reach any of these, and a stolen session cannot use them
@@ -650,6 +705,20 @@
     // (default 50 / max 200) and echoes the effective value back.
     merchantSales: (merchantId, limit) =>
       getJson("/merchant/portal/sales", { merchant_id: merchantId, limit }),
+    // (Re)issue the shop's static QR. Session + PIN. Re-issuing invalidates the
+    // old code, so callers must say so before asking for the PIN.
+    portalStaticQr: (merchantId, pin) =>
+      postJson("/merchant/portal/static-qr", { merchant_id: merchantId, pin }, undefined, true),
+    // Report that the goods were handed over (all of the amount, or part of it).
+    // Session only — NO PIN, like `merchantSales`: the report can only lower what
+    // the shop receives, never raise it. `reason` is optional (<= 120 chars).
+    portalFulfill: (merchantId, intentId, fulfilledAmountMinor, reason) =>
+      postJson("/merchant/portal/fulfill", {
+        merchant_id: merchantId,
+        intent_id: intentId,
+        fulfilled_amount_minor: fulfilledAmountMinor,
+        reason: reason || undefined,
+      }, undefined, true),
 
     // ── OS launch intent ──
     // Consume the payload another app launched us with. Single-use: a second call

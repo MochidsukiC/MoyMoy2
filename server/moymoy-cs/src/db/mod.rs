@@ -58,8 +58,12 @@ const SCHEMA_V11: &str = include_str!("schema_v11.sql");
 /// deadline parks a payment for a human instead of refunding it on a timer, and
 /// the release sweep's partial index excludes what it has parked.
 const SCHEMA_V12: &str = include_str!("schema_v12.sql");
+/// The v13 delta: QR payments — `merchants.static_qr_code` (the shop's printed
+/// static code) and `payment_intents.source` (shop-created vs customer-created
+/// via a static code, so the shop's issuance ceilings can ignore the latter).
+const SCHEMA_V13: &str = include_str!("schema_v13.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -216,8 +220,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 12;
         tracing::info!("sqlite migrated to schema v12 (an unreported payment is parked, not refunded)");
     }
-    // Future: `if version < 13 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V13)?;
-    //          tx.pragma_update(None, "user_version", 13)?; tx.commit()?; version = 13; }`
+    if version < 13 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V13)?;
+        tx.pragma_update(None, "user_version", 13)?;
+        tx.commit()?;
+        version = 13;
+        tracing::info!("sqlite migrated to schema v13 (QR payments: static codes + intent source)");
+    }
+    // Future: `if version < 14 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V14)?;
+    //          tx.pragma_update(None, "user_version", 14)?; tx.commit()?; version = 14; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }

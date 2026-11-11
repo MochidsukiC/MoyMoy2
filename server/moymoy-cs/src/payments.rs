@@ -100,6 +100,38 @@ pub fn intent_scope(merchant_id: &str) -> String {
     format!("mi:{merchant_id}")
 }
 
+/// Who created an intent (schema v13, `payment_intents.source`).
+///
+/// This is not a trust level — an approval is the same PIN-gated, escrowed
+/// payment whichever it is. It exists so the SHOP's issuance ceilings can tell a
+/// bill the shop chose to issue from one a customer created by scanning its
+/// printed static code (see [`create`] and `merchant::check_issuance`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentSource {
+    /// Created by the shop's backend with its API key.
+    Api,
+    /// Created by a customer's wallet from a shop's static QR code.
+    StaticQr,
+}
+
+impl IntentSource {
+    /// The string stored in `payment_intents.source`.
+    pub const fn as_db(self) -> &'static str {
+        match self {
+            IntentSource::Api => "api",
+            IntentSource::StaticQr => "static_qr",
+        }
+    }
+
+    fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "api" => Some(IntentSource::Api),
+            "static_qr" => Some(IntentSource::StaticQr),
+            _ => None,
+        }
+    }
+}
+
 /// A payment intent as stored.
 #[derive(Debug, Clone)]
 pub struct Intent {
@@ -154,6 +186,8 @@ pub struct Intent {
     pub release_tx_id: Option<String>,
     /// The escrow → payer ledger row, if there was a shortfall to return.
     pub escrow_refund_tx_id: Option<String>,
+    /// Who created it (v13). Never changes after creation.
+    pub source: IntentSource,
 }
 
 impl Intent {
@@ -175,7 +209,7 @@ const INTENT_COLS: &str = "intent_id, merchant_id, amount, description, order_re
      refund_tx_id, created_unix_ms, expires_unix_ms, \
      escrowed_unix_ms, release_due_unix_ms, escrow_deadline_unix_ms, fulfilled_unix_ms, \
      fulfilled_amount, fulfil_reason, escrow_parked_unix_ms, released_unix_ms, release_tx_id, \
-     escrow_refund_tx_id";
+     escrow_refund_tx_id, source";
 
 fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
     Ok(Intent {
@@ -203,6 +237,19 @@ fn row_to_intent(r: &rusqlite::Row<'_>) -> rusqlite::Result<Intent> {
         released_unix_ms: r.get(21)?,
         release_tx_id: r.get(22)?,
         escrow_refund_tx_id: r.get(23)?,
+        source: {
+            let s: String = r.get(24)?;
+            // An unrecognised value is a corrupt or newer-than-us row, not a
+            // reason to treat the intent as shop-created: `source` decides whether
+            // the issuance ceilings count it.
+            IntentSource::from_db(&s).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    24,
+                    rusqlite::types::Type::Text,
+                    format!("unknown payment_intents.source {s:?}").into(),
+                )
+            })?
+        },
     })
 }
 
@@ -241,6 +288,9 @@ pub struct NewIntent<'a> {
     /// to decide what a handle means.
     pub payer_hint_account_id: Option<&'a str>,
     pub expires_in_secs: Option<i64>,
+    /// Who is creating it. `StaticQr` exempts the create from the shop's
+    /// issuance ceilings — see [`create`].
+    pub source: IntentSource,
 }
 
 /// Outcome of creating an intent. Only `Ok` is a success.
@@ -257,6 +307,16 @@ pub enum CreateOutcome {
 /// Create an intent inside the caller's transaction (the issuance ceilings and
 /// the insert have to be one unit, or a burst of concurrent creates all pass a
 /// ceiling none of them are individually over).
+///
+/// ## A static-QR intent is not counted against the shop's ceilings
+///
+/// `source == StaticQr` skips [`merchant::check_issuance`] (and
+/// `check_issuance` itself counts only `source = 'api'` rows). The ceilings exist
+/// to bound how fast a SHOP can ask for money. A static-QR bill is created by a
+/// customer, not by the shop; if it counted, anybody holding the printed code
+/// could fill the shop's open-intent ceiling by creating bills and stop the shop
+/// from billing at all. The customer-side bound is the per-account rate limit and
+/// the one-open-bill-per-customer-per-shop rule in `qr::static_qr_intent`.
 pub fn create(
     tx: &rusqlite::Transaction<'_>,
     m: &MerchantRow,
@@ -282,9 +342,11 @@ pub fn create(
         return Ok(CreateOutcome::BadTtl);
     }
     let now = now_ms();
-    match merchant::check_issuance(tx, m, req.amount, now)? {
-        IssueGuard::Ok => {}
-        capped => return Ok(CreateOutcome::Capped(capped)),
+    if req.source == IntentSource::Api {
+        match merchant::check_issuance(tx, m, req.amount, now)? {
+            IssueGuard::Ok => {}
+            capped => return Ok(CreateOutcome::Capped(capped)),
+        }
     }
 
     let intent = Intent {
@@ -313,12 +375,13 @@ pub fn create(
         released_unix_ms: None,
         release_tx_id: None,
         escrow_refund_tx_id: None,
+        source: req.source,
     };
     tx.execute(
         "INSERT INTO payment_intents \
            (intent_id, merchant_id, amount, description, order_ref, state, payer_hint_account_id, \
-            launch_app_id, idem_key, created_unix_ms, updated_unix_ms, expires_unix_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
+            launch_app_id, idem_key, created_unix_ms, updated_unix_ms, expires_unix_ms, source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)",
         params![
             intent.intent_id,
             intent.merchant_id,
@@ -331,6 +394,7 @@ pub fn create(
             req.idem_key,
             now,
             intent.expires_unix_ms,
+            intent.source.as_db(),
         ],
     )?;
     Ok(CreateOutcome::Ok(intent))
@@ -599,7 +663,17 @@ pub fn sales_page(
     let sales = rows
         .iter()
         .take(limit as usize)
-        .map(|i| merchant_view(m, i, now))
+        .map(|i| {
+            let mut row = merchant_view(m, i, now)?;
+            // On the sales page only, not in `merchant_view`: that view is also
+            // the public `/merchant/v1/intent` response, whose shape is a
+            // contract with third-party integrators. The owner reading its own
+            // sales wants to tell a till-side QR payment from an API-created bill.
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("source".to_string(), json!(i.source.as_db()));
+            }
+            Ok(row)
+        })
         .collect::<Result<Vec<_>, ApiError>>()?;
 
     // Counted from the intents, not from any balance — see the note above.
@@ -891,27 +965,33 @@ pub struct MerchantFace {
     pub created_unix_ms: i64,
 }
 
+/// The shop as the payer sees it. One construction shared by the approval screen
+/// ([`payer_view`]) and the static-QR scan (`qr::static_qr_lookup`), so the two
+/// can never disagree about what a shop's name, `@owner_handle` or "new shop"
+/// signal is.
+pub fn merchant_face(conn: &Connection, m: &MerchantRow) -> rusqlite::Result<MerchantFace> {
+    let owner_handle = match &m.owner_account_id {
+        Some(owner) => auth::account_view(conn, owner)?
+            .map(|a| a.handle)
+            .filter(|h| !h.is_empty()),
+        None => None,
+    };
+    Ok(MerchantFace {
+        merchant_id: m.merchant_id.clone(),
+        name: m.name.clone(),
+        sub: m.sub.clone(),
+        owner_handle,
+        created_unix_ms: m.created_unix_ms,
+    })
+}
+
 /// The face of an intent, for the payer's approval screen. This is the ONLY thing
 /// the screen may render: everything on it comes from this backend's record, not
 /// from whatever the launching app passed along.
 pub fn payer_view(conn: &Connection, intent: &Intent, now: i64) -> rusqlite::Result<Value> {
     let m = merchant::get(conn, &intent.merchant_id)?;
     let face = match &m {
-        Some(m) => {
-            let owner_handle = match &m.owner_account_id {
-                Some(owner) => auth::account_view(conn, owner)?
-                    .map(|a| a.handle)
-                    .filter(|h| !h.is_empty()),
-                None => None,
-            };
-            Some(MerchantFace {
-                merchant_id: m.merchant_id.clone(),
-                name: m.name.clone(),
-                sub: m.sub.clone(),
-                owner_handle,
-                created_unix_ms: m.created_unix_ms,
-            })
-        }
+        Some(m) => Some(merchant_face(conn, m)?),
         None => None,
     };
     Ok(json!({
@@ -1500,7 +1580,9 @@ pub(crate) async fn payment_approve(
 ) -> Result<Json<Value>, ApiError> {
     let email_enabled = st.email_enabled();
     let backoff = st.pin_backoff.clone();
-    let value = blocking(st.pool, move |conn| {
+    let watch = st.watch.clone();
+    let intent_id = req.intent_id.clone();
+    let result = blocking(st.pool, move |conn| {
         approve(
             conn,
             &backoff,
@@ -1515,8 +1597,13 @@ pub(crate) async fn payment_approve(
             &req.intent_id,
         )
     })
-    .await?;
-    Ok(Json(value))
+    .await;
+    // Before `?`, and whether or not the approval succeeded: `approve` commits in
+    // several transactions, so even an `Err` can follow a state change. Waiters
+    // re-read the row, so a notification that changed nothing is harmless and a
+    // missing one would strand a long-poll until its timeout.
+    watch.notify(&intent_id);
+    Ok(Json(result?))
 }
 
 #[derive(Deserialize)]
@@ -1529,11 +1616,15 @@ pub(crate) async fn payment_decline(
     acct: AuthedAccount,
     Json(req): Json<DeclineReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let value = blocking(st.pool, move |conn| {
+    let watch = st.watch.clone();
+    let intent_id = req.intent_id.clone();
+    let result = blocking(st.pool, move |conn| {
         decline(conn, &req.intent_id, &acct.account_id).map_err(ApiError::from)
     })
-    .await?;
-    Ok(Json(value))
+    .await;
+    // After the commit and regardless of the outcome — see `payment_approve`.
+    watch.notify(&intent_id);
+    Ok(Json(result?))
 }
 
 #[cfg(test)]
@@ -1639,6 +1730,7 @@ mod tests {
                 launch_app_id: None,
                 payer_hint_account_id: hint,
                 expires_in_secs: Some(ttl),
+                source: IntentSource::Api,
             },
         )
         .unwrap();
@@ -3409,6 +3501,7 @@ mod tests {
                 launch_app_id: None,
                 payer_hint_account_id: None,
                 expires_in_secs: None,
+                source: IntentSource::Api,
             },
         )
         .unwrap();
@@ -3437,6 +3530,7 @@ mod tests {
                     launch_app_id: None,
                     payer_hint_account_id: None,
                     expires_in_secs: Some(bad),
+                    source: IntentSource::Api,
                 },
             )
             .unwrap();

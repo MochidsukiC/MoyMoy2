@@ -1,14 +1,14 @@
 {
   "id": "com.mochi.moymoy",
-  "version": "0.8.3",
+  "version": "0.9.0",
   "schema_version": 1,
   "name": {
     "default": "MoyMoy",
     "ja": "モイモイ"
   },
   "description": {
-    "default": "In-Minecraft emerald wallet for MochiOS — check your balance, send エメ to friends, pay merchants, charge from the emeralds in your inventory, and withdraw エメ back out as emeralds.",
-    "ja": "MochiOS のゲーム内エメラルド決済ウォレット。残高確認、フレンドへの送金、加盟店での支払い、インベントリのエメラルドからのチャージ、エメラルドでの出金ができます。"
+    "default": "In-Minecraft emerald wallet for MochiOS — check your balance, send エメ to friends, pay merchants (in their apps or by scanning a QR code), charge from the emeralds in your inventory, and withdraw エメ back out as emeralds.",
+    "ja": "MochiOS のゲーム内エメラルド決済ウォレット。残高確認、フレンドへの送金、加盟店での支払い（お店のアプリ、または QR コードの読み取り）、インベントリのエメラルドからのチャージ、エメラルドでの出金ができます。"
   },
   "author": {
     "name": "Mochidsuki",
@@ -47,11 +47,19 @@
     "mochi_services": [
       "phone_state.read",
       "attestation.request",
-      "apps.launch"
+      "apps.launch",
+      "qr.scan"
     ],
     "min_runtime_version": "0.1.0"
   },
   "release_notes": [
+    {
+      "version": "0.9.0",
+      "notes": {
+        "default": "お店の QR コードで支払えるようになりました。お店が金額を決める QR と、自分で金額を入力して払う店頭 QR の両方に対応します。加盟店管理画面から店頭 QR の発行と、商品を渡したことの報告ができます。",
+        "ja": "お店の QR コードで支払えるようになりました。お店が金額を決める QR と、自分で金額を入力して払う店頭 QR の両方に対応します。加盟店管理画面から店頭 QR の発行と、商品を渡したことの報告ができます。"
+      }
+    },
     {
       "version": "0.8.3",
       "notes": {

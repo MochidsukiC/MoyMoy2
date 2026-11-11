@@ -878,7 +878,11 @@ function MoyMoyRoot() {
     if (authMode === "login") return <AuthLogin emailEnabled={emailEnabled} onDone={onAuthDone} onBack={() => setAuthMode("welcome")} onForgot={() => setAuthMode("recover")} />;
     if (authMode === "recover") return <AuthRecover onDone={onAuthDone} onBack={() => setAuthMode("login")} />;
     return <AuthWelcome canCancel={adding && !!accounts.find((a) => a.account_id === activeId)}
-      notice={pendingPayment ? "お支払いの承認が待っています。先にログインしてください。" : null}
+      notice={pendingPayment
+        ? (pendingPayment.kind === "static_qr"
+          ? "お店の QR コードでのお支払いが待っています。先にログインしてください。"
+          : "お支払いの承認が待っています。先にログインしてください。")
+        : null}
       onRegister={() => setAuthMode("register")} onLogin={() => setAuthMode("login")} onCancel={cancelAdd} />;
   }
 

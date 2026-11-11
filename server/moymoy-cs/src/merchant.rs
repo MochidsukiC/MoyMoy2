@@ -350,6 +350,30 @@ fn gen_payer_salt() -> String {
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(buf)
 }
 
+/// Leading marker of a static QR code (`sq_` + 128-bit CSPRNG, base64url).
+pub const STATIC_QR_PREFIX: &str = "sq_";
+
+/// Where a static QR code resolves to a landing page. The public name of this
+/// service on the overlay, fixed rather than configured: the code is printed on
+/// physical blocks, so the URL has to be one that does not move.
+const STATIC_QR_URL_BASE: &str = "https://moymoy.cs.mnn/qr/s/";
+
+/// A fresh static QR code. Unguessable (128 bits) so codes cannot be enumerated
+/// into a list of shops, though it is not a secret once printed.
+fn gen_static_qr_code() -> String {
+    let mut buf = [0u8; 16];
+    OsRng.fill_bytes(&mut buf);
+    format!(
+        "{STATIC_QR_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+    )
+}
+
+/// The URL to print in a shop's static QR for `code`.
+pub fn static_qr_url(code: &str) -> String {
+    format!("{STATIC_QR_URL_BASE}{code}")
+}
+
 /// The stable, per-merchant pseudonym for one payer.
 ///
 /// `sha256(salt ‖ account_id)` with a salt this merchant alone holds: the same
@@ -440,6 +464,10 @@ pub struct MerchantSummary {
     pub max_open_intents: i64,
     pub daily_issue_cap: i64,
     pub created_unix_ms: i64,
+    /// The URL printed in the shop's static QR code, or `None` before one is
+    /// issued. Not a secret (it is printed on a public block), so the portal list
+    /// shows it without a PIN.
+    pub static_qr_url: Option<String>,
 }
 
 /// Every merchant this login account owns.
@@ -449,7 +477,8 @@ pub fn list_for_owner(
 ) -> rusqlite::Result<Vec<MerchantSummary>> {
     let mut stmt = conn.prepare(
         "SELECT merchant_id, name, sub, status, listed, api_key_prefix, api_key_created_unix_ms, \
-                api_key_last_used_unix_ms, max_open_intents, daily_issue_cap, created_unix_ms \
+                api_key_last_used_unix_ms, max_open_intents, daily_issue_cap, created_unix_ms, \
+                static_qr_code \
          FROM merchants WHERE owner_account_id = ?1 ORDER BY created_unix_ms ASC",
     )?;
     let v = stmt
@@ -466,6 +495,9 @@ pub fn list_for_owner(
                 max_open_intents: r.get::<_, Option<i64>>(8)?.unwrap_or(DEFAULT_MAX_OPEN_INTENTS),
                 daily_issue_cap: r.get::<_, Option<i64>>(9)?.unwrap_or(DEFAULT_DAILY_ISSUE_CAP),
                 created_unix_ms: r.get(10)?,
+                static_qr_url: r
+                    .get::<_, Option<String>>(11)?
+                    .map(|code| static_qr_url(&code)),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -604,6 +636,65 @@ pub fn rotate_key(
     Ok((changed == 1).then_some((api_key, prefix)))
 }
 
+/// Outcome of issuing a shop's static QR code.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StaticQrOutcome {
+    Ok { code: String },
+    /// Not this account's, or already closed (`rotate_key` treats these the same).
+    UnknownMerchant,
+    /// Stopped by its owner or an operator. A code is only meaningful while the
+    /// shop can be paid, so a stopped shop is not given a new one.
+    NotActive,
+}
+
+/// Issue a new static QR code for a shop this account owns, replacing any earlier
+/// one in the same statement: the printed old code stops resolving at once, which
+/// is how a leaked or defaced code is retired.
+pub fn issue_static_qr(
+    tx: &rusqlite::Transaction<'_>,
+    merchant_id: &str,
+    owner_account_id: &str,
+) -> rusqlite::Result<StaticQrOutcome> {
+    let Some(m) = get(tx, merchant_id)?
+        .filter(|m| m.owner_account_id.as_deref() == Some(owner_account_id))
+        .filter(|m| m.status != STATUS_DELETED)
+    else {
+        return Ok(StaticQrOutcome::UnknownMerchant);
+    };
+    if !m.is_active() {
+        return Ok(StaticQrOutcome::NotActive);
+    }
+    let code = gen_static_qr_code();
+    // The UPDATE carries the same conditions, so it is correct on its own, and a
+    // row it did not change is reported rather than assumed.
+    let changed = tx.execute(
+        "UPDATE merchants SET static_qr_code = ?3, updated_unix_ms = ?4 \
+         WHERE merchant_id = ?1 AND owner_account_id = ?2 AND status = ?5",
+        params![merchant_id, owner_account_id, code, now_ms(), STATUS_ACTIVE],
+    )?;
+    Ok(if changed == 1 {
+        StaticQrOutcome::Ok { code }
+    } else {
+        StaticQrOutcome::NotActive
+    })
+}
+
+/// The ACTIVE shop a static QR code belongs to. A stopped or closed shop resolves
+/// to `None`, indistinguishable from a code that never existed.
+pub fn get_active_by_static_qr(
+    conn: &Connection,
+    code: &str,
+) -> rusqlite::Result<Option<MerchantRow>> {
+    conn.query_row(
+        &format!(
+            "SELECT {MERCHANT_COLS} FROM merchants WHERE static_qr_code = ?1 AND status = ?2"
+        ),
+        params![code, STATUS_ACTIVE],
+        row_to_merchant,
+    )
+    .optional()
+}
+
 /// Set a merchant's status. `false` when the merchant is not this account's.
 ///
 /// A closed merchant is not reachable from here: it has already given its name
@@ -704,10 +795,12 @@ pub fn close(
     }
     // The name and the credential go at the same moment as the status: a closed
     // shop that kept its skeleton would hold a name nothing can trade under, and
-    // one that kept its key hash would still authenticate.
+    // one that kept its key hash would still authenticate. The static QR code goes
+    // with them: a code still printed on a closed shop's counter must resolve to
+    // nothing.
     tx.execute(
         "UPDATE merchants SET status = ?3, name_skeleton = NULL, api_key_hash = NULL, \
-                api_key_prefix = NULL, listed = 0, updated_unix_ms = ?4 \
+                api_key_prefix = NULL, static_qr_code = NULL, listed = 0, updated_unix_ms = ?4 \
          WHERE merchant_id = ?1 AND owner_account_id = ?2",
         params![merchant_id, owner_account_id, STATUS_DELETED, now],
     )?;
@@ -761,6 +854,13 @@ pub enum IssueGuard {
 /// it — canceled and expired ones included. The ceiling is on how fast a shop can
 /// *ask* for money, and an intent that was created and abandoned still went in
 /// front of a customer.
+///
+/// **Both counts are over `source = 'api'` only.** A bill a customer created by
+/// scanning the shop's static QR code is not the shop asking for anything; if it
+/// counted, anybody holding the printed code could use up the shop's ceilings
+/// just by creating bills (see [`payments::create`]). `close` deliberately does
+/// NOT filter by source — a customer may be looking at a static-QR bill, and
+/// closing the shop under them is the same harm as for any other.
 pub fn check_issuance(
     tx: &rusqlite::Transaction<'_>,
     m: &MerchantRow,
@@ -769,7 +869,7 @@ pub fn check_issuance(
 ) -> rusqlite::Result<IssueGuard> {
     let open: i64 = tx.query_row(
         "SELECT COUNT(*) FROM payment_intents \
-         WHERE merchant_id = ?1 AND state = ?2 AND expires_unix_ms > ?3",
+         WHERE merchant_id = ?1 AND state = ?2 AND expires_unix_ms > ?3 AND source = 'api'",
         params![m.merchant_id, crate::payments::STATE_CREATED, now],
         |r| r.get(0),
     )?;
@@ -780,7 +880,7 @@ pub fn check_issuance(
     }
     let issued: i64 = tx.query_row(
         "SELECT COALESCE(SUM(amount), 0) FROM payment_intents \
-         WHERE merchant_id = ?1 AND created_unix_ms > ?2",
+         WHERE merchant_id = ?1 AND created_unix_ms > ?2 AND source = 'api'",
         params![m.merchant_id, now - 24 * 60 * 60 * 1000],
         |r| r.get(0),
     )?;
@@ -1305,6 +1405,105 @@ pub(crate) async fn portal_sales(
     Ok(Json(value))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct PortalStaticQrReq {
+    merchant_id: String,
+    pin: String,
+}
+
+/// Issue (or re-issue) a shop's static QR code.
+///
+/// Session + PIN, the same standing as rotating the API key: re-issuing retires
+/// the code that is physically printed at the till, so it is the owner's decision
+/// and a stolen session alone must not be able to make it. Issuing a code moves
+/// no money and the code is not a secret once printed — the PIN is about not
+/// letting somebody else take the old one out of service.
+pub(crate) async fn portal_static_qr(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalStaticQrReq>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(refused) = portal_pin(&st, &acct, &req.pin, LockoutPolicy::Enforce).await? {
+        return Ok(Json(refused));
+    }
+    let value = blocking(st.pool, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let v = match issue_static_qr(&tx, &req.merchant_id, &acct.account_id)? {
+            StaticQrOutcome::Ok { code } => json!({
+                "ok": true,
+                "static_qr_code": code,
+                "static_qr_url": static_qr_url(&code),
+            }),
+            StaticQrOutcome::UnknownMerchant => {
+                json!({ "ok": false, "error": "unknown_merchant" })
+            }
+            StaticQrOutcome::NotActive => json!({ "ok": false, "error": "merchant_not_active" }),
+        };
+        tx.commit()?;
+        Ok::<Value, ApiError>(v)
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PortalFulfillReq {
+    merchant_id: String,
+    intent_id: String,
+    /// Optional in the struct for the reason [`IntentFulfillReq::fulfilled_amount_minor`]
+    /// is: absent and `0` are different statements.
+    fulfilled_amount_minor: Option<i64>,
+    reason: Option<String>,
+}
+
+/// Report an order fulfilled from the portal, on the owner's say-so.
+///
+/// **Session only, no PIN** (an explicit decision). The report can only fix the
+/// shop's own take at an amount no greater than what the customer approved, and
+/// reducing it gives the difference back to the customer; it cannot move money
+/// out of anybody's account, which is why `/merchant/v1/intent/fulfill` accepts
+/// it from a bare API key too. What a stolen session CAN do here is under-report
+/// and so reduce the shop's own sales — accepted: it harms only the shop, the
+/// customer is made whole, and demanding a PIN to say "I handed it over" is the
+/// habit-forming prompt `payments::decline` argues against.
+///
+/// The body and status codes are exactly [`intent_fulfill`]'s, from the shared
+/// [`fulfill_response`], and the work is the same [`payments::fulfill`].
+pub(crate) async fn portal_fulfill(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Json(req): Json<PortalFulfillReq>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if req.intent_id.trim().is_empty() {
+        return Err(ApiError::bad_request("intent_id required"));
+    }
+    let Some(fulfilled) = req.fulfilled_amount_minor else {
+        return Ok(missing_fulfilled_amount());
+    };
+    let value = blocking(st.pool, move |conn| {
+        // Ownership decides visibility; a shop that is not this account's reads
+        // as one that does not exist (see `portal_sales`).
+        let owned = get(conn, &req.merchant_id)?
+            .filter(|m| m.owner_account_id.as_deref() == Some(acct.account_id.as_str()));
+        let Some(m) = owned else {
+            return Ok::<(StatusCode, Value), ApiError>((
+                StatusCode::OK,
+                json!({ "ok": false, "error": "unknown_merchant" }),
+            ));
+        };
+        let out = payments::fulfill(
+            conn,
+            &m.merchant_id,
+            &req.intent_id,
+            fulfilled,
+            req.reason.as_deref(),
+        )?;
+        Ok(fulfill_response(out, &req.intent_id))
+    })
+    .await?;
+    Ok((value.0, Json(value.1)))
+}
+
 // ── merchant API (Bearer moy_sk_…) ───────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1344,31 +1543,43 @@ impl IntentCreateReq {
     /// creation — before any money moves, in whichever direction the versions are
     /// skewed. That is worth more than the compatibility it costs.
     fn amount_minor(&self) -> Result<i64, (StatusCode, Json<Value>)> {
-        match (self.amount_minor, self.amount) {
-            // Whichever else is present: a caller still sending `amount` is
-            // stating an amount in a unit this API no longer has.
-            (_, Some(amount)) => Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "ok": false,
-                    "error": "unsupported_amount_unit",
-                    "detail": format!(
-                        "`amount` counted whole エメ and is no longer accepted; send \
-                         `amount_minor` in 1/100 エメ instead (the {amount} you sent would be \
-                         {amount}00 as amount_minor)"
-                    ),
-                })),
-            )),
-            (Some(minor), None) => Ok(minor),
-            (None, None) => Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "ok": false,
-                    "error": "missing_amount_minor",
-                    "detail": "`amount_minor` (1/100 エメ) is required",
-                })),
-            )),
-        }
+        amount_minor_of(self.amount_minor, self.amount)
+    }
+}
+
+/// The amount a request states, in minor units, or the `400` to send instead.
+/// Shared by every endpoint that takes an amount from a caller, so the legacy
+/// `amount` key is refused the same way everywhere (see
+/// [`IntentCreateReq::amount_minor`] for why that refusal is the safety
+/// mechanism).
+pub(crate) fn amount_minor_of(
+    amount_minor: Option<i64>,
+    amount: Option<i64>,
+) -> Result<i64, (StatusCode, Json<Value>)> {
+    match (amount_minor, amount) {
+        // Whichever else is present: a caller still sending `amount` is
+        // stating an amount in a unit this API no longer has.
+        (_, Some(amount)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "unsupported_amount_unit",
+                "detail": format!(
+                    "`amount` counted whole エメ and is no longer accepted; send \
+                     `amount_minor` in 1/100 エメ instead (the {amount} you sent would be \
+                     {amount}00 as amount_minor)"
+                ),
+            })),
+        )),
+        (Some(minor), None) => Ok(minor),
+        (None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "missing_amount_minor",
+                "detail": "`amount_minor` (1/100 エメ) is required",
+            })),
+        )),
     }
 }
 
@@ -1426,6 +1637,7 @@ pub(crate) async fn intent_create(
                 launch_app_id: req.launch_app_id.as_deref(),
                 payer_hint_account_id: payer_hint.as_deref(),
                 expires_in_secs: req.expires_in_secs,
+                source: payments::IntentSource::Api,
             },
         )?;
         let v = match out {
@@ -1497,6 +1709,139 @@ pub(crate) async fn intent_get(
     Ok(ok_json(value))
 }
 
+/// The default, floor and ceiling of one long-poll, in seconds. Out-of-range
+/// requests are clamped, not refused: a caller asking for 60 s wants "as long as
+/// you'll let me", and 25 s keeps the request inside the idle timeouts of the
+/// proxies the overlay passes through.
+pub const WAIT_DEFAULT_SECS: i64 = 20;
+pub const WAIT_MIN_SECS: i64 = 1;
+pub const WAIT_MAX_SECS: i64 = 25;
+
+#[derive(Deserialize)]
+pub(crate) struct IntentWaitQuery {
+    intent_id: String,
+    timeout_secs: Option<i64>,
+}
+
+/// One of this shop's intents, or `None` for a missing one and for another shop's
+/// alike (the ownership discipline [`intent_get`] uses).
+async fn read_own_intent(
+    pool: &db::Pool,
+    merchant_id: &str,
+    intent_id: &str,
+) -> Result<Option<payments::Intent>, ApiError> {
+    let merchant_id = merchant_id.to_string();
+    let intent_id = intent_id.to_string();
+    blocking(pool.clone(), move |conn| {
+        Ok(payments::get(conn, &intent_id)?.filter(|i| i.merchant_id == merchant_id))
+    })
+    .await
+}
+
+/// `intent_get`, but when the intent is still `created` it waits for it to
+/// change: until a customer approves or declines, the shop cancels, the intent
+/// expires, or `timeout_secs` runs out. It saves a shop polling at the till.
+///
+/// ## Why this cannot miss a change
+///
+/// The order is **register → create the `Notified` future → re-read → wait**. A
+/// handler notifies only AFTER its transaction commits, so either the commit is
+/// before our re-read (we see it) or it is after (its notification reaches the
+/// future we already created — `notify_waiters` reaches a `Notified` from the
+/// moment it exists, polled or not). There is no window between the two.
+///
+/// ## What it does not hold while it waits
+///
+/// No pooled connection and no blocking thread: every read goes through
+/// [`blocking`] and returns before the wait begins, so a shop with sixteen
+/// pollers costs the 8-connection pool nothing. The wait is in this handler's own
+/// future (never a `tokio::spawn`) so that a client disconnect drops it, and the
+/// [`crate::watch::WaitGuard`] with it.
+pub(crate) async fn intent_wait(
+    State(st): State<AppState>,
+    m: MerchantAuth,
+    Query(q): Query<IntentWaitQuery>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // Shared with `intent_get`: one budget of reads per shop, however it is spent.
+    if let Err(retry_after_ms) = st.rate.check(
+        &format!("mget:{}", m.merchant.merchant_id),
+        RL_INTENT_READ.0,
+        RL_INTENT_READ.1,
+        now_ms(),
+    ) {
+        return Ok(rate_limited(retry_after_ms));
+    }
+    let timeout_secs = q
+        .timeout_secs
+        .unwrap_or(WAIT_DEFAULT_SECS)
+        .clamp(WAIT_MIN_SECS, WAIT_MAX_SECS);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+    let shop = &m.merchant;
+    let unknown = || ok_json(json!({ "ok": false, "error": "unknown_intent" }));
+    let answer = |i: &payments::Intent,
+                  timed_out: bool|
+     -> Result<(StatusCode, Json<Value>), ApiError> {
+        Ok(ok_json(json!({
+            "ok": true,
+            "intent": payments::merchant_view(shop, i, now_ms())?,
+            "timed_out": timed_out,
+        })))
+    };
+
+    // Not this shop's, or nonexistent: answered at once, and BEFORE a waiting
+    // slot is taken, so unknown ids can neither occupy the shop's sixteen nor put
+    // entries in the watch map.
+    let Some(mut intent) = read_own_intent(&st.pool, &shop.merchant_id, &q.intent_id).await?
+    else {
+        return Ok(unknown());
+    };
+    if intent.effective_state(now_ms()) != payments::STATE_CREATED {
+        return answer(&intent, false);
+    }
+
+    let Some(guard) = st.watch.register(&shop.merchant_id, &intent.intent_id) else {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "ok": false, "error": "too_many_waiters",
+                "limit": crate::watch::MAX_WAITERS_PER_MERCHANT,
+            })),
+        ));
+    };
+    loop {
+        // The future first, the read second — see the doc comment.
+        let notified = guard.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let Some(fresh) = read_own_intent(&st.pool, &shop.merchant_id, &q.intent_id).await?
+        else {
+            // Intents are never deleted, so this is not reachable for a row that
+            // was just read; report it like any other unknown id rather than guess.
+            return Ok(unknown());
+        };
+        intent = fresh;
+        let now = now_ms();
+        if intent.effective_state(now) != payments::STATE_CREATED {
+            return answer(&intent, false);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return answer(&intent, true);
+        }
+        // Expiry is time, not an event: nothing notifies when a deadline passes,
+        // so the wait is also bounded by this intent's own. (+1 ms because the
+        // wall clock this reads and the timer sleeping on it are different
+        // clocks, and waking a hair early would only loop once more.)
+        let until_expiry =
+            std::time::Duration::from_millis((intent.expires_unix_ms - now).max(0) as u64 + 1);
+        // The result is deliberately unused: woken by a notification, or
+        // timed out, the next step is the same — read the row again and decide.
+        let _ = tokio::time::timeout(remaining.min(until_expiry), notified).await;
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct IntentFulfillReq {
     intent_id: String,
@@ -1533,15 +1878,7 @@ pub(crate) async fn intent_fulfill(
         return Err(ApiError::bad_request("intent_id required"));
     }
     let Some(fulfilled) = req.fulfilled_amount_minor else {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": "missing_fulfilled_amount_minor",
-                "detail": "`fulfilled_amount_minor` (1/100 エメ) is required; send 0 to report \
-                           that nothing could be delivered",
-            })),
-        ));
+        return Ok(missing_fulfilled_amount());
     };
     let value = blocking(st.pool, move |conn| {
         let out = payments::fulfill(
@@ -1551,61 +1888,83 @@ pub(crate) async fn intent_fulfill(
             fulfilled,
             req.reason.as_deref(),
         )?;
-        Ok::<(StatusCode, Value), ApiError>(match out {
-            payments::FulfillOutcome::Ok {
-                fulfilled_amount,
-                refund_amount,
-            } => (
-                StatusCode::OK,
-                json!({
-                    "ok": true,
-                    "intent_id": req.intent_id,
-                    "state": "fulfilled",
-                    "fulfilled_amount_minor": fulfilled_amount,
-                    "refund_amount_minor": refund_amount,
-                }),
-            ),
-            payments::FulfillOutcome::UnknownIntent => (
-                StatusCode::OK,
-                json!({ "ok": false, "error": "unknown_intent" }),
-            ),
-            // A conflict, not a success. A retrying integrator has to be able to
-            // tell "your report was recorded" from "a report already existed",
-            // because only the first decided what the customer gets back.
-            payments::FulfillOutcome::AlreadyFulfilled { fulfilled_amount } => (
-                StatusCode::CONFLICT,
-                json!({
-                    "ok": false, "error": "already_fulfilled",
-                    "fulfilled_amount_minor": fulfilled_amount,
-                }),
-            ),
-            payments::FulfillOutcome::NotHeld { stage } => (
-                StatusCode::CONFLICT,
-                json!({ "ok": false, "error": "not_held", "escrow_stage": stage }),
-            ),
-            payments::FulfillOutcome::AmountOutOfRange { amount } => (
-                StatusCode::BAD_REQUEST,
-                json!({
-                    "ok": false, "error": "bad_fulfilled_amount",
-                    "amount_minor": amount,
-                    "detail": "fulfilled_amount_minor must be between 0 and the amount the \
-                               customer approved",
-                }),
-            ),
-            // Refused, not trimmed. The stored explanation has to be what the shop
-            // actually said — a silently shortened one is neither its words nor
-            // visibly not its words.
-            payments::FulfillOutcome::BadReason(e) => (
-                StatusCode::BAD_REQUEST,
-                json!({
-                    "ok": false, "error": "bad_reason", "reason_code": e.code(),
-                    "max_chars": MAX_FULFIL_REASON_CHARS,
-                }),
-            ),
-        })
+        Ok::<(StatusCode, Value), ApiError>(fulfill_response(out, &req.intent_id))
     })
     .await?;
     Ok((value.0, Json(value.1)))
+}
+
+/// The `400` for a fulfilment report with no amount. Shared by both endpoints that
+/// take one; see [`IntentFulfillReq::fulfilled_amount_minor`] for why absent is
+/// refused rather than read as `0`.
+fn missing_fulfilled_amount() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "ok": false,
+            "error": "missing_fulfilled_amount_minor",
+            "detail": "`fulfilled_amount_minor` (1/100 エメ) is required; send 0 to report \
+                       that nothing could be delivered",
+        })),
+    )
+}
+
+/// The HTTP answer to a fulfilment report, shared by the API-key endpoint
+/// ([`intent_fulfill`]) and the portal's ([`portal_fulfill`]) so the two cannot
+/// drift apart: same body, same status code, for the same outcome.
+fn fulfill_response(out: payments::FulfillOutcome, intent_id: &str) -> (StatusCode, Value) {
+    match out {
+        payments::FulfillOutcome::Ok {
+            fulfilled_amount,
+            refund_amount,
+        } => (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "intent_id": intent_id,
+                "state": "fulfilled",
+                "fulfilled_amount_minor": fulfilled_amount,
+                "refund_amount_minor": refund_amount,
+            }),
+        ),
+        payments::FulfillOutcome::UnknownIntent => (
+            StatusCode::OK,
+            json!({ "ok": false, "error": "unknown_intent" }),
+        ),
+        // A conflict, not a success. A retrying integrator has to be able to
+        // tell "your report was recorded" from "a report already existed",
+        // because only the first decided what the customer gets back.
+        payments::FulfillOutcome::AlreadyFulfilled { fulfilled_amount } => (
+            StatusCode::CONFLICT,
+            json!({
+                "ok": false, "error": "already_fulfilled",
+                "fulfilled_amount_minor": fulfilled_amount,
+            }),
+        ),
+        payments::FulfillOutcome::NotHeld { stage } => (
+            StatusCode::CONFLICT,
+            json!({ "ok": false, "error": "not_held", "escrow_stage": stage }),
+        ),
+        payments::FulfillOutcome::AmountOutOfRange { amount } => (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "ok": false, "error": "bad_fulfilled_amount",
+                "amount_minor": amount,
+                "detail": "fulfilled_amount_minor must be between 0 and the amount the \
+                           customer approved",
+            }),
+        ),
+        // Refused, not trimmed. The stored explanation has to be what the shop
+        // actually said — a silently shortened one is neither its words nor
+        // visibly not its words.
+        payments::FulfillOutcome::BadReason(e) => (
+            StatusCode::BAD_REQUEST,
+            json!({
+                "ok": false, "error": "bad_reason", "reason_code": e.code(),
+                "max_chars": MAX_FULFIL_REASON_CHARS,
+            }),
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1618,18 +1977,23 @@ pub(crate) async fn intent_cancel(
     m: MerchantAuth,
     Json(req): Json<IntentCancelReq>,
 ) -> Result<Json<Value>, ApiError> {
-    let value = blocking(st.pool, move |conn| {
+    let watch = st.watch.clone();
+    let intent_id = req.intent_id.clone();
+    let result = blocking(st.pool, move |conn| {
         payments::cancel(conn, &req.intent_id, &m.merchant.merchant_id).map_err(ApiError::from)
     })
-    .await?;
-    Ok(Json(value))
+    .await;
+    // After the commit and regardless of the outcome: a long-poll on this intent
+    // (this shop's own, or a second process of it) re-reads the row when woken.
+    watch.notify(&intent_id);
+    Ok(Json(result?))
 }
 
 
 /// Too many calls. A `429` and not a `200 {ok:false}`: the wallet is refusing to
 /// look at the request at all, which is an infrastructure answer — unlike
 /// "insufficient" or "already_paid", which are facts about the request itself.
-fn rate_limited(retry_after_ms: i64) -> (StatusCode, Json<Value>) {
+pub(crate) fn rate_limited(retry_after_ms: i64) -> (StatusCode, Json<Value>) {
     (
         StatusCode::TOO_MANY_REQUESTS,
         Json(json!({ "ok": false, "error": "rate_limited", "retry_after_ms": retry_after_ms })),
@@ -1637,7 +2001,7 @@ fn rate_limited(retry_after_ms: i64) -> (StatusCode, Json<Value>) {
 }
 
 /// The ordinary answer from a handler that can also rate-limit.
-fn ok_json(v: Value) -> (StatusCode, Json<Value>) {
+pub(crate) fn ok_json(v: Value) -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(v))
 }
 
@@ -1882,6 +2246,7 @@ mod tests {
             char_sessions: std::sync::Arc::new(crate::attest::CharSessionStore::new()),
             rate: std::sync::Arc::new(RateLimiter::new()),
             pin_backoff: std::sync::Arc::new(crate::riskauth::PinBackoff::new()),
+            watch: std::sync::Arc::new(crate::watch::IntentWatch::new()),
         };
         let acct = AuthedAccount {
             account_id: "acct-m".to_string(),

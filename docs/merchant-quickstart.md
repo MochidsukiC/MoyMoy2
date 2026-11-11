@@ -195,6 +195,94 @@ curl https://moymoy.cs.mnn/merchant/v1/intent?intent_id=pi_... \
 
 `payer_ref` は加盟店ごとに派生する不可逆な安定 ID。同一支払者は同一加盟店内で常に同じ値になるので再犯検知に使えるが、加盟店を跨いでは相関できない（実 handle は漏れない）。
 
+## 7-2. QR 決済（動的・静的）
+
+QR コードを読んで MoyMoy で払う経路。**QR は権限を運ばない** — 着地ページは `intent_id` を渡すだけで、客が払う金額・店名は §7 と同じく moymoy-cs の記録から承認画面に出る。承認後の PIN・エスクロー・履行報告は通常の決済と同じ。
+
+### 動的 QR（請求ごとに QR を作る）
+
+他の mod（RPSystem 等）から使う想定。
+
+1. **事前に** §5 の `intent/create` で請求を作る。`QrBlockUseHandler` はサーバースレッド上で同期的に呼ばれ、I/O を禁止されるため、QR を使う瞬間に HTTP を呼んで請求を作ってはいけない。
+2. `https://moymoy.cs.mnn/qr/i/<intent_id>` を `MochiMod.QR.createItem` / `registerUseHandler` で QR に埋め込む。
+3. intent の TTL は最長 30 分（§5 の `expires_in_secs`）。**期限切れの QR は使えないので、新しい intent を作って QR を作り直す。**
+4. 支払い完了は、下記の待ち受け型照会で知る（Webhook は無い）。
+5. `paid` を確認して商品を渡したら、`POST /merchant/v1/intent/fulfill` で履行を報告する（未報告のエスクローは 6 時間で保留される。詳細は DEV.md §エスクロー）。
+
+```bash
+curl 'https://moymoy.cs.mnn/merchant/v1/intent/wait?intent_id=pi_...&timeout_secs=20' \
+  -H 'Authorization: Bearer moy_sk_...'
+# → {"ok":true,"intent":{"intent_id":"pi_...","state":"created",...},"timed_out":true}
+```
+
+- `intent` は §7 の `intent`（照会）と同じ形。`state` が `created` のままなら、客が承認・拒否するか、キャンセルされるか、期限が来るか、`timeout_secs` が経つまで応答を返さない。
+- `timeout_secs`: 省略時 20。1〜25 に丸められる（25 を超えても 25）。
+- `timed_out: true` は「まだ `created` のまま時間切れ」。**終端ではないので、同じ呼び出しを投げ直す。** `state` が `paid` / `declined` / `canceled` / `expired` なら終端で、`timed_out` は `false`。
+- 存在しない・他店の `intent_id` は 200 `unknown_intent`（§3-3）。
+- **店ごとに同時 16 本まで。** 超えると 429 `too_many_waiters`（`limit` 付き）。
+- 読み取りレート枠は `intent_get` と共有（120 回/60 秒、§9）。1 回の待ち受けが 1 回分を消費する。
+- 結果を信じる根拠は §7 と同じ、この応答だけ。
+
+#### Java のサンプル（`awaitPaid`）
+
+`java.net.http.HttpClient` の `sendAsync` を使い、`CompletableFuture` を返してコールバックで受ける形。`client` は §4 の方法で `moymoy.cs.mnn` に到達できるよう構成済みのもの（Java の `HttpClient` で §4 のプロキシ認証をどう組むかは本書では扱っていない）。
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+static final Set<String> TERMINAL = Set.of("paid", "declined", "canceled", "expired");
+
+/** intent が終端状態になったら、その intent オブジェクトで完了する。 */
+static CompletableFuture<JsonObject> awaitPaid(HttpClient client, String apiKey, String intentId) {
+    HttpRequest req = HttpRequest.newBuilder(URI.create(
+            "https://moymoy.cs.mnn/merchant/v1/intent/wait?intent_id=" + intentId + "&timeout_secs=20"))
+        .header("Authorization", "Bearer " + apiKey)
+        .GET().build();
+    return client.sendAsync(req, HttpResponse.BodyHandlers.ofString())
+        .thenCompose(res -> {
+            JsonObject body = JsonParser.parseString(res.body()).getAsJsonObject();
+            if (!body.get("ok").getAsBoolean()) {
+                // unknown_intent / too_many_waiters / rate_limited など。投げ直さず呼び出し側へ。
+                return CompletableFuture.failedFuture(new IllegalStateException(res.body()));
+            }
+            JsonObject intent = body.getAsJsonObject("intent");
+            if (TERMINAL.contains(intent.get("state").getAsString())) {
+                return CompletableFuture.completedFuture(intent);
+            }
+            // timed_out で state が created のまま: もう一度待つ
+            return awaitPaid(client, apiKey, intentId);
+        });
+}
+
+// 使う側:
+awaitPaid(client, apiKey, intentId).thenAccept(intent -> {
+    // ここはサーバースレッドではない。ワールドやプレイヤーに触る処理は戻す:
+    server.execute(() -> {
+        if ("paid".equals(intent.get("state").getAsString())) {
+            // 商品を渡す → intent/fulfill で履行を報告
+        }
+    });
+});
+```
+
+- コールバックは HTTP クライアントのスレッドで走る。**Minecraft のメインスレッドへ戻すには `server.execute` を使う**（ワールド・プレイヤーを直接触らない）。
+- 再帰の投げ直しは `ok:false`（429 含む）では行わない。失敗を無限に回さないため。レート制限に当たったら `retry_after_ms` 待ってから呼び出し側で再開する。
+- 期限後に QR を読まれる場合に備え、`expired` を受けたら QR を作り直す。
+
+### 静的 QR（店頭据え置き、客が金額を入力）
+
+- 加盟店管理画面（§3-2 の到達手順）で「静的 QR」を発行する（セッション + PIN）。表示される URL（`https://moymoy.cs.mnn/qr/s/<code>`）を、サーバー管理者が `/mochi qr label "<店名>" <URL>` で QR ブロックにする。**再発行すると旧コードは直ちに無効になる**（印刷物の紛失・汚損時の失効手段）。停止中・閉店した店のコードは使えない。
+- 客は QR を読み、店名を確認して金額を入力し、PIN で承認する。客が作る請求は店の発行上限（§5）には数えられない。
+- 静的 QR の請求には履行報告をする MC 側の仕組みが無いので、**加盟店管理画面の売上ページで、受け取った分について「渡した」報告をする**（PIN 不要・ログイン中のセッションのみ）。API からは `POST /merchant/portal/fulfill {merchant_id, intent_id, fulfilled_amount_minor, reason?}`（セッション認証。本体と応答は `intent/fulfill` と同じ）。未報告のまま 6 時間経つと保留される。
+- QR ブロックは MochiOS の Fabric 26.2 版でのみ使える。
+
 ## 8. 金額の扱い
 
 MoyMoy が受け取るのは 1/100 エメの整数マイナーユニットだけで、浮動小数は一切入らない。小数価格を持つカタログをこの整数に変換するのは加盟店側の責任。**PiggleShop の実装が worked example**（`server/piggleshop-cs/src/orders.rs`。金額計算ロジックは実装・テスト済みだが、moymoy-cs への intent 作成呼び出しはまだ配線されていない ── §11 参照）:
@@ -244,7 +332,7 @@ let amount_minor = total_cents; // 合計がそのまま送る値。÷100 も切
 
 ## 11. 現時点で無いもの
 
-- **webhook は無い。** 結果はポーリングで取得する。
+- **webhook は無い。** 結果はポーリング、または待ち受け型照会（§7-2）で取得する。
 - **加盟店主導の返金 API は無い。** 運営による強制返金のみ（CLI 経由、加盟店 API からは呼べない）。
 - **署名レシートは無い。** 照会は API キー + TLS の認証済みチャネルの応答をそのまま信頼できる前提。
 - **閉店（`/merchant/portal/close`）だけはアプリ内の加盟店管理画面に UI が無い。** 登録・キー再発行・停止/再開・発行上限の変更・売上ページは画面から行える（到達手順は §3-2）。

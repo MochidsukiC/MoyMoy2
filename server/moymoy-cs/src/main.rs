@@ -28,10 +28,12 @@ mod merchant;
 mod notify;
 mod otp;
 mod payments;
+mod qr;
 mod riskauth;
 mod tls;
 mod tunnel;
 mod wallet;
+mod watch;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -182,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         // read of every intent.
         rate: Arc::new(merchant::RateLimiter::new()),
         pin_backoff: Arc::new(riskauth::PinBackoff::new()),
+        watch: Arc::new(watch::IntentWatch::new()),
     };
 
     // --- bind loopback listener ---

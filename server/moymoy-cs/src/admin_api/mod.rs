@@ -287,6 +287,7 @@ pub(crate) mod tests {
             char_sessions: std::sync::Arc::new(crate::attest::CharSessionStore::new()),
             rate: std::sync::Arc::new(crate::merchant::RateLimiter::new()),
             pin_backoff: std::sync::Arc::new(crate::riskauth::PinBackoff::new()),
+            watch: std::sync::Arc::new(crate::watch::IntentWatch::new()),
         }
     }
 
