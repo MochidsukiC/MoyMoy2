@@ -1987,73 +1987,111 @@ pub(crate) async fn intent_wait(
     m: MerchantAuth,
     Query(q): Query<IntentWaitQuery>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let shop = &m.merchant;
+    match wait_for_change(&st, &shop.merchant_id, &q.intent_id, q.timeout_secs).await? {
+        WaitOutcome::Settled { intent, timed_out } => Ok(ok_json(json!({
+            "ok": true,
+            "intent": payments::merchant_view(shop, &intent, now_ms())?,
+            "timed_out": timed_out,
+        }))),
+        other => Ok(other.refusal()),
+    }
+}
+
+/// How one long-poll ended. The wait itself ([`wait_for_change`]) is shared by
+/// the public API and the owner's portal; only the way the intent is rendered
+/// differs, so each handler renders `Settled` itself and hands the rest to
+/// [`WaitOutcome::refusal`].
+enum WaitOutcome {
+    /// The shop's read budget is spent.
+    RateLimited(i64),
+    /// Not this shop's intent, or no such intent.
+    Unknown,
+    /// The shop already has [`crate::watch::MAX_WAITERS_PER_MERCHANT`] waiters.
+    TooManyWaiters,
+    /// The intent left `created`, or the wait ran out (`timed_out`).
+    Settled {
+        intent: payments::Intent,
+        timed_out: bool,
+    },
+}
+
+impl WaitOutcome {
+    /// The response for every outcome but `Settled`, identical for both callers.
+    fn refusal(self) -> (StatusCode, Json<Value>) {
+        match self {
+            WaitOutcome::RateLimited(retry_after_ms) => rate_limited(retry_after_ms),
+            WaitOutcome::Unknown => ok_json(json!({ "ok": false, "error": "unknown_intent" })),
+            WaitOutcome::TooManyWaiters => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "ok": false, "error": "too_many_waiters",
+                    "limit": crate::watch::MAX_WAITERS_PER_MERCHANT,
+                })),
+            ),
+            WaitOutcome::Settled { .. } => {
+                unreachable!("a settled wait is rendered by its handler, never as a refusal")
+            }
+        }
+    }
+}
+
+/// The wait shared by [`intent_wait`] and [`portal_intent_wait`]: see
+/// [`intent_wait`] for why it cannot miss a change and what it does not hold.
+/// `merchant_id` must already be the caller's own shop.
+async fn wait_for_change(
+    st: &AppState,
+    merchant_id: &str,
+    intent_id: &str,
+    timeout_secs: Option<i64>,
+) -> Result<WaitOutcome, ApiError> {
     // Shared with `intent_get`: one budget of reads per shop, however it is spent.
     if let Err(retry_after_ms) = st.rate.check(
-        &format!("mget:{}", m.merchant.merchant_id),
+        &format!("mget:{merchant_id}"),
         RL_INTENT_READ.0,
         RL_INTENT_READ.1,
         now_ms(),
     ) {
-        return Ok(rate_limited(retry_after_ms));
+        return Ok(WaitOutcome::RateLimited(retry_after_ms));
     }
-    let timeout_secs = q
-        .timeout_secs
+    let timeout_secs = timeout_secs
         .unwrap_or(WAIT_DEFAULT_SECS)
         .clamp(WAIT_MIN_SECS, WAIT_MAX_SECS);
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
-    let shop = &m.merchant;
-    let unknown = || ok_json(json!({ "ok": false, "error": "unknown_intent" }));
-    let answer = |i: &payments::Intent,
-                  timed_out: bool|
-     -> Result<(StatusCode, Json<Value>), ApiError> {
-        Ok(ok_json(json!({
-            "ok": true,
-            "intent": payments::merchant_view(shop, i, now_ms())?,
-            "timed_out": timed_out,
-        })))
-    };
 
     // Not this shop's, or nonexistent: answered at once, and BEFORE a waiting
     // slot is taken, so unknown ids can neither occupy the shop's sixteen nor put
     // entries in the watch map.
-    let Some(mut intent) = read_own_intent(&st.pool, &shop.merchant_id, &q.intent_id).await?
-    else {
-        return Ok(unknown());
+    let Some(mut intent) = read_own_intent(&st.pool, merchant_id, intent_id).await? else {
+        return Ok(WaitOutcome::Unknown);
     };
     if intent.effective_state(now_ms()) != payments::STATE_CREATED {
-        return answer(&intent, false);
+        return Ok(WaitOutcome::Settled { intent, timed_out: false });
     }
 
-    let Some(guard) = st.watch.register(&shop.merchant_id, &intent.intent_id) else {
-        return Ok((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "ok": false, "error": "too_many_waiters",
-                "limit": crate::watch::MAX_WAITERS_PER_MERCHANT,
-            })),
-        ));
+    let Some(guard) = st.watch.register(merchant_id, &intent.intent_id) else {
+        return Ok(WaitOutcome::TooManyWaiters);
     };
     loop {
-        // The future first, the read second — see the doc comment.
+        // The future first, the read second — see `intent_wait`'s doc comment.
         let notified = guard.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let Some(fresh) = read_own_intent(&st.pool, &shop.merchant_id, &q.intent_id).await?
-        else {
+        let Some(fresh) = read_own_intent(&st.pool, merchant_id, intent_id).await? else {
             // Intents are never deleted, so this is not reachable for a row that
             // was just read; report it like any other unknown id rather than guess.
-            return Ok(unknown());
+            return Ok(WaitOutcome::Unknown);
         };
         intent = fresh;
         let now = now_ms();
         if intent.effective_state(now) != payments::STATE_CREATED {
-            return answer(&intent, false);
+            return Ok(WaitOutcome::Settled { intent, timed_out: false });
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return answer(&intent, true);
+            return Ok(WaitOutcome::Settled { intent, timed_out: true });
         }
         // Expiry is time, not an event: nothing notifies when a deadline passes,
         // so the wait is also bounded by this intent's own. (+1 ms because the
@@ -2064,6 +2102,48 @@ pub(crate) async fn intent_wait(
         // The result is deliberately unused: woken by a notification, or
         // timed out, the next step is the same — read the row again and decide.
         let _ = tokio::time::timeout(remaining.min(until_expiry), notified).await;
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PortalIntentWaitQuery {
+    merchant_id: String,
+    intent_id: String,
+    timeout_secs: Option<i64>,
+}
+
+/// `GET /merchant/portal/intent/wait` — [`intent_wait`] for the shop's OWNER,
+/// signed in to the wallet rather than holding the API key. Used by the phone that
+/// is presenting a bill's QR, to notice the payment.
+///
+/// Same wait, same budget (`mget:`), same sixteen slots. The only difference is the
+/// `intent`, which is the owner's row ([`payments::owner_sale_row`], the same as
+/// `portal_sales`' `sales[]`, payer's name included) rather than the public view.
+/// Ownership is decided as in [`portal_intent_cancel`].
+pub(crate) async fn portal_intent_wait(
+    State(st): State<AppState>,
+    acct: AuthedAccount,
+    Query(q): Query<PortalIntentWaitQuery>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let merchant_id = q.merchant_id.clone();
+    let owned = blocking(st.pool.clone(), move |conn| {
+        Ok(get(conn, &merchant_id)?
+            .filter(|m| m.owner_account_id.as_deref() == Some(acct.account_id.as_str()))
+            .filter(|m| m.status != STATUS_DELETED))
+    })
+    .await?;
+    let Some(shop) = owned else {
+        return Ok(ok_json(json!({ "ok": false, "error": "unknown_merchant" })));
+    };
+    match wait_for_change(&st, &shop.merchant_id, &q.intent_id, q.timeout_secs).await? {
+        WaitOutcome::Settled { intent, timed_out } => {
+            let row = blocking(st.pool.clone(), move |conn| {
+                payments::owner_sale_row(conn, &shop, &intent, now_ms())
+            })
+            .await?;
+            Ok(ok_json(json!({ "ok": true, "intent": row, "timed_out": timed_out })))
+        }
+        other => Ok(other.refusal()),
     }
 }
 

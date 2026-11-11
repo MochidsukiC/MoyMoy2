@@ -426,11 +426,41 @@
    * origin of the `.mnn` page behind a web-started launch — the two things about
    * the caller that cannot be forged.
    */
+  // A QR another player presented (`os.qr.present`) and this phone read: the OS
+  // launches us with `{from:"os", params:{qr:{content}}}`. The content is text
+  // a stranger chose — it only ever names a payment (`moymoy-pay:pi_…` / `sq_…`),
+  // and everything shown on screen is then read from the backend as for any
+  // launch. `from` is "os", which is not an app anyone can be returned to, so the
+  // result carries `from: ""` (no return button) and `via: "qr_present"`.
+  const PRESENT_PREFIX = "moymoy-pay:";
+  function presentedKey(params) {
+    const content = params.qr.content.trim();
+    if (content.indexOf(PRESENT_PREFIX) !== 0) {
+      console.warn("MoyMoy: a presented QR that is not a MoyMoy payment was ignored");
+      return null;
+    }
+    const key = content.slice(PRESENT_PREFIX.length);
+    if (key.indexOf("pi_") === 0) return { id: key, staticQr: "" };
+    if (key.indexOf("sq_") === 0) return { id: "", staticQr: key };
+    console.warn("MoyMoy: a presented MoyMoy QR names no payment and was ignored");
+    return null;
+  }
+
   function readLaunchIntent(raw) {
     if (!raw || typeof raw !== "object") return null;
     const params = raw.params;
-    const id = params && typeof params.intent_id === "string" ? params.intent_id.trim() : "";
-    const staticQr = params && typeof params.static_qr === "string" ? params.static_qr.trim() : "";
+    const presented = raw.from === "os" && params && params.qr && typeof params.qr === "object"
+      && typeof params.qr.content === "string";
+    let id = params && typeof params.intent_id === "string" ? params.intent_id.trim() : "";
+    let staticQr = params && typeof params.static_qr === "string" ? params.static_qr.trim() : "";
+    if (presented) {
+      // A presented QR next to explicit keys: no way to know which was meant.
+      if (id !== "" || staticQr !== "") return null;
+      const k = presentedKey(params);
+      if (!k) return null;
+      id = k.id;
+      staticQr = k.staticQr;
+    }
     // Neither key, or both: nothing this app can act on, or no way to know which
     // the sender meant. Safe side — no screen, same as an unrelated launch.
     if ((id === "") === (staticQr === "")) return null;
@@ -444,6 +474,14 @@
     const kind = id !== "" ? "intent" : "static_qr";
     const key = id !== "" ? id : staticQr;
     if (key.indexOf(kind === "intent" ? "pi_" : "sq_") !== 0 || key.length > 128) return null;
+    if (presented) {
+      const age0 = Number(raw.age_ms);
+      const common0 = { from: "", origin: "", return_url: "", via: "qr_present",
+        age_ms: Number.isFinite(age0) && age0 >= 0 ? age0 : 0 };
+      return kind === "intent"
+        ? Object.assign({ kind: "intent", intent_id: id }, common0)
+        : Object.assign({ kind: "static_qr", static_qr: staticQr }, common0);
+    }
     const from = typeof raw.from === "string" ? raw.from : "";
     // Attested by the host, so it is carried through exactly as stamped. Absent
     // on an app→app launch, and that absence is load-bearing rather than a gap:
@@ -459,6 +497,7 @@
     const returnUrl = webReturnUrl(params && params.return_url, origin);
     const common = {
       from,
+      via: "launch",
       origin,
       return_url: returnUrl,
       age_ms: Number.isFinite(age) && age >= 0 ? age : 0,
@@ -715,6 +754,13 @@
     // The totals in the answer cover every bill, whatever the filter.
     merchantSales: (merchantId, limit, state) =>
       getJson("/merchant/portal/sales", { merchant_id: merchantId, limit, state }),
+    // Wait (long-poll) until one of the shop's own bills leaves `created`, or
+    // `timeoutSecs` passes. Session only. `{ok:true, intent:<one sales row>,
+    // timed_out}`; refusals come back as `{ok:false, error}` (`unknown_merchant`,
+    // `unknown_intent`, `too_many_waiters`, `rate_limited`, ...).
+    portalIntentWait: (merchantId, intentId, timeoutSecs) =>
+      getJson("/merchant/portal/intent/wait",
+        { merchant_id: merchantId, intent_id: intentId, timeout_secs: timeoutSecs }, undefined, true),
     // (Re)issue the shop's static QR. Session + PIN. Re-issuing invalidates the
     // old code, so callers must say so before asking for the PIN.
     portalStaticQr: (merchantId, pin) =>

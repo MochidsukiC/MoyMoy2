@@ -543,6 +543,9 @@ function MoyQrShare({ url, label, note }) {
 function MoyStaticQrSection({ merchant, onIssue }) {
   const url = merchant.static_qr_url || null;
   const active = merchant.status === "active";
+  const [presenting, setPresenting] = msState(false);
+  const code = moyStaticQrCode(url);
+  if (url && !code) console.warn("MoyMoy: the shop QR URL has no sq_ code; it cannot be presented", url);
   return (
     <div>
       <div style={{ fontFamily: "var(--font-jp)", fontSize: 18, fontWeight: 800, color: "var(--ink)" }}>
@@ -569,6 +572,12 @@ function MoyStaticQrSection({ merchant, onIssue }) {
 
       {url && (
         <>
+          {active && code && (presenting ? (
+            <MoyPresentPanel merchantId={merchant.merchant_id} shopName={merchant.name} kind="static"
+              content={MOY_PRESENT_PREFIX + code} onClose={() => setPresenting(false)} onReported={() => {}} />
+          ) : (
+            <MoyPresentButton onClick={() => setPresenting(true)} />
+          ))}
           <div style={{ marginTop: 12 }}>
             <MoyQrShare url={url} label={merchant.name} />
           </div>
@@ -741,6 +750,240 @@ function MoyBillQr({ qrUrl, description }) {
   return (
     <div style={{ marginTop: 10 }}>
       <MoyQrShare url={qrUrl} label={description} note="期限が過ぎた QR は使えません。" />
+    </div>
+  );
+}
+
+/* ─── QR を掲げる（os.qr.present） ─────────────────────────────────
+   お店のスマホが「いま QR を見せている」と OS に伝え、お客さんが QR 読み取りにした
+   スマホでお店の人を右クリックすると、お客さんの MoyMoy がこの支払いで開く。
+   渡すのは支払いの番号（`moymoy-pay:pi_…` / `moymoy-pay:sq_…`）だけで、金額と店名は
+   読み取った側が必ずサーバーから読み直す（moymoy-sdk.js の readLaunchIntent）。
+   掲げるのはこの部品が出ている間だけ。消えるとき・支払いが済んだときに取り下げる。 */
+const MOY_PRESENT_PREFIX = "moymoy-pay:";
+
+/* お店の QR の URL（…/qr/s/<code>）から掲げる用のコードを取り出す。sq_ 始まりでなければ null。 */
+function moyStaticQrCode(url) {
+  if (typeof url !== "string") return null;
+  const last = url.replace(/\/+$/, "").split("/").pop() || "";
+  return last.indexOf("sq_") === 0 ? last : null;
+}
+
+function moyPresentApi() {
+  return window.mochi && mochi.os && mochi.os.qr && typeof mochi.os.qr.present === "function" ? mochi.os.qr : null;
+}
+
+const MOY_PRESENT_REFUSED = {
+  not_foreground: "MoyMoy を開いたまま、もう一度「もう一度掲げる」を押してください。",
+  rate_limited: "少し待ってから、もう一度掲げてください。",
+};
+
+const MOY_PRESENT_ENDED = {
+  expired: "期限が切れました。もう一度お会計をつくってください。",
+  canceled: "このお会計は取り消されました。",
+  declined: "お客さんが支払いを断りました。",
+};
+
+function MoyPresentButton({ onClick }) {
+  return (
+    <button onClick={onClick} style={{ width: "100%", marginTop: 10, padding: "13px",
+      border: "1.5px solid var(--ink)", background: "var(--moy-deep)", color: "#fff",
+      boxShadow: "3px 3px 0 var(--ink)", cursor: "pointer", fontFamily: "var(--font-jp)",
+      fontWeight: 800, fontSize: 15 }}>
+      スマホを掲げて払ってもらう
+    </button>
+  );
+}
+
+function MoyPresentPanel({ merchantId, shopName, kind, content, bill, onClose, onReported, onSettled }) {
+  // starting | on | unsupported | refused | failed
+  const [present, setPresent] = msState({ phase: "starting" });
+  const [attempt, setAttempt] = msState(0);
+  const [outcome, setOutcome] = msState(null); // 掲げ終わったお会計の行（paid など）
+  const [linkDown, setLinkDown] = msState(false);
+  const [lost, setLost] = msState(null); // 見つからない等、待ち受けを続けられない理由
+  const stopped = outcome !== null;
+
+  msEffect(() => {
+    if (stopped) return undefined;
+    const api = moyPresentApi();
+    if (!api) { setPresent({ phase: "unsupported" }); return undefined; }
+    let live = true;
+    setPresent({ phase: "starting" });
+    Promise.resolve(api.present(content)).then((r) => {
+      if (!live) return;
+      if (r && r.ok === false) {
+        console.warn("MoyMoy: os.qr.present refused: " + r.reason, r);
+        setPresent({ phase: "refused", reason: r.reason });
+      } else {
+        setPresent({ phase: "on" });
+      }
+    }, (e) => {
+      console.error("MoyMoy: os.qr.present failed", e);
+      if (live) setPresent({ phase: "failed" });
+    });
+    return () => {
+      live = false;
+      if (typeof api.clearPresent === "function") {
+        Promise.resolve(api.clearPresent()).then(null, (e) => console.warn("MoyMoy: os.qr.clearPresent failed", e));
+      }
+    };
+  }, [content, attempt, stopped]);
+
+  // お会計なら、支払われる（または期限切れ・取消）までサーバーで待つ。
+  const intentId = kind === "bill" && bill ? bill.intent_id : null;
+  msEffect(() => {
+    if (!intentId) return undefined;
+    let live = true;
+    const pause = (ms) => new Promise((res) => setTimeout(res, ms));
+    (async () => {
+      while (live) {
+        let r = null;
+        try {
+          r = await MoyMoy.portalIntentWait(merchantId, intentId, 25);
+        } catch (e) {
+          console.warn("MoyMoy: waiting for the bill failed", e);
+        }
+        if (!live) return;
+        if (r && r.ok && r.intent) {
+          setLinkDown(false);
+          const row = r.intent;
+          const expired = row.state === "created" && row.expires_unix_ms <= Date.now();
+          if (row.state !== "created" || expired) {
+            setOutcome(expired ? Object.assign({}, row, { state: "expired" }) : row);
+            // 下の一覧はまだ「未払い」のままなので取り直す。
+            if (onSettled) onSettled();
+            return;
+          }
+          // まだ未払い。timed_out なら即つなぎ直す。そうでない応答は想定外なので間を置く。
+          if (!r.timed_out) await pause(1000);
+          continue;
+        }
+        if (r && r.ok === false && (r.error === "unknown_intent" || r.error === "unknown_merchant" || r.error === "unauthorized")) {
+          console.warn("MoyMoy: cannot keep waiting for the bill: " + r.error, r);
+          setLost(r.error);
+          return;
+        }
+        setLinkDown(true);
+        await pause(4000);
+      }
+    })();
+    return () => { live = false; };
+  }, [merchantId, intentId]);
+
+  // 「渡した」を知らせたあと、ここに出している行（outcome）は古いまま。支払い済みの
+  // お会計なら待ち受けは即答するので、1 回読み直して報告済みの表示に切り替える。
+  async function reportedHere(res) {
+    if (onReported) onReported(res);
+    if (!intentId) return;
+    let r = null;
+    try {
+      r = await MoyMoy.portalIntentWait(merchantId, intentId, 1);
+    } catch (e) {
+      console.warn("MoyMoy: re-reading the bill after the report failed", e);
+      return;
+    }
+    if (r && r.ok && r.intent) setOutcome(r.intent);
+    else console.warn("MoyMoy: re-reading the bill after the report was refused", r);
+  }
+
+  const box = { marginTop: 12, border: "2px solid var(--moy-deep)", background: "var(--bg-white)", padding: "16px" };
+  const small = { fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)", lineHeight: 1.7 };
+  const closeBtn = (label) => (
+    <button onClick={onClose} style={{ width: "100%", marginTop: 12, padding: "11px",
+      border: "1.5px solid var(--ink)", background: "var(--bg-white)", cursor: "pointer",
+      fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14 }}>{label}</button>
+  );
+
+  if (outcome) {
+    const paid = outcome.state === "paid";
+    return (
+      <div style={box}>
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 20, fontWeight: 800,
+          color: paid ? "var(--moy-deep)" : "var(--ink)" }}>
+          {paid ? "支払われました" : "支払いはありませんでした"}
+        </div>
+        <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 26, fontWeight: 800, color: "var(--ink)" }}>
+          {formatEme(outcome.amount_minor)} エメ
+        </div>
+        {outcome.description && (
+          <div style={{ marginTop: 2, fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700,
+            color: "var(--ink)", wordBreak: "break-all" }}>{outcome.description}</div>
+        )}
+        {paid
+          ? <SaleEscrowNotes sale={outcome} merchantId={merchantId} onReported={reportedHere} />
+          : <div style={{ ...small, marginTop: 8 }}>{MOY_PRESENT_ENDED[outcome.state] || "このお会計は終わりました。"}</div>}
+        {closeBtn("閉じる")}
+      </div>
+    );
+  }
+
+  const phase = present.phase;
+  return (
+    <div style={box}>
+      <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 800, color: "var(--moy-deep)" }}>
+        {phase === "on" ? (kind === "bill" ? "スマホを掲げています" : "お店の QR を掲げています")
+          : phase === "starting" ? "掲げています…" : "掲げられませんでした"}
+      </div>
+      {kind === "bill" && bill ? (
+        <>
+          <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 30, fontWeight: 800, color: "var(--ink)" }}>
+            {formatEme(bill.amount_minor)} エメ
+          </div>
+          {bill.description && (
+            <div style={{ marginTop: 2, fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 700,
+              color: "var(--ink)", wordBreak: "break-all" }}>{bill.description}</div>
+          )}
+        </>
+      ) : (
+        <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 18, fontWeight: 800,
+          color: "var(--ink)", wordBreak: "break-all" }}>{shopName}</div>
+      )}
+
+      {(phase === "on" || phase === "starting") && (
+        <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--moy-mint)",
+          fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--ink)", lineHeight: 1.8 }}>
+          お客さんに、QR 読み取りにしたスマホであなたを右クリックしてもらってください。
+          スマホは手に持ったままにしてください（画面は閉じても大丈夫です）。
+        </div>
+      )}
+      {kind === "static" && phase === "on" && (
+        <div style={{ ...small, marginTop: 8 }}>
+          お客さんが金額を入れて払います。支払いは「お会計の一覧」の渡し待ちに出ます。
+        </div>
+      )}
+      {phase === "unsupported" && (
+        <div style={{ ...small, marginTop: 10, color: "var(--carle-red)", fontWeight: 700 }}>
+          この環境ではスマホを掲げられません（Fabric 26.2 のサーバーでのみ使えます）。
+        </div>
+      )}
+      {phase === "refused" && (
+        <div style={{ ...small, marginTop: 10, color: "var(--carle-red)", fontWeight: 700 }}>
+          {MOY_PRESENT_REFUSED[present.reason] || "いまは掲げられません。もう一度お試しください。"}
+        </div>
+      )}
+      {phase === "failed" && (
+        <div style={{ ...small, marginTop: 10, color: "var(--carle-red)", fontWeight: 700 }}>
+          掲げられませんでした（アプリの更新が必要かもしれません）。
+        </div>
+      )}
+      {linkDown && !lost && (
+        <div style={{ ...small, marginTop: 8, fontSize: 11 }}>支払いの確認が途切れています。つなぎ直しています…</div>
+      )}
+      {lost && (
+        <div style={{ ...small, marginTop: 8, color: "var(--carle-red)", fontWeight: 700 }}>
+          このお会計の支払いを確かめられません。「お会計の一覧」で確かめてください。
+        </div>
+      )}
+
+      {phase !== "unsupported" && phase !== "starting" && (
+        <button onClick={() => setAttempt(attempt + 1)} style={{ width: "100%", marginTop: 12, padding: "11px",
+          border: "1.5px solid var(--moy-deep)", background: "var(--bg-white)", cursor: "pointer",
+          fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14, color: "var(--moy-deep)" }}>
+          もう一度掲げる
+        </button>
+      )}
+      {closeBtn("掲げるのをやめる")}
     </div>
   );
 }
@@ -924,7 +1167,7 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
 
 /* お会計の 1 行。未払いは QR の表示と取り消し、支払い済みは売上ページと同じ
    預かり中の表示（SaleEscrowNotes。渡し待ちなら「全額渡した」）。 */
-function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onReported }) {
+function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onReported, onPresent }) {
   const [showQr, setShowQr] = msState(false);
   const [confirming, setConfirming] = msState(false);
   const [busy, setBusy] = msState(false);
@@ -1011,6 +1254,7 @@ function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onRepo
 
       {isOpen && !canceled && (
         <div style={{ marginTop: 8 }}>
+          <MoyPresentButton onClick={() => onPresent(sale)} />
           {hasQr && (
             <button onClick={() => setShowQr(!showQr)} style={{ padding: "8px 14px",
               border: "1.5px solid var(--ink)", background: "var(--bg-white)", cursor: "pointer",
@@ -1088,6 +1332,15 @@ function MoyBillsPage({ merchant, initialFilter, startWithForm }) {
   const [notice, setNotice] = msState(null);    // 渡し待ちの行を報告した結果 {ok, text}
   const [formOpen, setFormOpen] = msState(!!startWithForm && active);
   const [created, setCreated] = msState(null);  // 作成結果カード
+  // 掲げているお会計 {intent_id, amount_minor, description}。同時に掲げるのは 1 つだけで、
+  // 別のお会計を掲げると前のパネルは unmount され、そこで取り下げられる。
+  const [presentingBill, setPresentingBill] = msState(null);
+  // 一覧の下の方の行から掲げても気付けるよう、出した掲げ画面まで画面を送る。
+  const presentRef = msRef(null);
+  const presentingId = presentingBill ? presentingBill.intent_id : null;
+  msEffect(() => {
+    if (presentingId && presentRef.current) presentRef.current.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, [presentingId]);
   // 期限切れの表示を取り直し無しで切り替えるための時計。このページを表示している
   // 間だけ動かし、離れたら止める。
   const [now, setNow] = msState(() => Date.now());
@@ -1194,10 +1447,22 @@ function MoyBillsPage({ merchant, initialFilter, startWithForm }) {
               <span style={{ fontWeight: 700 }}>{moyDateLabel(created.expires_unix_ms)} まで</span>
             </div>
           </div>
+          {!(presentingBill && presentingBill.intent_id === created.intent_id) && (
+            <MoyPresentButton onClick={() => setPresentingBill({ intent_id: created.intent_id,
+              amount_minor: created.amount_minor, description: created.description })} />
+          )}
           <MoyBillQr qrUrl={created.qr_url} description={created.description} />
           <button onClick={() => setCreated(null)} style={{ width: "100%", marginTop: 12, padding: "10px",
             border: "1.5px solid var(--ink)", background: "var(--bg-white)", cursor: "pointer",
             fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 13 }}>閉じる</button>
+        </div>
+      )}
+
+      {presentingBill && (
+        <div ref={presentRef} style={{ scrollMarginTop: 12 }}>
+          <MoyPresentPanel key={presentingBill.intent_id} merchantId={merchantId} shopName={merchant.name} kind="bill"
+            content={MOY_PRESENT_PREFIX + presentingBill.intent_id} bill={presentingBill}
+            onClose={() => { setPresentingBill(null); refresh(); }} onReported={refresh} onSettled={refresh} />
         </div>
       )}
 
@@ -1259,7 +1524,9 @@ function MoyBillsPage({ merchant, initialFilter, startWithForm }) {
             {rows.map((s, i) => (
               <MoyBillRow key={s.intent_id} sale={s} last={i === rows.length - 1} merchantId={merchantId}
                 now={now} onChanged={refresh} onCanceled={handleCanceled}
-                onReported={(res) => handleReported(s, res)} />
+                onReported={(res) => handleReported(s, res)}
+                onPresent={(sale) => setPresentingBill({ intent_id: sale.intent_id,
+                  amount_minor: sale.amount_minor, description: sale.description || "" })} />
             ))}
             {rows.length === 0 && (
               <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",

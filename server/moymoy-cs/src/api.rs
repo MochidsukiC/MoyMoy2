@@ -46,6 +46,7 @@
 //!   GET  /merchant/portal/sales?merchant_id=&limit=&state=         (auth; state = all|open|held|paid|expired|canceled|declined)
 //!   POST /merchant/portal/intent/create {merchant_id, amount_minor, description, order_ref?, expires_in_secs?, idem_key} (auth)
 //!   POST /merchant/portal/intent/cancel {merchant_id, intent_id}   (auth)
+//!   GET  /merchant/portal/intent/wait?merchant_id=&intent_id=&timeout_secs= (auth; long-poll)
 //!   POST /merchant/portal/static-qr {merchant_id, pin}             (auth + PIN)
 //!   POST /merchant/portal/fulfill {merchant_id, intent_id, fulfilled_amount_minor, reason?} (auth)
 //!   GET  /wallet/qr/static?code=                                   (auth)
@@ -194,6 +195,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/merchant/portal/intent/cancel",
             post(merchant::portal_intent_cancel),
+        )
+        .route(
+            "/merchant/portal/intent/wait",
+            get(merchant::portal_intent_wait),
         )
         // Merchant API (Bearer moy_sk_…): intents only, never a balance.
         .route("/merchant/v1/intent/create", post(merchant::intent_create))

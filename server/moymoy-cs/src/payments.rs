@@ -703,6 +703,65 @@ impl SalesFilter {
 /// It also cannot be answered from the escrow account's balance, because that one
 /// account holds every shop's held money in a single pot. `merchant::close` makes
 /// the same judgement for the same reason, and both count intents.
+/// One intent as its shop's OWNER sees it: the `sales[]` row of [`sales_page`],
+/// also the `intent` of the portal long-poll (`merchant::portal_intent_wait`), so
+/// the two cannot drift apart.
+pub fn owner_sale_row(
+    conn: &Connection,
+    m: &MerchantRow,
+    i: &Intent,
+    now: i64,
+) -> Result<Value, ApiError> {
+    let mut row = merchant_view(m, i, now)?;
+    // The portal learns who paid; the public API does not.
+    //
+    // Only a PAID intent has a payer. `payer_account_id` alone is not the
+    // test: `decline` writes it too, and showing a shopkeeper the name of
+    // somebody who refused to buy would be disclosing a non-customer.
+    // (`state` stays `paid` through a refund, so a refunded sale keeps its
+    // buyer's name.) Read live from `accounts` — nothing is snapshotted, so
+    // a rename shows and past payments show too. An account row that cannot
+    // be found yields a `payer` object with null handle/display_name rather
+    // than hiding that somebody paid.
+    //
+    // A separate statement keyed by primary key rather than a JOIN folded into
+    // the listing query: `INTENT_COLS` and the `SalesFilter` fragments are
+    // unqualified, and the `Intent` row type (which `approve` and the public view
+    // share) stays exactly as it was. Cached, so a page of rows prepares it once;
+    // SQLite is in-process, so this is not a network N+1.
+    let payer = if i.state == STATE_PAID && i.payer_account_id.is_some() {
+        let mut payer_stmt = conn.prepare_cached(
+            "SELECT a.handle, a.display_name, i.payer_game_name \
+             FROM payment_intents i LEFT JOIN accounts a ON a.account_id = i.payer_account_id \
+             WHERE i.intent_id = ?1",
+        )?;
+        let (handle, display_name, game_name): (Option<String>, Option<String>, Option<String>) =
+            payer_stmt.query_row([&i.intent_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        json!({
+            "handle": handle,
+            "display_name": display_name,
+            "game_name": game_name,
+        })
+    } else {
+        Value::Null
+    };
+    // For the owner only, not in `merchant_view`: that view is also the public
+    // `/merchant/v1/intent` response, whose shape is a contract with third-party
+    // integrators. The owner reading its own sales wants to tell a till-side QR
+    // payment from an API-created bill.
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("source".to_string(), json!(i.source.as_db()));
+        obj.insert("payer".to_string(), payer);
+        // The URL its QR encodes — only while the bill can still be paid. Keyed
+        // off the EFFECTIVE state, like `state` itself, so a bill past its
+        // deadline stops offering a code before the sweep has rewritten the row.
+        let qr_url = (i.effective_state(now) == STATE_CREATED)
+            .then(|| merchant::intent_qr_url(&i.intent_id));
+        obj.insert("qr_url".to_string(), json!(qr_url));
+    }
+    Ok(row)
+}
+
 pub fn sales_page(
     conn: &Connection,
     m: &MerchantRow,
@@ -743,64 +802,10 @@ pub fn sales_page(
         v
     };
     let truncated = rows.len() as i64 > limit;
-    // Who paid, for the owner's eyes only (see the `payer` insert below). A
-    // separate statement keyed by primary key rather than a JOIN folded into the
-    // listing query: `INTENT_COLS` and the `SalesFilter` fragments are unqualified,
-    // and the `Intent` row type (which `approve` and the public view share) stays
-    // exactly as it was. SQLite is in-process, so this is not a network N+1.
-    let mut payer_stmt = conn.prepare(
-        "SELECT a.handle, a.display_name, i.payer_game_name \
-         FROM payment_intents i LEFT JOIN accounts a ON a.account_id = i.payer_account_id \
-         WHERE i.intent_id = ?1",
-    )?;
     let sales = rows
         .iter()
         .take(limit as usize)
-        .map(|i| {
-            let mut row = merchant_view(m, i, now)?;
-            // The portal learns who paid; the public API does not.
-            //
-            // Only a PAID intent has a payer. `payer_account_id` alone is not the
-            // test: `decline` writes it too, and showing a shopkeeper the name of
-            // somebody who refused to buy would be disclosing a non-customer.
-            // (`state` stays `paid` through a refund, so a refunded sale keeps its
-            // buyer's name.) Read live from `accounts` — nothing is snapshotted, so
-            // a rename shows and past payments show too. An account row that cannot
-            // be found yields a `payer` object with null handle/display_name rather
-            // than hiding that somebody paid.
-            let payer = if i.state == STATE_PAID && i.payer_account_id.is_some() {
-                let (handle, display_name, game_name): (
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                ) = payer_stmt.query_row([&i.intent_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })?;
-                json!({
-                    "handle": handle,
-                    "display_name": display_name,
-                    "game_name": game_name,
-                })
-            } else {
-                Value::Null
-            };
-            // On the sales page only, not in `merchant_view`: that view is also
-            // the public `/merchant/v1/intent` response, whose shape is a
-            // contract with third-party integrators. The owner reading its own
-            // sales wants to tell a till-side QR payment from an API-created bill.
-            if let Some(obj) = row.as_object_mut() {
-                obj.insert("source".to_string(), json!(i.source.as_db()));
-                obj.insert("payer".to_string(), payer);
-                // The URL its QR encodes — only while the bill can still be
-                // paid. Keyed off the EFFECTIVE state, like `state` itself, so a
-                // bill past its deadline stops offering a code before the sweep
-                // has rewritten the row.
-                let qr_url = (i.effective_state(now) == STATE_CREATED)
-                    .then(|| merchant::intent_qr_url(&i.intent_id));
-                obj.insert("qr_url".to_string(), json!(qr_url));
-            }
-            Ok(row)
-        })
+        .map(|i| owner_sale_row(conn, m, i, now))
         .collect::<Result<Vec<_>, ApiError>>()?;
 
     // Counted from the intents, not from any balance — see the note above. Over

@@ -1440,6 +1440,12 @@ function errLabelFor(res) {
   return base;
 }
 
+/* 起動元の表示。OS が刻んだ app id か、相手のスマホから読み取った QR（os.qr.present）。 */
+function moyLaunchFrom(pending) {
+  if (pending && pending.via === "qr_present") return "読み取った QR";
+  return (pending && pending.from) || "(不明)";
+}
+
 /* ─── EC 決済の承認オーバーレイ ───────────────────────────────────
    表示する金額・加盟店・注文内容は、すべて `GET /wallet/payment/intent` の
    応答だけから来る。起動してきたアプリから読むのは intent_id（店頭 QR の起動なら
@@ -1578,7 +1584,7 @@ function MoyPaymentApproval({ pending, intent, loading, error, required, balance
             gap: 10, fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)",
             letterSpacing: "0.04em", borderBottom: "1px solid rgba(0,0,0,0.12)", paddingBottom: 8 }}>
             <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              FROM {(pending && pending.from) || "(不明)"}
+              FROM {moyLaunchFrom(pending)}
             </span>
             <span style={{ flexShrink: 0 }}>{moyDuration(ageMs)}前</span>
           </div>
@@ -1734,9 +1740,13 @@ function MoyPaymentApproval({ pending, intent, loading, error, required, balance
           )}
           <div style={{ marginTop: 10, fontFamily: "var(--font-jp)", fontSize: 13,
             color: "var(--ink-soft)", lineHeight: 1.8 }}>
-            {done === "paid"
-              ? "お店のアプリに戻ると、商品の受け取りに進めます。"
-              : "お店のアプリに戻ってやり直せます。"}
+            {pending && pending.via === "qr_present"
+              ? (done === "paid"
+                ? "お店の人のスマホにも支払いが表示されます。商品を受け取ってください。"
+                : "やり直すときは、もう一度お店の人を読み取ってください。")
+              : done === "paid"
+                ? "お店のアプリに戻ると、商品の受け取りに進めます。"
+                : "お店のアプリに戻ってやり直せます。"}
           </div>
           {error && (
             <div style={{ marginTop: 12, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
@@ -1871,7 +1881,7 @@ function MoyStaticQrPay({ pending, balance, onCancel, onIntent, onExpired }) {
         <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)",
           letterSpacing: "0.04em", borderBottom: "1px solid rgba(0,0,0,0.12)", paddingBottom: 8,
           overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          FROM {pending.from || "(不明)"}
+          FROM {moyLaunchFrom(pending)}
         </div>
 
         {loading && (
