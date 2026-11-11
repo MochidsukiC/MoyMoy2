@@ -1815,40 +1815,45 @@ pub(crate) async fn payment_approve(
     let watch = st.watch.clone();
     let intent_id = req.intent_id.clone();
     let result = blocking(st.pool, move |conn| {
-        let mut value = approve(
-            conn,
-            &backoff,
-            email_enabled,
-            &riskauth::Caller {
-                account_id: &acct.account_id,
-                phone_id: acct.phone_id.as_deref(),
-                session_key: &acct.session_key,
-                pin: req.pin.as_deref(),
-                otp: req.otp.as_deref(),
-            },
-            &req.intent_id,
-        )?;
-        // `state` alone is not the test: the answer to a non-payer who approves an
-        // already-paid intent is `{ok:false, error:"already_paid", state:"paid"}`.
-        if value["ok"] == json!(true) && value["state"] == json!(STATE_PAID) {
-            let stored = record_payer_game_name(
+        let outcome = (|| -> Result<Value, ApiError> {
+            let mut value = approve(
                 conn,
+                &backoff,
+                email_enabled,
+                &riskauth::Caller {
+                    account_id: &acct.account_id,
+                    phone_id: acct.phone_id.as_deref(),
+                    session_key: &acct.session_key,
+                    pin: req.pin.as_deref(),
+                    otp: req.otp.as_deref(),
+                },
                 &req.intent_id,
-                &acct.account_id,
-                req.payer_game_name.as_deref(),
-            );
-            if let Some(o) = value.as_object_mut() {
-                o.insert("payer_game_name_stored".to_string(), json!(stored));
+            )?;
+            // `state` alone is not the test: the answer to a non-payer who approves
+            // an already-paid intent is `{ok:false, error:"already_paid", state:"paid"}`.
+            if value["ok"] == json!(true) && value["state"] == json!(STATE_PAID) {
+                let stored = record_payer_game_name(
+                    conn,
+                    &req.intent_id,
+                    &acct.account_id,
+                    req.payer_game_name.as_deref(),
+                );
+                if let Some(o) = value.as_object_mut() {
+                    o.insert("payer_game_name_stored".to_string(), json!(stored));
+                }
             }
-        }
-        Ok(value)
+            Ok(value)
+        })();
+        // Whether or not the approval succeeded: `approve` commits in several
+        // transactions, so even an `Err` can follow a state change. Waiters re-read
+        // the row, so a notification that changed nothing is harmless and a missing
+        // one would strand a long-poll until its timeout. Sent here, on the blocking
+        // task, so the commit and the notification stay paired even when the HTTP
+        // handler is dropped by a client disconnect before it resumes.
+        watch.notify(&intent_id);
+        outcome
     })
     .await;
-    // Before `?`, and whether or not the approval succeeded: `approve` commits in
-    // several transactions, so even an `Err` can follow a state change. Waiters
-    // re-read the row, so a notification that changed nothing is harmless and a
-    // missing one would strand a long-poll until its timeout.
-    watch.notify(&intent_id);
     Ok(Json(result?))
 }
 
@@ -1865,11 +1870,13 @@ pub(crate) async fn payment_decline(
     let watch = st.watch.clone();
     let intent_id = req.intent_id.clone();
     let result = blocking(st.pool, move |conn| {
-        decline(conn, &req.intent_id, &acct.account_id).map_err(ApiError::from)
+        let outcome = decline(conn, &req.intent_id, &acct.account_id).map_err(ApiError::from);
+        // After the commit and regardless of the outcome, on the blocking task so
+        // a dropped handler cannot skip it — see `payment_approve`.
+        watch.notify(&intent_id);
+        outcome
     })
     .await;
-    // After the commit and regardless of the outcome — see `payment_approve`.
-    watch.notify(&intent_id);
     Ok(Json(result?))
 }
 
@@ -4148,5 +4155,71 @@ mod tests {
             .unwrap();
             assert!(matches!(out, CreateOutcome::BadTtl), "{bad} was accepted");
         }
+    }
+
+    /// One static-QR bill from `acct-a` at the shop whose code is `code`.
+    async fn static_bill(st: &AppState, code: &str, idem_key: &str, amount_minor: i64) -> String {
+        let (_, Json(v)) = crate::qr::static_qr_intent(
+            State(st.clone()),
+            AuthedAccount {
+                account_id: "acct-a".to_string(),
+                phone_id: None,
+                session_key: "sess-a".to_string(),
+            },
+            Json(
+                serde_json::from_value(json!({
+                    "code": code, "idem_key": idem_key, "amount_minor": amount_minor
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["ok"], json!(true), "{v}");
+        v["intent_id"].as_str().unwrap().to_string()
+    }
+
+    /// A rescan replaces the customer's still-payable static-QR bill, but a bill
+    /// whose deadline has passed is the sweep's to mark `expired` — cancelling it
+    /// would record "the shop withdrew it" for what was really a lapse.
+    #[tokio::test]
+    async fn a_rescan_cancels_a_live_static_bill_but_leaves_a_lapsed_one_expired() {
+        let (pool, _first, m) = fixture(100, 1_000);
+        let st = AppState {
+            pool: pool.clone(),
+            ..crate::admin_api::tests::app_state()
+        };
+        let code = {
+            let mut conn = pool.get().unwrap();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let merchant::StaticQrOutcome::Ok { code } =
+                merchant::issue_static_qr(&tx, &m.merchant_id, "acct-m").unwrap()
+            else {
+                panic!("static QR was not issued");
+            };
+            tx.commit().unwrap();
+            code
+        };
+
+        let a = static_bill(&st, &code, "sq-a", 150).await;
+        let b = static_bill(&st, &code, "sq-b", 160).await;
+        // A was still payable: replaced, as before.
+        assert_eq!(state_of(&pool, &a), "canceled");
+
+        // B lapses; the expiry sweep has not run yet.
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE payment_intents SET expires_unix_ms = ?1 WHERE intent_id = ?2",
+                params![now_ms() - 1_000, b],
+            )
+            .unwrap();
+        let c = static_bill(&st, &code, "sq-c", 170).await;
+
+        assert_eq!(state_of(&pool, &b), "created");
+        assert_eq!(intent_of(&pool, &b).effective_state(now_ms()), "expired");
+        assert_eq!(state_of(&pool, &c), "created");
     }
 }

@@ -1691,23 +1691,20 @@ pub(crate) async fn portal_intent_cancel(
         let owned = get(conn, &req.merchant_id)?
             .filter(|m| m.owner_account_id.as_deref() == Some(acct.account_id.as_str()))
             .filter(|m| m.status != STATUS_DELETED);
+        // Not for a shop that was never this account's — nothing was attempted, so
+        // nobody is notified.
         let Some(m) = owned else {
-            return Ok::<(Value, bool), ApiError>((
-                json!({ "ok": false, "error": "unknown_merchant" }),
-                false,
-            ));
+            return Ok::<Value, ApiError>(json!({ "ok": false, "error": "unknown_merchant" }));
         };
-        let v = payments::cancel(conn, &req.intent_id, &m.merchant_id)?;
-        Ok((v, true))
+        let outcome = payments::cancel(conn, &req.intent_id, &m.merchant_id).map_err(ApiError::from);
+        // After the commit (`cancel` runs in autocommit) and whatever its outcome,
+        // as in `intent_cancel`: a long-poll on this intent re-reads the row when
+        // woken. Here on the blocking task, so a dropped handler cannot skip it.
+        watch.notify(&intent_id);
+        outcome
     })
     .await;
-    // After the commit (`cancel` runs in autocommit) and whatever its outcome, as
-    // in `intent_cancel`: a long-poll on this intent re-reads the row when woken.
-    // Not for a shop that was never this account's — nothing was attempted.
-    if matches!(result, Ok((_, true))) {
-        watch.notify(&intent_id);
-    }
-    Ok(Json(result?.0))
+    Ok(Json(result?))
 }
 
 // ── merchant API (Bearer moy_sk_…) ───────────────────────────────────────────
@@ -2285,12 +2282,16 @@ pub(crate) async fn intent_cancel(
     let watch = st.watch.clone();
     let intent_id = req.intent_id.clone();
     let result = blocking(st.pool, move |conn| {
-        payments::cancel(conn, &req.intent_id, &m.merchant.merchant_id).map_err(ApiError::from)
+        let outcome =
+            payments::cancel(conn, &req.intent_id, &m.merchant.merchant_id).map_err(ApiError::from);
+        // After the commit and regardless of the outcome: a long-poll on this
+        // intent (this shop's own, or a second process of it) re-reads the row when
+        // woken. Sent on the blocking task, so the commit and the notification stay
+        // paired even if the HTTP handler is dropped by a client disconnect.
+        watch.notify(&intent_id);
+        outcome
     })
     .await;
-    // After the commit and regardless of the outcome: a long-poll on this intent
-    // (this shop's own, or a second process of it) re-reads the row when woken.
-    watch.notify(&intent_id);
     Ok(Json(result?))
 }
 

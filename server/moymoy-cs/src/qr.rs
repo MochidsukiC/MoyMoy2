@@ -275,32 +275,33 @@ pub(crate) async fn static_qr_intent(
         return Ok(rate_limited(retry_after_ms));
     }
 
+    let watch = st.watch.clone();
     let result = blocking(st.pool, move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(prev) = db::idem_get(&tx, &req.idem_key, &scope)? {
-            return Ok((replay(prev), Vec::new()));
+            return Ok(replay(prev));
         }
         let Some(m) = merchant::get_active_by_static_qr(&tx, &req.code)? else {
-            return Ok((
-                json!({ "ok": false, "error": "unknown_static_qr" }),
-                Vec::new(),
-            ));
+            return Ok(json!({ "ok": false, "error": "unknown_static_qr" }));
         };
         // Same bound as every other payment, and BEFORE anything is cancelled: a
         // refused request must leave the customer's earlier bill alone.
         // (Deliberately no `% 100` test, as for sends and approvals.)
         if !(1..=wallet::MAX_AMOUNT).contains(&amount_minor) {
-            return Ok((json!({ "ok": false, "error": "bad_amount" }), Vec::new()));
+            return Ok(json!({ "ok": false, "error": "bad_amount" }));
         }
 
-        // This customer's earlier open bills at this shop. Selected, then updated,
-        // in the one IMMEDIATE transaction: the ids are what the caller notifies
-        // long-pollers about once this commits.
+        // This customer's earlier STILL-PAYABLE bills at this shop. Selected, then
+        // updated, in the one IMMEDIATE transaction: the ids are what gets notified
+        // to long-pollers once this commits. One `now` for both statements, and
+        // only bills inside their deadline: a lapsed one is the expiry sweep's to
+        // mark `expired` — cancelling it would record "withdrawn" for a lapse.
+        let now = now_ms();
         let stale: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT intent_id FROM payment_intents \
                  WHERE merchant_id = ?1 AND payer_hint_account_id = ?2 \
-                   AND source = ?3 AND state = ?4",
+                   AND source = ?3 AND state = ?4 AND expires_unix_ms > ?5",
             )?;
             let ids = stmt
                 .query_map(
@@ -308,7 +309,8 @@ pub(crate) async fn static_qr_intent(
                         m.merchant_id,
                         acct.account_id,
                         IntentSource::StaticQr.as_db(),
-                        payments::STATE_CREATED
+                        payments::STATE_CREATED,
+                        now
                     ],
                     |r| r.get::<_, String>(0),
                 )?
@@ -318,14 +320,14 @@ pub(crate) async fn static_qr_intent(
         tx.execute(
             "UPDATE payment_intents SET state = ?5, updated_unix_ms = ?6 \
              WHERE merchant_id = ?1 AND payer_hint_account_id = ?2 \
-               AND source = ?3 AND state = ?4",
+               AND source = ?3 AND state = ?4 AND expires_unix_ms > ?6",
             params![
                 m.merchant_id,
                 acct.account_id,
                 IntentSource::StaticQr.as_db(),
                 payments::STATE_CREATED,
                 payments::STATE_CANCELED,
-                now_ms()
+                now
             ],
         )?;
 
@@ -361,16 +363,17 @@ pub(crate) async fn static_qr_intent(
         });
         db::idem_put(&tx, &req.idem_key, &scope, &v.to_string())?;
         tx.commit()?;
-        Ok::<(Value, Vec<String>), ApiError>((v, stale))
+        // Right after the commit, on this blocking task: a shop long-polling one
+        // of the bills just replaced must hear that it is cancelled, and that must
+        // not depend on the HTTP handler still being alive to run a later line
+        // (a client disconnect drops the handler, never this task).
+        for intent_id in &stale {
+            watch.notify(intent_id);
+        }
+        Ok::<Value, ApiError>(v)
     })
     .await;
-    let (value, cancelled) = result?;
-    // After the commit: a shop long-polling one of the bills that was just
-    // replaced must hear that it is cancelled.
-    for intent_id in &cancelled {
-        st.watch.notify(intent_id);
-    }
-    Ok(ok_json(value))
+    Ok(ok_json(result?))
 }
 
 #[cfg(test)]
