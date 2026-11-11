@@ -745,11 +745,28 @@ function MoyBillQr({ qrUrl, description }) {
   );
 }
 
+/* 前回つくったお会計の内容。お店ごと・この端末だけに保存し、次のフォームに最初から
+   入れておく（同じ品を続けて売る店頭の手間を減らす）。お金の流れには関わらない。 */
+const moyLastBillDescKey = (merchantId) => "moymoy.lastBillDesc.v1." + merchantId;
+
 /* 新しいお会計のフォーム。閉じると（成功・やめる）この部品ごと消えるので、入力値と
-   再試行用の鍵は次に開いたときに持ち越されない。 */
+   再試行用の鍵は次に開いたときに持ち越されない。内容だけは前回の値を保存から入れる。 */
 function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
   const entry = useMoyAmountInput(true);
   const [desc, setDesc] = msState("");
+  const [prefilled, setPrefilled] = msState(false);
+  const typedRef = msRef(false);
+  msEffect(() => {
+    let live = true;
+    MoyMoy.store.get(moyLastBillDescKey(merchantId)).then((saved) => {
+      if (!live || typeof saved !== "string" || saved === "") return;
+      // 読み込み中に打ち始めていたら、その入力を優先して上書きしない。
+      if (typedRef.current) return;
+      setDesc(saved);
+      setPrefilled(true);
+    });
+    return () => { live = false; };
+  }, [merchantId]);
   const [ttl, setTtl] = msState(600);
   const [orderRef, setOrderRef] = msState("");
   const [busy, setBusy] = msState(false);
@@ -786,6 +803,9 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
       const r = await MoyMoy.portalIntentCreate(merchantId, input, attemptRef.current.key);
       if (!aliveRef.current) return;
       if (r.ok && typeof r.qr_url === "string" && r.qr_url) {
+        MoyMoy.store.set(moyLastBillDescKey(merchantId), input.description).then((saved) => {
+          if (!saved) console.warn("MoyMoy: could not save the last bill description; the next form starts empty");
+        });
         onCreated(r, input.description);
         return;
       }
@@ -817,11 +837,12 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
 
       <div style={{ marginTop: 14 }}>
         <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>内容（必須）</div>
-        <input value={desc} disabled={busy} onChange={(e) => setDesc(e.target.value)}
+        <input value={desc} disabled={busy} onChange={(e) => { typedRef.current = true; setDesc(e.target.value); setPrefilled(false); }}
           maxLength={MOY_MAX_BILL_DESC * 3} aria-label="お会計の内容（120文字まで）"
           placeholder="例: 石レンガ x64" style={fieldStyle} />
         <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, lineHeight: 1.6,
           color: descBad ? "var(--carle-red)" : "var(--ink-soft)", fontWeight: descBad ? 700 : 400 }}>
+          {prefilled && <div>前回と同じ内容を入れてあります。違うときは書き換えてください。</div>}
           {descLen} / {MOY_MAX_BILL_DESC} 文字{descBad ? "。長すぎます" : ""}
         </div>
       </div>
