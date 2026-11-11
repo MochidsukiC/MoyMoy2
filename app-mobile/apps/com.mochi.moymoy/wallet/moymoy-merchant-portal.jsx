@@ -500,7 +500,11 @@ function MoyStaticQrSection({ merchant, onIssue }) {
   );
 }
 
-function MerchantPortal({ open, onClose }) {
+/* inline: ボトムナビの「お店」タブとして本体レイアウトに埋め込む形。アプリの
+   ヘッダとボトムナビが既にあるので、自前の全画面ヘッダと「閉じる」を出さず、
+   一覧以外の画面でだけ戻るボタンを出す。PIN シート (MoyPinStep) はこの要素の
+   外側（アプリ本体）を基準に全画面で出る。 */
+function MerchantPortal({ open, onClose, inline }) {
   const [list, setList] = msState([]);
   const [loading, setLoading] = msState(true);
   const [loadErr, setLoadErr] = msState(null);
@@ -699,21 +703,47 @@ function MerchantPortal({ open, onClose }) {
   // 弾かれていた。PIN を打たせてから失敗させることになるので、ここで止める。
   const canRegister = nameOk && subOk;
 
+  // 一つ上の画面へ戻る。一覧ではオーバーレイ形のときだけ閉じる。
+  function goBack() {
+    if (view === "list") { if (onClose) onClose(); return; }
+    // 売上はある加盟店の詳細のサブ画面なので、一覧ではなく詳細へ戻る。
+    if (view === "sales") { setView("detail"); setErr(null); return; }
+    setView("list"); setErr(null); setRevealed(null);
+  }
+
   return (
     <>
-      <div className="fade-in" style={{ position: "absolute", inset: 0, zIndex: 145,
-        background: "var(--bg-white)", display: "flex", flexDirection: "column" }}>
+      <div className="fade-in" style={inline
+        ? { flex: 1, minHeight: 0, position: "relative", background: "var(--bg-white)",
+            display: "flex", flexDirection: "column" }
+        : { position: "absolute", inset: 0, zIndex: 145,
+            background: "var(--bg-white)", display: "flex", flexDirection: "column" }}>
+        {inline ? (
+          <div style={{ flexShrink: 0, padding: "14px 18px 10px", borderBottom: "1px solid rgba(0,0,0,0.08)",
+            display: "flex", alignItems: "center", gap: 10 }}>
+            {view !== "list" && (
+              <button onClick={goBack} aria-label={view === "sales" ? "詳細へ戻る" : "一覧へ戻る"}
+                style={{ background: "transparent", border: "1.5px solid var(--ink)", cursor: "pointer",
+                color: "var(--ink)", padding: "4px 8px", display: "flex", alignItems: "center", gap: 4,
+                fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700 }}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M15 18l-6-6 6-6" /></svg>
+                {view === "sales" ? "詳細へ" : "一覧へ"}
+              </button>
+            )}
+            <div>
+              <div style={{ fontFamily: "var(--font-jp)", fontSize: 16, fontWeight: 800, color: "var(--ink)" }}>お店</div>
+              <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)" }}>
+                加盟店管理 · MoyMoy で代金を受け取る
+              </div>
+            </div>
+          </div>
+        ) : (
         <div style={{ flexShrink: 0, padding: "56px 18px 14px", background: "var(--moy)", color: "#fff",
           borderBottom: "1.5px solid #000", position: "relative", overflow: "hidden" }}>
           <div className="paper-noise" style={{ opacity: 0.1 }} />
           <div style={{ position: "relative", zIndex: 1 }}>
             <button
-              onClick={() => {
-                if (view === "list") { onClose(); return; }
-                // 売上はある加盟店の詳細のサブ画面なので、一覧ではなく詳細へ戻る。
-                if (view === "sales") { setView("detail"); setErr(null); return; }
-                setView("list"); setErr(null); setRevealed(null);
-              }}
+              onClick={goBack}
               style={{ background: "transparent", border: "none", cursor: "pointer", color: "#fff",
               fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 700, letterSpacing: "0.16em",
               display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
@@ -732,8 +762,9 @@ function MerchantPortal({ open, onClose }) {
             </div>
           </div>
         </div>
+        )}
 
-        <div style={{ flex: 1, overflow: "auto", padding: "16px 18px 30px" }}>
+        <div style={{ flex: 1, overflow: "auto", padding: inline ? "16px 18px 120px" : "16px 18px 30px" }}>
           {err && (
             <div style={{ marginBottom: 12, padding: "10px 12px", border: "1.5px solid var(--carle-red)",
               background: "rgba(227,38,54,0.08)", fontFamily: "var(--font-jp)", fontSize: 12,

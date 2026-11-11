@@ -282,7 +282,9 @@ function MoyBottomNav({ tab, onTab }) {
     { id: "send", label: "送る", glyph: "⇄" },
     { id: "pay", label: "支払う", center: true },
     { id: "charge", label: "チャージ", glyph: "＋" },
-    { id: "history", label: "履歴", glyph: "≡" },
+    // 履歴はホームのクイックアクションから開く（2026-11-11 ユーザー決定）。
+    // この枠は加盟店管理（お店）の入口。
+    { id: "shop", label: "お店", glyph: "▤" },
   ];
   return (
     <div style={{ position: "absolute", left: 0, right: 0, bottom: 0, zIndex: 60,
@@ -374,21 +376,22 @@ function MoyHome({ balance, txns, profile, onTab, onTxn }) {
       </div>
 
       {/* quick actions */}
-      <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+      <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 6 }}>
         {[
           { id: "pay", label: "支払う", glyph: "◈" },
           { id: "send", label: "送る", glyph: "⇄" },
           { id: "charge", label: "チャージ", glyph: "＋" },
           { id: "withdraw", label: "出金", glyph: "↑" },
+          { id: "history", label: "履歴", glyph: "≡" },
         ].map(a => (
           <button key={a.id} onClick={() => onTab(a.id)} style={{
-            border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)",
-            padding: "14px 6px", display: "flex", flexDirection: "column", alignItems: "center", gap: 7,
-            cursor: "pointer", transition: "transform 120ms" }}>
-            <span style={{ width: 34, height: 34, display: "grid", placeItems: "center",
+            border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "2px 2px 0 var(--ink)",
+            padding: "10px 2px", display: "flex", flexDirection: "column", alignItems: "center", gap: 5,
+            cursor: "pointer", transition: "transform 120ms", minWidth: 0 }}>
+            <span style={{ width: 30, height: 30, display: "grid", placeItems: "center",
               background: "var(--moy-mint)", border: "1.5px solid var(--moy-deep)",
-              fontFamily: "var(--font-mono)", fontSize: 17, fontWeight: 700, color: "var(--moy-deep)" }}>{a.glyph}</span>
-            <span style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700 }}>{a.label}</span>
+              fontFamily: "var(--font-mono)", fontSize: 15, fontWeight: 700, color: "var(--moy-deep)" }}>{a.glyph}</span>
+            <span style={{ fontFamily: "var(--font-jp)", fontSize: 11, fontWeight: 700, whiteSpace: "nowrap" }}>{a.label}</span>
           </button>
         ))}
       </div>

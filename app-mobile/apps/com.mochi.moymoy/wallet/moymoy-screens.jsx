@@ -1999,7 +1999,6 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
   const [complete, setComplete] = msState(null);
   const [menuOpen, setMenuOpen] = msState(false);
   const [settingsOpen, setSettingsOpen] = msState(false);
-  const [portalOpen, setPortalOpen] = msState(false);
 
   // 送金・出金の step-up PIN。承認画面の PIN ステップと同じ MoyPinStep を使う。
   const [pinAsk, setPinAsk] = msState(false);
@@ -2456,7 +2455,10 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
       background: "var(--bg-white)", display: "flex", flexDirection: "column", ...rootStyle }}>
       <MoyHeader account={account} onMenu={() => setMenuOpen(true)} />
 
-      <div style={{ flex: 1, overflow: "auto", position: "relative" }}>
+      {/* お店タブは加盟店管理画面をそのまま本体に埋め込む。画面内に自前の
+          スクロール領域を持つので、下のスクロール領域の代わりに置く。 */}
+      {tab === "shop" && <MerchantPortal open inline />}
+      <div style={{ flex: 1, overflow: "auto", position: "relative", display: tab === "shop" ? "none" : undefined }}>
         {tab === "home" && <MoyHome balance={balance} txns={txns} profile={profile} onTab={goFromHome} onTxn={setSelectedTxn} />}
         {tab === "pay" && <MoyPay txns={txns} onTxn={setSelectedTxn} />}
         {tab === "send" && <MoySend account={account} friends={friends} onPick={t => setFlow({ kind: "send", target: t })} />}
@@ -2555,12 +2557,11 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
         onClose={() => setMenuOpen(false)} />
       <SettingsSheet open={settingsOpen} account={account} seal={seal}
         onLogout={() => { setSettingsOpen(false); if (account && onLogoutAccount) onLogoutAccount(account.account_id); }}
-        onMerchant={() => { setSettingsOpen(false); setPortalOpen(true); }}
+        onMerchant={() => { setSettingsOpen(false); setFlow(null); setTab("shop"); }}
         onSeal={() => { setSettingsOpen(false); setSealSetup(true); }}
         onClose={() => setSettingsOpen(false)} />
       {/* 開くたびに新しくマウントする。据え置くと、シールを設定したあとに
           開き直しても入力欄が初回マウント時の値のままになる。 */}
-      {portalOpen && <MerchantPortal open onClose={() => setPortalOpen(false)} />}
       {sealSetup && <MoySealSetup open seal={seal} onSave={persistSeal} onClose={() => setSealSetup(false)} />}
     </div>
   );
