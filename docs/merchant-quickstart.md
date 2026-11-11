@@ -203,7 +203,7 @@ QR コードを読んで MoyMoy で払う経路。**QR は権限を運ばない*
 
 他の mod（RPSystem 等）から使う想定。
 
-1. **事前に** §5 の `intent/create` で請求を作る。`QrBlockUseHandler` はサーバースレッド上で同期的に呼ばれ、I/O を禁止されるため、QR を使う瞬間に HTTP を呼んで請求を作ってはいけない。
+1. **事前に** §5 の `intent/create` で請求を作る。`QrBlockUseHandler` はサーバースレッド上で同期的に呼ばれ、I/O を禁止されるため、QR を使う瞬間に HTTP を呼んで請求を作ってはいけない。`launch_app_id` は**付けない**（QR 経由の起動は Web 起点なので起動元が必ず `com.mochi.browser` になり、自分のアプリ id を申告すると毎回不一致の警告バナーが出る。§5 参照）。
 2. `https://moymoy.cs.mnn/qr/i/<intent_id>` を `MochiMod.QR.createItem` / `registerUseHandler` で QR に埋め込む。
 3. intent の TTL は最長 30 分（§5 の `expires_in_secs`）。**期限切れの QR は使えないので、新しい intent を作って QR を作り直す。**
 4. 支払い完了は、下記の待ち受け型照会で知る（Webhook は無い）。
@@ -280,7 +280,7 @@ awaitPaid(client, apiKey, intentId).thenAccept(intent -> {
 
 - 加盟店管理画面（§3-2 の到達手順）で「静的 QR」を発行する（セッション + PIN）。表示される URL（`https://moymoy.cs.mnn/qr/s/<code>`）を、サーバー管理者が `/mochi qr label "<店名>" <URL>` で QR ブロックにする。**再発行すると旧コードは直ちに無効になる**（印刷物の紛失・汚損時の失効手段）。停止中・閉店した店のコードは使えない。
 - 客は QR を読み、店名を確認して金額を入力し、PIN で承認する。客が作る請求は店の発行上限（§5）には数えられない。
-- 静的 QR の請求には履行報告をする MC 側の仕組みが無いので、**加盟店管理画面の売上ページで、受け取った分について「渡した」報告をする**（PIN 不要・ログイン中のセッションのみ）。API からは `POST /merchant/portal/fulfill {merchant_id, intent_id, fulfilled_amount_minor, reason?}`（セッション認証。本体と応答は `intent/fulfill` と同じ）。未報告のまま 6 時間経つと保留される。
+- 静的 QR の請求は客が作るため、店のシステムは請求 ID を前もって知らない。**加盟店管理画面の売上ページで、受け取った分について「渡した」報告をする**（API キーの `intent/fulfill` でも報告できるが、ID は売上ページか `/merchant/portal/sales` で知るしかない）（PIN 不要・ログイン中のセッションのみ）。API からは `POST /merchant/portal/fulfill {merchant_id, intent_id, fulfilled_amount_minor, reason?}`（セッション認証。本体と応答は `intent/fulfill` と同じ）。未報告のまま 6 時間経つと保留される。
 - QR ブロックは MochiOS の Fabric 26.2 版でのみ使える。
 
 ## 8. 金額の扱い
