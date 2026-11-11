@@ -132,8 +132,8 @@ fn landing_html(params: &Value) -> String {
          <body>\n\
          <main>\n\
          <h1>MoyMoy で支払う</h1>\n\
-         <p>ボタンを押すと MoyMoy アプリが開き、金額とお店を確認して支払えます。\
-         金額はアプリの画面で確認してください。</p>\n\
+         <p>ボタンを押すと MoyMoy アプリが開きます。\
+         お店と金額は、アプリの画面で確認してから支払ってください。</p>\n\
          <button id=\"pay\" type=\"button\" data-app-params=\"{params}\">MoyMoy アプリを開く</button>\n\
          </main>\n\
          <script src=\"/qr/launch.js\" defer></script>\n\
