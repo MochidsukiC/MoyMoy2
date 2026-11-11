@@ -787,7 +787,7 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
 
 /* 請求の 1 行。未払いは QR の表示と取り消し、支払い済みは売上ページと同じ
    エスクロー表示（SaleEscrowNotes。渡し待ちなら「全額渡した」）。 */
-function MoyBillRow({ sale, last, merchantId, onChanged, onReported }) {
+function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onReported }) {
   const [showQr, setShowQr] = msState(false);
   const [confirming, setConfirming] = msState(false);
   const [busy, setBusy] = msState(false);
@@ -800,7 +800,10 @@ function MoyBillRow({ sale, last, merchantId, onChanged, onReported }) {
   }, []);
 
   const escrow = sale.escrow || { stage: "none" };
-  const isOpen = sale.state === "created";
+  // サーバーの `effective_state` と同じ判定: created のまま期限 (expires_unix_ms) を
+  // 過ぎたら expired。取り直しを待たずに、表示中に期限が来た行もここで切り替える。
+  const expiredNow = sale.state === "created" && sale.expires_unix_ms <= now;
+  const isOpen = sale.state === "created" && !expiredNow;
   const isHeld = sale.state === "paid" && escrow.stage === "held";
   const sourceLabel = MOY_BILL_SOURCE[sale.source];
   const hasQr = typeof sale.qr_url === "string" && sale.qr_url !== "";
@@ -825,7 +828,7 @@ function MoyBillRow({ sale, last, merchantId, onChanged, onReported }) {
     }
     if (!aliveRef.current) return;
     setBusy(false); setConfirming(false);
-    if (ok) { setCanceled(true); onChanged(); }
+    if (ok) { setCanceled(true); onCanceled(sale); onChanged(); }
     else setCancelErr(err);
   }
 
@@ -863,7 +866,7 @@ function MoyBillRow({ sale, last, merchantId, onChanged, onReported }) {
             {formatEme(sale.amount_minor)} エメ
           </div>
           <div style={{ marginTop: 4, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}>
-            <MoyBillStateBadge state={canceled ? "canceled" : sale.state} />
+            <MoyBillStateBadge state={canceled ? "canceled" : expiredNow ? "expired" : sale.state} />
             {sale.state === "paid" && <EscrowStageBadge stage={escrow.stage} />}
           </div>
         </div>
@@ -945,6 +948,13 @@ function MoyBillsPage({ merchant }) {
   const [notice, setNotice] = msState(null);    // 渡し待ちの行を報告した結果 {ok, text}
   const [formOpen, setFormOpen] = msState(false);
   const [created, setCreated] = msState(null);  // 作成結果カード
+  // 期限切れの表示を取り直し無しで切り替えるための時計。このページを表示している
+  // 間だけ動かし、離れたら止める。
+  const [now, setNow] = msState(() => Date.now());
+  msEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
   // 取得は重なりうる（チップの連打、報告直後の取り直し）。遅れて返った古い応答で
   // 一覧を上書きしないよう、最後に始めた取得の応答だけを採用する。
   const seqRef = msRef(0);
@@ -994,6 +1004,13 @@ function MoyBillsPage({ merchant }) {
       setNotice({ ok: res.ok, text: "「" + (sale.description || "請求") + "」 " + res.text });
     }
     refresh();
+  }
+
+  // 「未払い」の絞り込み中は、取り消した行が取り直しですぐ消え、行内の結果表示が
+  // 見えない。何を取り消したかを一覧の上に残す。
+  function handleCanceled(sale) {
+    setNotice({ ok: true, text: "「" + (sale.description || "請求") + "」（" + formatEme(sale.amount_minor) +
+      " エメ）の請求を取り消しました。" });
   }
 
   const spec = MOY_BILL_FILTERS.find((f) => f.key === filter);
@@ -1061,13 +1078,13 @@ function MoyBillsPage({ merchant }) {
         <MoyNewBillForm merchantId={merchantId} onCreated={handleCreated} onCancel={() => setFormOpen(false)} />
       )}
 
-      <div style={{ marginTop: 18, display: "flex", flexWrap: "wrap", gap: 6 }}>
+      <div style={{ marginTop: 18, display: "flex", flexWrap: "wrap", gap: 4 }}>
         {MOY_BILL_FILTERS.map((f) => (
           <button key={f.key} onClick={() => setFilter(f.key)} aria-pressed={filter === f.key} style={{
-            padding: "7px 12px", border: "1.5px solid " + (filter === f.key ? "var(--moy-deep)" : "var(--ink)"),
+            padding: "6px 8px", border: "1.5px solid " + (filter === f.key ? "var(--moy-deep)" : "var(--ink)"),
             background: filter === f.key ? "var(--moy-deep)" : "var(--bg-white)",
-            color: filter === f.key ? "#fff" : "var(--ink)", cursor: "pointer",
-            fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 12 }}>{f.label}</button>
+            color: filter === f.key ? "#fff" : "var(--ink)", cursor: "pointer", whiteSpace: "nowrap",
+            fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 11 }}>{f.label}</button>
         ))}
       </div>
 
@@ -1101,7 +1118,8 @@ function MoyBillsPage({ merchant }) {
           <div style={{ marginTop: 10, border: "1.5px solid var(--ink)" }}>
             {rows.map((s, i) => (
               <MoyBillRow key={s.intent_id} sale={s} last={i === rows.length - 1} merchantId={merchantId}
-                onChanged={refresh} onReported={(res) => handleReported(s, res)} />
+                now={now} onChanged={refresh} onCanceled={handleCanceled}
+                onReported={(res) => handleReported(s, res)} />
             ))}
             {rows.length === 0 && (
               <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",
@@ -1156,7 +1174,7 @@ function MerchantPortal({ open, onClose, inline }) {
     const id = selectedRef.current;
     if (!id) return;
     try {
-      const r = await MoyMoy.merchantSales(id);
+      const r = await MoyMoy.merchantSales(id, undefined, "paid");
       if (!aliveRef.current || selectedRef.current !== id) return;
       if (r.ok) setSales(r);
       else setErr({ code: r.error || "error" });
@@ -1218,7 +1236,9 @@ function MerchantPortal({ open, onClose, inline }) {
     (async () => {
       setSalesLoading(true); setSales(null);
       try {
-        const r = await MoyMoy.merchantSales(selected);
+        // 売上 = 支払われた請求だけ。未払い・取消・期限切れは請求管理で見る
+        // （混ぜると売上に見え、件数上限で渡し待ちの行が押し出される）。
+        const r = await MoyMoy.merchantSales(selected, undefined, "paid");
         if (alive) setSales(r);
       } catch (e) {
         console.warn("MoyMoy: merchant sales load failed", e);
@@ -1754,7 +1774,7 @@ function MerchantPortal({ open, onClose, inline }) {
                   )}
 
                   <div style={{ marginTop: 20 }}>
-                    <div className="h-section">取引一覧</div>
+                    <div className="h-section">支払われた取引</div>
                   </div>
                   <div style={{ marginTop: 10, border: "1.5px solid var(--ink)" }}>
                     {(sales.sales || []).map((s, i) => (
