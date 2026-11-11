@@ -149,3 +149,73 @@ impl Drop for WaitGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn sixteen_waiters_are_allowed_per_merchant() {
+        let watch = Arc::new(IntentWatch::new());
+        let guards: Vec<_> = (0..16)
+            .map(|n| watch.register("shop-a", &format!("intent-{n}")).unwrap())
+            .collect();
+        assert_eq!(guards.len(), 16);
+        assert!(watch.register("shop-a", "overflow").is_none());
+        assert!(watch.register("shop-b", "other-shop").is_some());
+    }
+
+    #[test]
+    fn dropping_a_guard_reopens_one_slot() {
+        let watch = Arc::new(IntentWatch::new());
+        let mut guards: Vec<_> = (0..16)
+            .map(|_| watch.register("shop", "intent").unwrap())
+            .collect();
+        assert!(watch.register("shop", "intent").is_none());
+        drop(guards.pop().unwrap());
+        let replacement = watch.register("shop", "replacement").unwrap();
+        assert!(watch.register("shop", "overflow").is_none());
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn notification_completes_the_matching_waiter() {
+        let watch = Arc::new(IntentWatch::new());
+        let guard = watch.register("shop", "intent").unwrap();
+        let notified = guard.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        watch.notify("intent");
+        timeout(Duration::from_secs(1), notified).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn notification_does_not_complete_another_intents_waiter() {
+        let watch = Arc::new(IntentWatch::new());
+        let guard = watch.register("shop", "intent").unwrap();
+        let notified = guard.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        watch.notify("other-intent");
+        assert!(timeout(Duration::from_millis(200), notified).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn one_notification_completes_both_waiters() {
+        let watch = Arc::new(IntentWatch::new());
+        let first = watch.register("shop", "intent").unwrap();
+        let second = watch.register("shop", "intent").unwrap();
+        let first_notified = first.notified();
+        let second_notified = second.notified();
+        tokio::pin!(first_notified, second_notified);
+        first_notified.as_mut().enable();
+        second_notified.as_mut().enable();
+        watch.notify("intent");
+        timeout(Duration::from_secs(1), async {
+            tokio::join!(first_notified, second_notified);
+        })
+        .await
+        .unwrap();
+    }
+}

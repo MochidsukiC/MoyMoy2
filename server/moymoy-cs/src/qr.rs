@@ -372,3 +372,67 @@ pub(crate) async fn static_qr_intent(
     }
     Ok(ok_json(value))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_valid_landing(response: Response) {
+        assert_eq!(response.status(), 200);
+        let headers = response.headers();
+        assert!(headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("default-src 'none'"));
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert!(headers["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("no-store"));
+    }
+
+    #[tokio::test]
+    async fn intent_landing_accepts_only_twenty_two_base64url_characters() {
+        for id in ["pi_AAAAAAAAAAAAAAAAAAAAAA", "pi_a-b_c0123456789XYZabcd"] {
+            assert_valid_landing(landing_intent(Path(id.to_string())).await);
+        }
+        for id in [
+            "pi_AAAAAAAAAAAAAAAAAAAAA",
+            "pi_AAAAAAAAAAAAAAAAAAAAAAA",
+            "pi_AAAAAAAAAAAAAAAAAAAAA=",
+            "pi_AAAAAAAAAAAAAAAAAAAAA.",
+            "pi_AAAAAAAAAAAAAAAAAAAAA/",
+            "sq_AAAAAAAAAAAAAAAAAAAAAA",
+            "",
+        ] {
+            assert_eq!(
+                landing_intent(Path(id.to_string())).await.status(),
+                404,
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_landing_accepts_only_twenty_two_base64url_characters() {
+        for id in ["sq_AAAAAAAAAAAAAAAAAAAAAA", "sq_a-b_c0123456789XYZabcd"] {
+            assert_valid_landing(landing_static(Path(id.to_string())).await);
+        }
+        for id in [
+            "sq_AAAAAAAAAAAAAAAAAAAAA",
+            "sq_AAAAAAAAAAAAAAAAAAAAAAA",
+            "sq_AAAAAAAAAAAAAAAAAAAAA=",
+            "sq_AAAAAAAAAAAAAAAAAAAAA.",
+            "sq_AAAAAAAAAAAAAAAAAAAAA/",
+            "pi_AAAAAAAAAAAAAAAAAAAAAA",
+            "",
+        ] {
+            assert_eq!(
+                landing_static(Path(id.to_string())).await.status(),
+                404,
+                "{id}"
+            );
+        }
+    }
+}

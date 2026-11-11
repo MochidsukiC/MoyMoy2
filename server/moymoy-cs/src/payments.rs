@@ -1881,6 +1881,372 @@ mod tests {
 
     const PIN: &str = "1234";
 
+    fn contract_create(
+        pool: &Pool,
+        m: &MerchantRow,
+        amount: i64,
+        source: IntentSource,
+        key: &str,
+    ) -> Intent {
+        let mut conn = pool.get().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let out = create(
+            &tx,
+            m,
+            &NewIntent {
+                idem_key: key,
+                amount,
+                description: "contract sale",
+                order_ref: Some(key),
+                launch_app_id: None,
+                payer_hint_account_id: None,
+                expires_in_secs: Some(600),
+                source,
+            },
+        )
+        .unwrap();
+        let CreateOutcome::Ok(intent) = out else {
+            panic!("{out:?}")
+        };
+        tx.commit().unwrap();
+        intent
+    }
+
+    async fn contract_approve(st: &AppState, id: &str, name: Option<&str>) -> Value {
+        payment_approve(
+            State(st.clone()),
+            AuthedAccount {
+                account_id: "acct-a".to_string(),
+                phone_id: None,
+                session_key: "sess-a".to_string(),
+            },
+            Json(ApproveReq {
+                intent_id: id.to_string(),
+                pin: Some(PIN.to_string()),
+                otp: None,
+                payer_game_name: name.map(str::to_string),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn sales_filter_parse_accepts_only_the_documented_spellings() {
+        for (input, expected) in [
+            ("all", SalesFilter::All),
+            ("open", SalesFilter::Open),
+            ("held", SalesFilter::Held),
+            ("paid", SalesFilter::State("paid")),
+            ("expired", SalesFilter::Expired),
+            ("canceled", SalesFilter::State("canceled")),
+            ("declined", SalesFilter::State("declined")),
+        ] {
+            assert_eq!(SalesFilter::parse(input), Some(expected), "{input}");
+        }
+        for input in ["", "PAID", "held ", "x"] {
+            assert_eq!(SalesFilter::parse(input), None, "{input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn seven_sale_states_have_exact_filters_totals_and_owner_rows() {
+        let (pool, a, m) = fixture(100, 10_000);
+        let st = AppState {
+            pool: pool.clone(),
+            ..crate::admin_api::tests::app_state()
+        };
+        let b = contract_create(&pool, &m, 200, IntentSource::Api, "b");
+        let c = contract_create(&pool, &m, 300, IntentSource::Portal, "c");
+        let d = contract_create(&pool, &m, 400, IntentSource::StaticQr, "d");
+        let e = contract_create(&pool, &m, 500, IntentSource::Api, "e");
+        let f = contract_create(&pool, &m, 600, IntentSource::Portal, "f");
+        let g = contract_create(&pool, &m, 700, IntentSource::StaticQr, "g");
+        assert_eq!(
+            contract_approve(&st, &c.intent_id, Some("Taro_MC")).await["payer_game_name_stored"],
+            true
+        );
+        assert_eq!(
+            contract_approve(&st, &d.intent_id, None).await["payer_game_name_stored"],
+            false
+        );
+        assert_eq!(approve_with(&pool, &e.intent_id, Some(PIN))["ok"], true);
+        assert_eq!(
+            report_with(&pool, &m.merchant_id, &d.intent_id, 400, None),
+            FulfillOutcome::Ok {
+                fulfilled_amount: 400,
+                refund_amount: 0
+            }
+        );
+        assert_eq!(
+            report_with(&pool, &m.merchant_id, &e.intent_id, 250, Some("partial")),
+            FulfillOutcome::Ok {
+                fulfilled_amount: 250,
+                refund_amount: 250
+            }
+        );
+        let conn = pool.get().unwrap();
+        assert_eq!(
+            cancel(&conn, &f.intent_id, &m.merchant_id).unwrap()["ok"],
+            true
+        );
+        assert_eq!(decline(&conn, &g.intent_id, "acct-a").unwrap()["ok"], true);
+        assert_eq!(
+            conn.execute(
+                "UPDATE payment_intents SET expires_unix_ms = 1 WHERE intent_id = ?1",
+                [&b.intent_id]
+            )
+            .unwrap(),
+            1
+        );
+        let now = now_ms();
+        let all = sales_page(&conn, &m, 50, now, SalesFilter::All).unwrap();
+        for (filter, amounts) in [
+            (SalesFilter::Open, vec![100]),
+            (SalesFilter::Expired, vec![200]),
+            (SalesFilter::Held, vec![300]),
+            (SalesFilter::State("paid"), vec![300, 400, 500]),
+            (SalesFilter::State("canceled"), vec![600]),
+            (SalesFilter::State("declined"), vec![700]),
+            (SalesFilter::All, vec![100, 200, 300, 400, 500, 600, 700]),
+        ] {
+            let page = sales_page(&conn, &m, 50, now, filter).unwrap();
+            let rows = page["sales"].as_array().unwrap();
+            let mut actual: Vec<_> = rows
+                .iter()
+                .map(|row| row["amount_minor"].as_i64().unwrap())
+                .collect();
+            actual.sort_unstable();
+            assert_eq!(actual, amounts, "{filter:?}");
+            assert_eq!(page["awaiting_count"], 1, "{filter:?}");
+            assert_eq!(page["incoming_total_minor"], 950, "{filter:?}");
+            assert_eq!(page["held_total_minor"], 1200, "{filter:?}");
+            assert_eq!(page["held_count"], 3, "{filter:?}");
+            assert_eq!(page["truncated"], false);
+        }
+        for (id, amount, state, source, payer, qr) in [
+            (a.as_str(), 100, "created", "api", Value::Null, true),
+            (
+                b.intent_id.as_str(),
+                200,
+                "expired",
+                "api",
+                Value::Null,
+                false,
+            ),
+            (
+                c.intent_id.as_str(),
+                300,
+                "paid",
+                "portal",
+                json!({"handle":"payer", "display_name":"payer", "game_name":"Taro_MC"}),
+                false,
+            ),
+            (
+                d.intent_id.as_str(),
+                400,
+                "paid",
+                "static_qr",
+                json!({"handle":"payer", "display_name":"payer", "game_name":null}),
+                false,
+            ),
+            (
+                e.intent_id.as_str(),
+                500,
+                "paid",
+                "api",
+                json!({"handle":"payer", "display_name":"payer", "game_name":null}),
+                false,
+            ),
+            (
+                f.intent_id.as_str(),
+                600,
+                "canceled",
+                "portal",
+                Value::Null,
+                false,
+            ),
+            (
+                g.intent_id.as_str(),
+                700,
+                "declined",
+                "static_qr",
+                Value::Null,
+                false,
+            ),
+        ] {
+            let intent = get(&conn, id).unwrap().unwrap();
+            let row = owner_sale_row(&conn, &m, &intent, now).unwrap();
+            let listed = all["sales"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["intent_id"] == id)
+                .unwrap();
+            assert_eq!(&row, listed);
+            assert_eq!(row["amount_minor"], amount);
+            assert_eq!(row["state"], state);
+            assert_eq!(row["source"], source);
+            assert_eq!(row.get("payer"), Some(&payer));
+            if qr {
+                assert!(row["qr_url"].is_string());
+            } else {
+                assert_eq!(row.get("qr_url"), Some(&Value::Null));
+            }
+        }
+        for (id, stage) in [
+            (&c.intent_id, "held"),
+            (&d.intent_id, "fulfilled"),
+            (&e.intent_id, "fulfilled"),
+        ] {
+            let row = all["sales"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["intent_id"] == *id)
+                .unwrap();
+            assert_eq!(row["escrow"]["stage"], stage);
+        }
+    }
+
+    #[tokio::test]
+    async fn payer_game_name_is_written_once_and_hidden_from_the_public_view() {
+        let (pool, id, m) = fixture(300, 1_000);
+        let st = AppState {
+            pool: pool.clone(),
+            ..crate::admin_api::tests::app_state()
+        };
+        let approved = contract_approve(&st, &id, Some("Taro_MC")).await;
+        assert_eq!(approved["ok"], true);
+        assert_eq!(approved["state"], "paid");
+        assert_eq!(approved["payer_game_name_stored"], true);
+        let replay = contract_approve(&st, &id, Some("Hanako_MC")).await;
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["state"], "paid");
+        assert_eq!(replay["payer_game_name_stored"], false);
+        assert_eq!(balance_of(&pool, "acct-a"), 700);
+        assert_eq!(balance_of(&pool, "acct-m"), 0);
+        assert_eq!(escrow_balance(&pool), 300);
+        let conn = pool.get().unwrap();
+        let saved: Option<String> = conn
+            .query_row(
+                "SELECT payer_game_name FROM payment_intents WHERE intent_id = ?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved.as_deref(), Some("Taro_MC"));
+        let intent = get(&conn, &id).unwrap().unwrap();
+        let owner = owner_sale_row(&conn, &m, &intent, now_ms()).unwrap();
+        assert_eq!(
+            owner["payer"],
+            json!({"handle":"payer", "display_name":"payer", "game_name":"Taro_MC"})
+        );
+        let public = merchant_view(&m, &intent, now_ms()).unwrap();
+        let encoded = public.to_string();
+        assert!(!encoded.contains("Taro_MC"));
+        assert!(!encoded.contains("\"payer\""));
+        assert!(public.get("payer").is_none());
+        assert!(public.get("handle").is_none());
+        assert!(public.get("display_name").is_none());
+        assert!(public.get("game_name").is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_game_names_do_not_prevent_payment() {
+        for name in ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "Taro\nMC"] {
+            let (pool, id, m) = fixture(300, 1_000);
+            let st = AppState {
+                pool: pool.clone(),
+                ..crate::admin_api::tests::app_state()
+            };
+            let approved = contract_approve(&st, &id, Some(name)).await;
+            assert_eq!(approved["ok"], true, "{name:?}");
+            assert_eq!(approved["state"], "paid");
+            assert_eq!(approved["payer_game_name_stored"], false);
+            assert_eq!(state_of(&pool, &id), "paid");
+            assert_eq!(balance_of(&pool, "acct-a"), 700);
+            assert_eq!(balance_of(&pool, "acct-m"), 0);
+            assert_eq!(escrow_balance(&pool), 300);
+            let conn = pool.get().unwrap();
+            let intent = get(&conn, &id).unwrap().unwrap();
+            assert_eq!(
+                owner_sale_row(&conn, &m, &intent, now_ms()).unwrap()["payer"],
+                json!({"handle":"payer", "display_name":"payer", "game_name":null})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_and_portal_share_the_open_limit_but_static_qr_does_not_count() {
+        let (pool, first, m) = fixture(100, 1_000);
+        let st = AppState {
+            pool: pool.clone(),
+            ..crate::admin_api::tests::app_state()
+        };
+        let m = {
+            let mut conn = pool.get().unwrap();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(merchant::set_limits(&tx, &m.merchant_id, "acct-m", Some(2), None).unwrap());
+            let limited = merchant::get(&tx, &m.merchant_id).unwrap().unwrap();
+            tx.commit().unwrap();
+            limited
+        };
+        let static_before =
+            contract_create(&pool, &m, 200, IntentSource::StaticQr, "static-before");
+        let second = contract_create(&pool, &m, 300, IntentSource::Api, "second-api");
+        assert_eq!(intent_of(&pool, &first).source.as_db(), "api");
+        assert_eq!(second.source.as_db(), "api");
+        let (_, Json(refused_api)) = merchant::intent_create(
+            State(st.clone()),
+            merchant::MerchantAuth {
+                merchant: m.clone(),
+            },
+            Json(
+                serde_json::from_value(
+                    json!({"idem_key":"over-api", "amount_minor":100, "description":"limit"}),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refused_api,
+            json!({"ok":false, "error":"too_many_open_intents", "limit":2})
+        );
+        let (_, Json(refused_portal)) = merchant::portal_intent_create(
+            State(st.clone()),
+            AuthedAccount { account_id:"acct-m".to_string(), phone_id:None, session_key:"sess-m".to_string() },
+            Json(serde_json::from_value(json!({"merchant_id":m.merchant_id, "idem_key":"over-portal", "amount_minor":100, "description":"limit"})).unwrap()),
+        ).await.unwrap();
+        assert_eq!(
+            refused_portal,
+            json!({"ok":false, "error":"too_many_open_intents", "limit":2})
+        );
+        let static_after = contract_create(&pool, &m, 400, IntentSource::StaticQr, "static-after");
+        assert_eq!(
+            intent_of(&pool, &static_before.intent_id).source.as_db(),
+            "static_qr"
+        );
+        assert_eq!(
+            intent_of(&pool, &static_after.intent_id).source.as_db(),
+            "static_qr"
+        );
+        assert_eq!(state_of(&pool, &static_after.intent_id), "created");
+        let count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM payment_intents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 4);
+    }
+
     /// A wallet with a customer (`acct-a`, funded) and a registered shop owned by
     /// `acct-m`, plus one open intent.
     fn fixture(amount: i64, balance: i64) -> (Pool, String, MerchantRow) {
