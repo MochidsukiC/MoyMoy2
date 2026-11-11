@@ -1390,25 +1390,25 @@ const ERR_LABEL = {
   not_declinable: "この支払いはもう取り消せません",
   canceled: "この支払いはお店によって取り消されました",
   declined: "この支払いはキャンセル済みです",
-  merchant_disabled: "この加盟店は現在停止中のため支払えません",
+  merchant_disabled: "このお店は現在停止中のため支払えません",
   return_failed: "お店のアプリに戻れませんでした。もう一度お試しください",
   network: "通信に失敗しました。もう一度お試しください",
   // ── 加盟店ポータル ──
   bad_name: "この店名は使えません",
   bad_sub: "説明文に使えない文字が含まれています",
   name_taken: "その店名はすでに使われています",
-  too_many_merchants: "登録できる加盟店の上限に達しています",
-  unknown_merchant: "加盟店が見つかりません",
+  too_many_merchants: "登録できるお店の数の上限に達しています",
+  unknown_merchant: "お店が見つかりません",
   bad_status: "指定された状態が不正です",
-  email_verification_required: "加盟店の登録にはメールアドレスの確認が必要です",
+  email_verification_required: "お店の登録にはメールアドレスの確認が必要です",
   rate_limited: "操作が続けて行われました。しばらく待ってからお試しください",
-  // ── 店頭 QR（静的 QR）・履行の報告 ──
+  // ── お店の QR・「渡した」の報告 ──
   unknown_static_qr: "この QR コードは使えません。お店に確認してください。",
-  merchant_not_active: "このお店は現在稼働していないため、店頭 QR を発行できません",
-  already_fulfilled: "この注文はすでに報告済みです",
-  not_held: "この注文はもう履行を報告できる状態ではありません",
-  bad_fulfilled_amount: "報告する金額が不正です。0 から支払い金額までで指定してください",
-  bad_reason: "理由に使えない文字が含まれているか、長すぎます",
+  merchant_not_active: "このお店は現在稼働していないため、お店の QR を発行できません",
+  already_fulfilled: "この注文はすでに「渡した」と知らせ済みです",
+  not_held: "この注文は、もう「渡した」と知らせられない状態です",
+  bad_fulfilled_amount: "金額が不正です。0 から支払い金額までで指定してください",
+  bad_reason: "メモに使えない文字が含まれているか、長すぎます",
 };
 function errLabel(code) {
   return ERR_LABEL[code] || "処理に失敗しました（" + (code || "error") + "）";
@@ -2202,8 +2202,25 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
   async function doApprove(pin, otp) {
     if (!pendingPayment || payBusy) return;
     setPayBusy(true); setPayErr(null);
+    // お店の売上に出す PL 名。取れなくても支払いは止めない（名前は付け足しの情報）。
+    // 失敗は握りつぶさず console.warn に残し、通信エラーとは別の try で扱う。
+    let payerGameName;
+    if (window.mochi && mochi.os && typeof mochi.os.gameName === "function") {
+      try {
+        // 名前のために支払いを待たせない: 1 秒で返らなければ名前なしで進む。
+        let timer;
+        const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), 1000); });
+        const g = await Promise.race([mochi.os.gameName(), timeout]);
+        clearTimeout(timer);
+        if (g === "timeout") console.warn("MoyMoy: os.gameName did not answer within 1s; approving without a payer name");
+        else if (g && typeof g.name === "string" && g.name !== "") payerGameName = g.name;
+        else console.warn("MoyMoy: os.gameName returned no name; approving without a payer name");
+      } catch (e) {
+        console.warn("MoyMoy: os.gameName failed; approving without a payer name", e);
+      }
+    }
     try {
-      const r = await MoyMoy.paymentApprove(pendingPayment.intent_id, pin, otp);
+      const r = await MoyMoy.paymentApprove(pendingPayment.intent_id, pin, otp, payerGameName);
       if (!mountedRef.current) return;
       if (r.ok) {
         await refresh(() => mountedRef.current);

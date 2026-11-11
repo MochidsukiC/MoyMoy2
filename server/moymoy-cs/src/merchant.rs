@@ -391,7 +391,13 @@ pub fn static_qr_url(code: &str) -> String {
 /// customer is the same ref every time they buy from this shop (so repeat fraud
 /// and a customer's own claim can be matched), and two shops comparing their
 /// books learn nothing — the refs for one person do not correlate across salts.
-/// The real `@handle` never leaves the wallet.
+///
+/// This is what the PUBLIC merchant API (`/merchant/v1/*`, API key) shows: there
+/// the payer stays anonymous, and the real `@handle` is not disclosed. The shop
+/// owner's portal is different by decision (2026-11-11): its sales list
+/// (`payments::sales_page`) also shows the payer's `@handle`, display name and
+/// self-reported Minecraft name, for paid sales only. `payer_ref` is still sent
+/// there alongside, for compatibility.
 pub fn payer_ref(salt_b64: &str, account_id: &str) -> Result<String, ApiError> {
     let salt = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(salt_b64)

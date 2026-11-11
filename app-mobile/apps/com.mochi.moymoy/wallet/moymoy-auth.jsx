@@ -643,7 +643,7 @@ function SettingsSheet({ open, account, seal, onLogout, onMerchant, onSeal, onCl
                     <div className="eyebrow" style={{ color: "var(--carle-red)", marginTop: 5 }}>メール未確認</div>
                     <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)",
                       lineHeight: 1.7, marginTop: 3 }}>
-                      確認が済むまで PIN の再設定と加盟店の登録は使えません。
+                      確認が済むまで PIN の再設定とお店の登録は使えません。
                     </div>
                   </>
                 )}
@@ -679,7 +679,7 @@ function SettingsSheet({ open, account, seal, onLogout, onMerchant, onSeal, onCl
           <button onClick={onMerchant} style={{ width: "100%", marginTop: 20, padding: "14px",
             border: "1.5px solid var(--ink)", background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)",
             cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15 }}>
-            加盟店管理（MoyMoy で代金を受け取る）
+            お店（MoyMoy で代金を受け取る）
           </button>
         )}
 

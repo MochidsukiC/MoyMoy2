@@ -1,0 +1,12 @@
+-- MoyMoy schema v14 — the payer's self-reported Minecraft name, kept per payment.
+--
+-- The shop's portal shows who paid (the payer's @handle and display name, read
+-- live from `accounts`, plus this). The in-game name is reported by the app at
+-- approval time from MochiOS `os.gameName()` — SELF-REPORTED and spoofable, so it
+-- is a label for the shopkeeper to read, never an identity anything is decided on.
+--
+-- NULL = never reported (every pre-v14 payment, an app that did not send one, or
+-- a name that failed `merchant::sanitize_text`). Written at most once, AFTER the
+-- payment has committed and outside the transaction that moves the money — see
+-- `payments::record_payer_game_name`. Nothing in the claim/settle path reads it.
+ALTER TABLE payment_intents ADD COLUMN payer_game_name TEXT;

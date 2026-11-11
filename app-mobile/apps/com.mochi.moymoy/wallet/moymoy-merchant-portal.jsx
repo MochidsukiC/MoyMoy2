@@ -1,8 +1,8 @@
 /* global React, CrystalIcon, EmeGem, formatEme, formatCount, MoyMoy, MoyPinStep, MoyAmountInput, useMoyAmountInput, errLabelFor, msState, msEffect, msRef, fieldStyle, ctaStyle */
 /* =====================================================================
-   MoyMoy — 加盟店管理 (設定内)
+   MoyMoy — お店タブ（加盟店管理。画面上は「お店」と呼ぶ）
 
-   moymoy-screens.jsx から切り出したもの。中身は移動しただけで変えていない。
+   moymoy-screens.jsx から切り出したもの。
 
    フックのエイリアス (msState / msEffect / msRef) と入力欄のスタイル
    (fieldStyle / ctaStyle) は、それぞれ moymoy-screens.jsx と moymoy-auth.jsx の
@@ -43,11 +43,11 @@ function moyTextLen(s) {
   return Array.from(s.normalize("NFKC").trim()).length;
 }
 
-/* ─── 加盟店管理 (設定内) ─────────────────────────────────────────
+/* ─── お店タブ ───────────────────────────────────────────────────
    セッション + PIN でしか触れない側の操作。API キーが漏れてもここには届かず、
    セッションが漏れても PIN 無しではキーを再発行できない、という分離が
    バックエンド側で引かれているので、UI もその 2 系統を混ぜない。 */
-const MOY_STATUS_LABEL = { active: "稼働中", disabled: "停止中", deleted: "閉店" };
+const MOY_STATUS_LABEL = { active: "営業中", disabled: "停止中", deleted: "閉店" };
 
 function moyDateLabel(ts) {
   if (!ts) return "—";
@@ -72,9 +72,9 @@ function moyDateLabel(ts) {
    parked は carle-red の塗りつぶしにして、一見して別物と分かるようにする
    （held より強い表示にする、という要求への対応）。 */
 const ESCROW_STAGE = {
-  held:      { label: "入金保留中",            border: "var(--carle-red)", bg: "rgba(227,38,54,0.08)", color: "var(--carle-red)" },
+  held:      { label: "MoyMoy が預かり中",     border: "var(--carle-red)", bg: "rgba(227,38,54,0.08)", color: "var(--carle-red)" },
   parked:    { label: "入金停止中（要確認）",  border: "var(--carle-red)", bg: "var(--carle-red)",     color: "#fff" },
-  fulfilled: { label: "報告済み・送金待ち",    border: "var(--ink)",       bg: "rgba(0,0,0,0.05)",     color: "var(--ink)" },
+  fulfilled: { label: "渡した・入金待ち",      border: "var(--ink)",       bg: "rgba(0,0,0,0.05)",     color: "var(--ink)" },
   released:  { label: "入金済み",              border: "var(--moy-deep)",  bg: "var(--moy-mint)",      color: "var(--moy-deep)" },
 };
 function EscrowStageBadge({ stage }) {
@@ -146,12 +146,12 @@ function FulfillPanel({ merchantId, sale, held, onReported }) {
         ok = true; refresh = true;
         const refunded = typeof r.refund_amount_minor === "number" ? r.refund_amount_minor : full - fulfilledAmount;
         const paid = typeof r.fulfilled_amount_minor === "number" ? r.fulfilled_amount_minor : fulfilledAmount;
-        text = "履行を報告しました。入金される額 " + formatEme(paid) + " エメ" +
-          (refunded > 0 ? "、買い手への返金 " + formatEme(refunded) + " エメ" : "") + "。";
+        text = "「渡した」と知らせました。お店に入る額 " + formatEme(paid) + " エメ" +
+          (refunded > 0 ? "、お客さんへの返金 " + formatEme(refunded) + " エメ" : "") + "。";
       } else if (r.error === "already_fulfilled") {
         refresh = true;
         text = errLabelFor({ code: r.error }) +
-          (typeof r.fulfilled_amount_minor === "number" ? "（入金される額 " + formatEme(r.fulfilled_amount_minor) + " エメ）" : "") + "。";
+          (typeof r.fulfilled_amount_minor === "number" ? "（お店に入る額 " + formatEme(r.fulfilled_amount_minor) + " エメ）" : "") + "。";
       } else if (r.error === "not_held") {
         refresh = true;
         const stage = ESCROW_STAGE[r.escrow_stage];
@@ -192,7 +192,7 @@ function FulfillPanel({ merchantId, sale, held, onReported }) {
             border: "1.5px solid var(--moy-deep)", background: busy ? "#e6e6e6" : "var(--moy-deep)",
             color: busy ? "var(--ink-soft)" : "#fff", cursor: busy ? "default" : "pointer",
             fontFamily: "var(--font-jp)", fontWeight: 800, fontSize: 15 }}>
-            {busy ? "報告しています…" : "全額渡した"}
+            {busy ? "知らせています…" : "全額渡した"}
           </button>
           <button disabled={busy} onClick={() => { setPartial(true); setOpen(true); }}
             style={{ display: "block", margin: "6px auto 0", padding: "6px 8px", border: "none",
@@ -205,7 +205,7 @@ function FulfillPanel({ merchantId, sale, held, onReported }) {
       {held && open && (
         <div style={{ border: "1.5px solid var(--ink)", padding: "12px", background: "var(--bg-white)" }}>
           <div style={{ fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 800, color: "var(--ink)" }}>
-            商品を渡したことを報告します
+            渡した分を知らせます
           </div>
           <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr", border: "1.5px solid var(--ink)" }}>
             {[[false, "全額渡した"], [true, "一部だけ渡した"]].map(([isPartial, label], i) => (
@@ -222,14 +222,14 @@ function FulfillPanel({ merchantId, sale, held, onReported }) {
               <MoyAmountInput entry={entry} id={"moy-fulfil-" + sale.intent_id} label="実際に渡した分の金額" size={30} />
               <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)",
                 textAlign: "center", lineHeight: 1.6 }}>
-                0 から {formatEme(full)} エメまで。差額は買い手へ返金されます。
+                0 から {formatEme(full)} エメまで。差額はお客さんへ返金されます。
               </div>
             </div>
           )}
           <div style={{ marginTop: 12 }}>
-            <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>理由（任意）</div>
+            <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>メモ（任意）</div>
             <input value={reason} disabled={busy} onChange={(e) => setReason(e.target.value)}
-              maxLength={MOY_MAX_FULFIL_REASON * 3} aria-label="報告の理由（任意・120文字まで）"
+              maxLength={MOY_MAX_FULFIL_REASON * 3} aria-label="メモ（任意・120文字まで）"
               placeholder="例: 在庫切れのため一部のみ" style={fieldStyle} />
             <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, lineHeight: 1.6,
               color: reasonOk ? "var(--ink-soft)" : "var(--carle-red)", fontWeight: reasonOk ? 400 : 700 }}>
@@ -239,20 +239,20 @@ function FulfillPanel({ merchantId, sale, held, onReported }) {
           <div style={{ marginTop: 12, padding: "8px 10px", border: "1px dashed rgba(0,0,0,0.28)",
             fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink)", lineHeight: 1.7 }}>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span>入金される額</span>
+              <span>お店に入る額</span>
               <span style={{ fontWeight: 700 }}>{amountOk ? formatEme(fulfilled) + " エメ" : "—"}</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span>買い手への返金</span>
+              <span>お客さんへの返金</span>
               <span style={{ fontWeight: 700 }}>{amountOk ? formatEme(full - fulfilled) + " エメ" : "—"}</span>
             </div>
           </div>
           <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, fontWeight: 700,
             color: "var(--carle-red)", lineHeight: 1.6 }}>
-            報告は取り消せません。内容を確かめてから送ってください。
+            知らせたあとは取り消せません。内容を確かめてから送ってください。
           </div>
           <button disabled={!canSend} onClick={send} style={{ ...ctaStyle(!canSend), marginTop: 10 }}>
-            {busy ? "報告しています…" : "この内容で報告する"}
+            {busy ? "知らせています…" : "この内容で知らせる"}
           </button>
           <button disabled={busy} onClick={() => setOpen(false)} style={{ width: "100%", marginTop: 6,
             padding: "10px", border: "none", background: "transparent", cursor: busy ? "default" : "pointer",
@@ -263,21 +263,45 @@ function FulfillPanel({ merchantId, sale, held, onReported }) {
   );
 }
 
-/* 支払い済みの1件について、エスクローの状況（保留・報告済み・入金済み・停止）と
-   「渡した」の報告、部分履行・返金の表示。売上ページの行と請求管理ページの行で
-   同じ表示を使うため、行の見出しから切り出してある。 */
+/* 支払った人。サーバーの `payer` = {handle, display_name, game_name} | null（各値も null
+   ありうる）をそのまま出す。1 行目「表示名（@handle）」、2 行目「PL: ゲーム内の名前」。
+   どれも無ければ何も描かない。値の欠けた行は、ある値だけで組む:
+     表示名と handle が両方ある → 「表示名（@handle）」
+     片方だけ → その片方（handle は @ 付き）
+     game_name が無い → 2 行目を出さない
+   以前の匿名化した参照番号（payer_ref）は、店主が誰が払ったか分かる表示に置き換えた。 */
+function MoyPayerLine({ payer }) {
+  if (!payer) return null;
+  const name = typeof payer.display_name === "string" && payer.display_name !== "" ? payer.display_name : null;
+  const handle = typeof payer.handle === "string" && payer.handle !== "" ? "@" + payer.handle : null;
+  const game = typeof payer.game_name === "string" && payer.game_name !== "" ? payer.game_name : null;
+  const first = name && handle ? name + "（" + handle + "）" : (name || handle);
+  if (!first && !game) return null;
+  return (
+    <div style={{ marginTop: 8, padding: "8px 10px", background: "rgba(0,0,0,0.04)",
+      borderLeft: "3px solid var(--moy-deep)", fontFamily: "var(--font-jp)", wordBreak: "break-all" }}>
+      {first && <div style={{ fontSize: 15, fontWeight: 800, color: "var(--ink)", lineHeight: 1.5 }}>{first}</div>}
+      {game && <div style={{ fontSize: 13, fontWeight: 700, color: "var(--ink)", lineHeight: 1.5 }}>PL: {game}</div>}
+    </div>
+  );
+}
+
+/* 支払い済みの1件について、支払った人、MoyMoy が預かっているお金の状況（預かり中・渡した・
+   入金済み・停止）と「渡した」の知らせ、一部だけ渡した場合・返金の表示。売上ページの行と
+   お会計ページの行で同じ表示を使うため、行の見出しから切り出してある。 */
 function SaleEscrowNotes({ sale, merchantId, onReported }) {
   const escrow = sale.escrow || { stage: "none" };
-  // 部分履行（一部だけ届けられず差額が返金された）かどうかは、返金額の
-  // 有無で判定する。fulfilled_amount_minor だけでは「満額履行」と区別できない。
+  // 一部だけ渡した（差額が返金された）かどうかは、返金額の
+  // 有無で判定する。fulfilled_amount_minor だけでは「全額渡した」と区別できない。
   const partial = (escrow.refunded_amount_minor || 0) > 0;
   return (
     <>
+      <MoyPayerLine payer={sale.payer} />
       {escrow.stage === "held" && (
         <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.6 }}>
-          買い手はすでに支払い済みです。商品を渡して履行を報告すると、
+          お客さんは支払い済みです。商品を渡して「渡した」と知らせると、
           {escrow.release_due_unix_ms ? moyDateLabel(escrow.release_due_unix_ms) + " 以降に" : "しばらくして"}
-          この口座へ入金されます。
+          お店に入ります。
         </div>
       )}
       {/* 「渡した」。held のときだけ押せる。報告後の結果表示は、売上を取り直して
@@ -295,32 +319,30 @@ function SaleEscrowNotes({ sale, merchantId, onReported }) {
           color: "var(--ink)", lineHeight: 1.7 }}>
           {escrow.parked_unix_ms && (
             <div style={{ fontWeight: 700, color: "var(--carle-red)" }}>
-              {moyDateLabel(escrow.parked_unix_ms)} から、保留のまま止まっています。
+              {moyDateLabel(escrow.parked_unix_ms)} から、MoyMoy が預かったまま止まっています。
             </div>
           )}
-          代金は買い手から引き落とされ、MoyMoy が保持しています（消えたわけではありません）。
-          期限内に履行の報告が届かなかったため、入金は自動では進みません。この注文は
-          すでに保留の段階を過ぎており、いま履行を報告しても受け付けられません。
-          MoyMoy 側での確認が必要です。
+          6 時間以内に「渡した」の知らせがなかったため、代金は消えていませんが自動では進みません。
+          いま知らせても受け付けられないので、MoyMoy 側での確認が必要です。
         </div>
       )}
       {escrow.stage === "fulfilled" && escrow.release_due_unix_ms && (
         <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.6 }}>
-          履行の報告は受け付けています。{moyDateLabel(escrow.release_due_unix_ms)} 以降に入金されます。
+          「渡した」の知らせは受け付けています。{moyDateLabel(escrow.release_due_unix_ms)} 以降にお店に入ります。
         </div>
       )}
       {escrow.stage === "released" && escrow.released_unix_ms && (
         <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)" }}>
-          {moyDateLabel(escrow.released_unix_ms)} に入金済みです。
+          {moyDateLabel(escrow.released_unix_ms)} にお店に入りました。
         </div>
       )}
 
       {partial && (
         <div style={{ marginTop: 8, padding: "8px 10px", border: "1px dashed rgba(0,0,0,0.28)",
           fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink)", lineHeight: 1.7 }}>
-          一部のみ履行されました。差額は買い手へ返金されています。
+          一部だけ渡したので、差額はお客さんへ返金されています。
           <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
-            <span>入金される額</span>
+            <span>お店に入る額</span>
             <span style={{ fontWeight: 700 }}>{formatEme(escrow.fulfilled_amount_minor)} エメ</span>
           </div>
           <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -328,23 +350,14 @@ function SaleEscrowNotes({ sale, merchantId, onReported }) {
             <span style={{ fontWeight: 700 }}>{formatEme(escrow.refunded_amount_minor)} エメ</span>
           </div>
           {escrow.fulfil_reason && (
-            <div style={{ marginTop: 4, color: "var(--ink-soft)" }}>理由: {escrow.fulfil_reason}</div>
+            <div style={{ marginTop: 4, color: "var(--ink-soft)" }}>メモ: {escrow.fulfil_reason}</div>
           )}
         </div>
       )}
 
       {sale.refunded && (
         <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, fontWeight: 700, color: "var(--carle-red)" }}>
-          この決済は取り消され、買い手へ返金されています
-        </div>
-      )}
-
-      {/* payer_ref はソルト付きの擬似 ID。買い手を特定できる情報ではないので、
-          そう読めるラベルは付けない — 問い合わせの突き合わせ用の技術参照値として
-          小さく添えるだけ。 */}
-      {sale.payer_ref && (
-        <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--ink-soft)", opacity: 0.7 }}>
-          支払い参照（匿名化） {sale.payer_ref}
+          このお会計は取り消され、お客さんへ返金されています
         </div>
       )}
     </>
@@ -366,11 +379,11 @@ function SalesRow({ sale, last, merchantId, onReported }) {
           <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)", marginTop: 2,
             display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             <span>{moyDateLabel(sale.created_unix_ms)}</span>
-            {/* 店頭 QR 経由の売上。API 経由 (source: "api") は従来どおり何も付けない。 */}
+            {/* お店の QR（静的 QR）経由の売上。API 経由 (source: "api") は従来どおり何も付けない。 */}
             {sale.source === "static_qr" && (
               <span style={{ border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)",
                 color: "var(--moy-deep)", padding: "0 5px", fontFamily: "var(--font-jp)", fontSize: 10,
-                fontWeight: 700, whiteSpace: "nowrap" }}>店頭 QR</span>
+                fontWeight: 700, whiteSpace: "nowrap" }}>お店の QR</span>
             )}
           </div>
         </div>
@@ -453,7 +466,7 @@ function MoyCopyButton({ text, label }) {
       {state === "fail" && (
         <div role="alert" style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
           color: "var(--carle-red)", lineHeight: 1.6 }}>
-          コピーできませんでした。上の文字を長押しして選択してください。
+          コピーできませんでした。文字を長押しして選択してください。
         </div>
       )}
     </>
@@ -467,58 +480,97 @@ function moyQuoteArg(s) {
   return '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
 
-/* 店ごとの「店頭 QR（静的 QR）」。発行・作り直しは PIN 付きの操作で、PIN の
-   集め方は他の操作（キー再発行など）と同じく親の askPin が持つ。ここは表示だけ。
+/* 折りたたみ。`open` と `onToggle` を渡せば親が開閉を持つ（設定の折りたたみは、API キーを
+   一度だけ見せるために親が強制的に開く）。渡さなければ自分で持つ。既定は閉じる。 */
+function MoyFold({ title, open, onToggle, children }) {
+  const [own, setOwn] = msState(false);
+  const isOpen = open !== undefined ? open : own;
+  const toggle = () => { if (onToggle) onToggle(!isOpen); else setOwn(!isOpen); };
+  return (
+    <div style={{ marginTop: 14, border: "1.5px solid rgba(0,0,0,0.35)", background: "var(--bg-white)" }}>
+      <button onClick={toggle} aria-expanded={isOpen} style={{ width: "100%", padding: "13px 14px",
+        display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, textAlign: "left",
+        background: "transparent", border: "none", cursor: "pointer", fontFamily: "var(--font-jp)",
+        fontSize: 13, fontWeight: 700, color: "var(--ink)", lineHeight: 1.5 }}>
+        <span>{title}</span>
+        <span aria-hidden="true" style={{ flexShrink: 0, fontSize: 18, color: "var(--moy-deep)",
+          transform: isOpen ? "rotate(90deg)" : "none" }}>›</span>
+      </button>
+      {isOpen && <div style={{ padding: "0 14px 14px" }}>{children}</div>}
+    </div>
+  );
+}
+
+/* QR ブロックにするための URL まわり。お店の QR ページとお会計の QR で共通。
+   表に出すのは URL のコピーと一文の説明だけで、コマンドは「作り方」の折りたたみの中。
+   `label` は QR ブロックに付ける名前（お店の名前 / お会計の内容）、`note` は追記の一文。 */
+function MoyQrShare({ url, label, note }) {
+  const command = "/mochi qr label " + moyQuoteArg(label) + " " + url;
+  return (
+    <div>
+      <MoyCopyButton text={url} label="URL をコピー" />
+      <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 10, color: "var(--ink-soft)",
+        wordBreak: "break-all", lineHeight: 1.6 }}>{url}</div>
+      <div style={{ marginTop: 10, fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink)", lineHeight: 1.8 }}>
+        この URL を QR ブロックにすると、お客さんがスマホで読み取って払えます。ブロックはサーバーの管理者に作ってもらいます。
+      </div>
+      {note && (
+        <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+          {note}
+        </div>
+      )}
+      <MoyFold title="QR ブロックの作り方（管理者に渡すコマンド）">
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+          QR ブロックを設置する権限のある管理者が、次のコマンドを実行します。
+        </div>
+        <div style={{ marginTop: 6, padding: "10px 12px", border: "1.5px solid var(--ink)",
+          background: "rgba(0,0,0,0.04)", fontFamily: "var(--font-mono)", fontSize: 12,
+          wordBreak: "break-all", userSelect: "all" }}>{command}</div>
+        <MoyCopyButton text={command} label="コマンドをコピー" />
+        <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+          QR ブロックは Fabric 26.2 版のサーバーでのみ使えます。
+        </div>
+      </MoyFold>
+    </div>
+  );
+}
+
+/* 「お店の QR」ページ（置いておく QR = 静的 QR）。発行・作り直しは PIN 付きの操作で、
+   PIN の集め方は他の操作（キー再発行など）と同じく親の askPin が持つ。ここは表示だけ。
    URL は発行直後も一覧 (`static_qr_url`) から取り直して出す。 */
 function MoyStaticQrSection({ merchant, onIssue }) {
   const url = merchant.static_qr_url || null;
   const active = merchant.status === "active";
-  const command = url ? "/mochi qr label " + moyQuoteArg(merchant.name) + " " + url : "";
   return (
-    <div style={{ marginTop: 22 }}>
-      <div className="h-section">店頭 QR（静的 QR）</div>
-      <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11,
-        color: "var(--ink-soft)", lineHeight: 1.7 }}>
-        店頭の QR ブロックに設定する QR コードです。お客さまは読み取ると、このお店の名前を
-        確かめたうえで、自分で金額を入力して支払います。
+    <div>
+      <div style={{ fontFamily: "var(--font-jp)", fontSize: 18, fontWeight: 800, color: "var(--ink)" }}>
+        お店の QR
+      </div>
+      <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 12,
+        color: "var(--ink-soft)", lineHeight: 1.8 }}>
+        お店に置いておく QR です。お客さんが読み取ると、このお店の名前を確かめて、自分で金額を入力して払えます。
       </div>
 
       {!url && (
-        <button disabled={!active} onClick={() => onIssue(merchant, false)} style={{ width: "100%", marginTop: 10,
+        <button disabled={!active} onClick={() => onIssue(merchant, false)} style={{ width: "100%", marginTop: 14,
           padding: "14px", border: "1.5px solid var(--ink)", background: active ? "var(--bg-white)" : "#e6e6e6",
           boxShadow: active ? "3px 3px 0 var(--ink)" : "none", cursor: active ? "pointer" : "default",
           fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15 }}>
-          店頭 QR を発行する
+          お店の QR を発行する
         </button>
       )}
       {!url && !active && (
         <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
-          稼働中のお店だけ発行できます。
+          営業中のお店だけ発行できます。
         </div>
       )}
 
       {url && (
         <>
-          <div style={{ marginTop: 10, padding: "10px 12px", border: "1.5px solid var(--ink)",
-            background: "var(--bg-white)", fontFamily: "var(--font-mono)", fontSize: 12,
-            wordBreak: "break-all", userSelect: "all" }}>{url}</div>
-          <MoyCopyButton text={url} label="URL をコピー" />
-
-          <div style={{ marginTop: 14, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, color: "var(--ink)" }}>
-            QR ブロックに設定する（ゲームマスター向け）
+          <div style={{ marginTop: 12 }}>
+            <MoyQrShare url={url} label={merchant.name} />
           </div>
-          <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
-            QR ブロックを設置する権限のある人が、次のコマンドを実行します。
-          </div>
-          <div style={{ marginTop: 6, padding: "10px 12px", border: "1.5px solid var(--ink)",
-            background: "rgba(0,0,0,0.04)", fontFamily: "var(--font-mono)", fontSize: 12,
-            wordBreak: "break-all", userSelect: "all" }}>{command}</div>
-          <MoyCopyButton text={command} label="コマンドをコピー" />
-          <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
-            QR ブロックは Fabric 26.2 版のサーバーでのみ使えます。
-          </div>
-
-          <button disabled={!active} onClick={() => onIssue(merchant, true)} style={{ width: "100%", marginTop: 14,
+          <button disabled={!active} onClick={() => onIssue(merchant, true)} style={{ width: "100%", marginTop: 18,
             padding: "13px", border: "1.5px solid var(--carle-red)", background: "rgba(227,38,54,0.06)",
             cursor: active ? "pointer" : "default", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14,
             color: "var(--carle-red)" }}>
@@ -526,21 +578,16 @@ function MoyStaticQrSection({ merchant, onIssue }) {
           </button>
         </>
       )}
-      {!url && (
-        <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
-          QR ブロックは Fabric 26.2 版のサーバーでのみ使えます。
-        </div>
-      )}
     </div>
   );
 }
 
-/* ─── 請求管理 ───────────────────────────────────────────────────
-   お店が自分で請求（payment intent）を作り、QR ブロックに載せて集金するための
-   ページ。作成・取り消しはセッションだけで通る（PIN なし）: 請求は「払ってください」
+/* ─── お会計（画面上の呼び名。コードでは bill / intent / 請求） ─────────────
+   お店が自分でお会計（payment intent）を作り、QR ブロックに載せて集金するための
+   ページ。作成・取り消しはセッションだけで通る（PIN なし）: お会計は「払ってください」
    という依頼にすぎず、実際に金が動くのは支払う側が自分の PIN で承認したときだけ。
-   店頭で商品を手渡しする運用では、支払いのあとの「渡した」の報告がいちばん大事な
-   操作なので、フィルタの既定は「渡し待ち」にしてある。 */
+   店頭で商品を手渡しする運用では、支払いのあとの「渡した」の知らせがいちばん大事な
+   操作なので、「渡し待ち」から開くのを主にしてある。 */
 
 const MOY_MAX_BILL_DESC = 120;
 const MOY_MAX_BILL_REF = 64;
@@ -554,45 +601,45 @@ const MOY_BILL_STATE = {
   canceled: { label: "取消",     border: "rgba(0,0,0,0.35)", bg: "transparent",          color: "var(--ink-soft)" },
   declined: { label: "拒否",     border: "var(--carle-red)", bg: "rgba(227,38,54,0.08)", color: "var(--carle-red)" },
 };
-const MOY_BILL_SOURCE = { api: "API", static_qr: "店頭 QR", portal: "アプリ" };
+const MOY_BILL_SOURCE = { api: "外部連携", static_qr: "お店の QR", portal: "この画面" };
 const MOY_BILL_FILTERS = [
-  { key: "held",     label: "渡し待ち", empty: "渡し待ちの請求はありません" },
-  { key: "open",     label: "未払い",   empty: "未払いの請求はありません" },
-  { key: "paid",     label: "支払済み", empty: "支払済みの請求はありません" },
-  { key: "expired",  label: "期限切れ", empty: "期限切れの請求はありません" },
-  { key: "canceled", label: "取消",     empty: "取り消した請求はありません" },
-  { key: "all",      label: "すべて",   empty: "まだ請求がありません" },
+  { key: "held",     label: "渡し待ち", empty: "渡し待ちのお会計はありません" },
+  { key: "open",     label: "未払い",   empty: "未払いのお会計はありません" },
+  { key: "paid",     label: "支払済み", empty: "支払済みのお会計はありません" },
+  { key: "expired",  label: "期限切れ", empty: "期限切れのお会計はありません" },
+  { key: "canceled", label: "取消",     empty: "取り消したお会計はありません" },
+  { key: "all",      label: "すべて",   empty: "まだお会計がありません" },
 ];
 
 const MOY_BILL_ERR = {
-  merchant_not_active: "このお店は現在稼働していないため、請求を作成できません",
+  merchant_not_active: "このお店は営業していない（停止中）ため、お会計を作れません",
   bad_amount: "金額が不正です。0.01 エメ以上で、入力上限以内にしてください",
   missing_amount_minor: "金額を入力してください",
-  already_paid: "この請求はすでに支払われているため、取り消せません。商品を渡したら「渡し待ち」から報告してください",
-  not_cancelable: "この請求は取り消せない状態です",
-  unknown_intent: "この請求が見つかりません",
+  already_paid: "このお会計はすでに支払われているため、取り消せません。商品を渡したら「渡し待ち」から「渡した」と知らせてください",
+  not_cancelable: "このお会計は取り消せない状態です",
+  unknown_intent: "このお会計が見つかりません",
 };
 const MOY_BILL_NOT_CANCELABLE = {
-  expired: "この請求はすでに期限が切れています",
-  canceled: "この請求はすでに取り消されています",
-  declined: "この請求は支払う側が断っています",
+  expired: "このお会計はすでに期限が切れています",
+  canceled: "このお会計はすでに取り消されています",
+  declined: "このお会計はお客さんが断っています",
 };
 
-/* 請求の作成・取り消し・一覧の `{ok:false,...}` 応答を文にする。上限系は応答に
+/* お会計の作成・取り消し・一覧の `{ok:false,...}` 応答を文にする。上限系は応答に
    添えて返る数値（limit / issued / min / max）を文に入れる。金額系 (daily_issue_cap)
    は minor なので formatEme を通し、件数 (too_many_open_intents) は通さない。 */
 function moyBillErrText(r) {
   const code = (r && r.error) || "error";
   const reason = r && r.reason ? (REASON_LABEL[r.reason] || r.reason) : null;
   if (code === "too_many_open_intents") {
-    return "未払いの請求が上限（" + formatCount(r.limit) + " 件）に達しています。古い請求を取り消すか、上限を引き上げてください。";
+    return "未払いのお会計が上限（" + formatCount(r.limit) + " 件）に達しています。古いお会計を取り消すか、「お店の設定」で上限を引き上げてください。";
   }
   if (code === "daily_issue_cap") {
-    return "24時間の発行上限（" + formatEme(r.limit) + " エメ）に達しています。" +
-      (typeof r.issued === "number" ? "発行済みは " + formatEme(r.issued) + " エメです。" : "") +
-      "上限を引き上げるか、時間をおいてから作成してください。";
+    return "1 日（24時間）のお会計の上限（" + formatEme(r.limit) + " エメ）に達しています。" +
+      (typeof r.issued === "number" ? "作った合計は " + formatEme(r.issued) + " エメです。" : "") +
+      "「お店の設定」で上限を引き上げるか、時間をおいてから作ってください。";
   }
-  if (code === "bad_description") return "請求の内容を確認してください" + (reason ? "（" + reason + "）" : "");
+  if (code === "bad_description") return "お会計の内容を確認してください" + (reason ? "（" + reason + "）" : "");
   if (code === "bad_order_ref") return "注文番号を確認してください" + (reason ? "（" + reason + "）" : "");
   if (code === "bad_expires_in_secs") {
     return "有効期限は " + Math.round(r.min / 60) + " 分から " + Math.round(r.max / 60) + " 分の間で指定してください";
@@ -612,10 +659,10 @@ function MoyBillStateBadge({ state }) {
   );
 }
 
-/* 「渡し待ち N 件」。お店の一覧・詳細に出して、請求管理ページ（渡し待ち）へ導く。
+/* 「渡し待ち N 件」。お店の一覧に出して、お会計ページ（渡し待ち）へ導く。
    `held` = {n, more} または {failed:true}。more は取得件数の上限で切れている（N 件以上）。
    failed は件数を取れなかった状態: 「0 件」と同じ見た目（何も出さない）にすると、渡し待ちが
-   あるのに無いように見える。取れなかったと明示して、確認先（請求管理）へ導く。 */
+   あるのに無いように見える。取れなかったと明示して、確認先（お会計）へ導く。 */
 function MoyHeldAlert({ held, onClick }) {
   if (!held) return null;
   if (held.failed) {
@@ -625,7 +672,7 @@ function MoyHeldAlert({ held, onClick }) {
         cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10,
         fontFamily: "var(--font-jp)", textAlign: "left" }}>
         <span style={{ fontWeight: 700, fontSize: 13 }}>渡し待ちの件数を確認できませんでした</span>
-        <span style={{ fontWeight: 700, fontSize: 11 }}>請求管理で確認する ›</span>
+        <span style={{ fontWeight: 700, fontSize: 11, flexShrink: 0 }}>お会計で確認する ›</span>
       </button>
     );
   }
@@ -636,36 +683,67 @@ function MoyHeldAlert({ held, onClick }) {
       cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10,
       fontFamily: "var(--font-jp)", textAlign: "left" }}>
       <span style={{ fontWeight: 800, fontSize: 15 }}>渡し待ち {held.n}{held.more ? " 件以上" : " 件"}</span>
-      <span style={{ fontWeight: 700, fontSize: 11, opacity: 0.95 }}>商品を渡したら報告する ›</span>
+      <span style={{ fontWeight: 700, fontSize: 11, opacity: 0.95 }}>商品を渡したら知らせる ›</span>
     </button>
   );
 }
 
-/* 請求の QR の URL と、QR ブロックに設定するコマンド。作成直後のカードと、未払い行の
-   「QR を表示」で同じものを出す。 */
-function MoyBillQr({ qrUrl, description }) {
-  const command = "/mochi qr label " + moyQuoteArg(description) + " " + qrUrl;
+/* 「今日のお店」の一番上の大きなカード。`held` は 3 つの状態を区別して描く:
+     undefined       まだ数えている最中 → 「確認しています」（0 件と見せない）
+     {failed:true}   数えられなかった   → 「確認できませんでした」でお会計一覧へ導く
+     {n, more}       数えられた         → n が 0 のときだけ「いま渡すものはありません」 */
+function MoyTodayCard({ held, onClick }) {
+  const base = { width: "100%", padding: "18px 16px", textAlign: "left", fontFamily: "var(--font-jp)",
+    display: "block" };
+  if (!held) {
+    return (
+      <div style={{ ...base, border: "1.5px solid var(--ink)", background: "var(--bg-white)",
+        fontSize: 14, fontWeight: 700, color: "var(--ink-soft)" }}>
+        渡し待ちを確認しています…
+      </div>
+    );
+  }
+  if (held.failed) {
+    return (
+      <button onClick={onClick} style={{ ...base, border: "1.5px solid var(--ink)", background: "rgba(0,0,0,0.04)",
+        color: "var(--ink)", cursor: "pointer" }}>
+        <div style={{ fontSize: 15, fontWeight: 800 }}>渡し待ちの件数を確認できませんでした</div>
+        <div style={{ marginTop: 4, fontSize: 12, fontWeight: 700 }}>お会計の一覧で確認する ›</div>
+      </button>
+    );
+  }
+  if (!held.n) {
+    return (
+      <div style={{ ...base, border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)",
+        fontSize: 16, fontWeight: 800, color: "var(--moy-deep)" }}>
+        いま渡すものはありません
+      </div>
+    );
+  }
   return (
-    <div>
-      <div style={{ marginTop: 10, padding: "10px 12px", border: "1.5px solid var(--ink)",
-        background: "var(--bg-white)", fontFamily: "var(--font-mono)", fontSize: 12,
-        wordBreak: "break-all", userSelect: "all" }}>{qrUrl}</div>
-      <MoyCopyButton text={qrUrl} label="URL をコピー" />
-      <div style={{ marginTop: 12, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, color: "var(--ink)" }}>
-        QR ブロックに設定する（ゲームマスター向け）
+    <button onClick={onClick} style={{ ...base, border: "1.5px solid var(--carle-red)", background: "var(--carle-red)",
+      color: "#fff", cursor: "pointer", boxShadow: "3px 3px 0 var(--ink)" }}>
+      <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.3 }}>
+        渡し待ち {held.n}{held.more ? " 件以上" : " 件"}
       </div>
-      <div style={{ marginTop: 6, padding: "10px 12px", border: "1.5px solid var(--ink)",
-        background: "rgba(0,0,0,0.04)", fontFamily: "var(--font-mono)", fontSize: 12,
-        wordBreak: "break-all", userSelect: "all" }}>{command}</div>
-      <MoyCopyButton text={command} label="コマンドをコピー" />
-      <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
-        期限が過ぎた QR は使えません。QR ブロックは Fabric 26.2 版のサーバーでのみ使えます。
+      <div style={{ marginTop: 4, fontSize: 12, fontWeight: 700, opacity: 0.95 }}>
+        タップして「渡した」と知らせる ›
       </div>
+    </button>
+  );
+}
+
+/* お会計の QR の URL まわり。作成直後のカードと、未払い行の「QR を出す」で同じものを出す。
+   お店の QR ページと同じ部品（MoyQrShare）。 */
+function MoyBillQr({ qrUrl, description }) {
+  return (
+    <div style={{ marginTop: 10 }}>
+      <MoyQrShare url={qrUrl} label={description} note="期限が過ぎた QR は使えません。" />
     </div>
   );
 }
 
-/* 新しい請求のフォーム。閉じると（成功・やめる）この部品ごと消えるので、入力値と
+/* 新しいお会計のフォーム。閉じると（成功・やめる）この部品ごと消えるので、入力値と
    再試行用の鍵は次に開いたときに持ち越されない。 */
 function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
   const entry = useMoyAmountInput(true);
@@ -725,17 +803,20 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
 
   return (
     <div style={{ marginTop: 14, border: "1.5px solid var(--ink)", padding: "14px", background: "var(--bg-white)" }}>
-      <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 800, color: "var(--ink)" }}>新しい請求</div>
+      <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 800, color: "var(--ink)" }}>お会計をつくる</div>
+      <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+        金額入りの QR を作ります。
+      </div>
 
       <div style={{ marginTop: 12 }}>
         <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>金額</div>
-        <MoyAmountInput entry={entry} id="moy-bill-amount" label="請求する金額" size={34} />
+        <MoyAmountInput entry={entry} id="moy-bill-amount" label="お会計の金額" size={34} />
       </div>
 
       <div style={{ marginTop: 14 }}>
         <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>内容（必須）</div>
         <input value={desc} disabled={busy} onChange={(e) => setDesc(e.target.value)}
-          maxLength={MOY_MAX_BILL_DESC * 3} aria-label="請求の内容（120文字まで）"
+          maxLength={MOY_MAX_BILL_DESC * 3} aria-label="お会計の内容（120文字まで）"
           placeholder="例: 石レンガ x64" style={fieldStyle} />
         <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, lineHeight: 1.6,
           color: descBad ? "var(--carle-red)" : "var(--ink-soft)", fontWeight: descBad ? 700 : 400 }}>
@@ -776,7 +857,7 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
       )}
 
       <button disabled={!canSend} onClick={send} style={{ ...ctaStyle(!canSend), marginTop: 14 }}>
-        {busy ? "作成しています…" : "この内容で請求を作る"}
+        {busy ? "作っています…" : "この内容でお会計をつくる"}
       </button>
       <button disabled={busy} onClick={onCancel} style={{ width: "100%", marginTop: 6, padding: "10px",
         border: "none", background: "transparent", cursor: busy ? "default" : "pointer",
@@ -785,8 +866,8 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
   );
 }
 
-/* 請求の 1 行。未払いは QR の表示と取り消し、支払い済みは売上ページと同じ
-   エスクロー表示（SaleEscrowNotes。渡し待ちなら「全額渡した」）。 */
+/* お会計の 1 行。未払いは QR の表示と取り消し、支払い済みは売上ページと同じ
+   預かり中の表示（SaleEscrowNotes。渡し待ちなら「全額渡した」）。 */
 function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onReported }) {
   const [showQr, setShowQr] = msState(false);
   const [confirming, setConfirming] = msState(false);
@@ -857,7 +938,7 @@ function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onRepo
             </div>
           )}
           {sale.order_ref && (
-            <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)", marginTop: 2,
+            <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", marginTop: 2,
               wordBreak: "break-all" }}>注文番号 {sale.order_ref}</div>
           )}
         </div>
@@ -878,7 +959,7 @@ function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onRepo
             <button onClick={() => setShowQr(!showQr)} style={{ padding: "8px 14px",
               border: "1.5px solid var(--ink)", background: "var(--bg-white)", cursor: "pointer",
               fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 13 }}>
-              {showQr ? "QR を隠す" : "QR を表示"}
+              {showQr ? "QR を隠す" : "QR を出す"}
             </button>
           )}
           {showQr && hasQr && <MoyBillQr qrUrl={sale.qr_url} description={sale.description || ""} />}
@@ -909,7 +990,7 @@ function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onRepo
           {confirming && (
             <div style={{ marginTop: 8, padding: "10px 12px", border: "1.5px solid var(--carle-red)" }}>
               <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink)", lineHeight: 1.7 }}>
-                この請求を取り消します。QR を読み取っても、もう支払えなくなります。
+                このお会計を取り消します。QR を読み取っても、もう払えなくなります。
               </div>
               <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
                 <button disabled={busy} onClick={doCancel} style={{ flex: 1, padding: "10px",
@@ -938,15 +1019,18 @@ function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onRepo
   );
 }
 
-function MoyBillsPage({ merchant }) {
+/* `initialFilter` と `startWithForm` は開いた時点の状態だけを決める（親が key を変えて
+   開き直す）。お店のホームの「渡し待ち」「お会計の一覧」「お会計をつくる」が、同じこの
+   ページを別の入口で開くため。 */
+function MoyBillsPage({ merchant, initialFilter, startWithForm }) {
   const merchantId = merchant.merchant_id;
   const active = merchant.status === "active";
-  const [filter, setFilter] = msState("held");
+  const [filter, setFilter] = msState(initialFilter || "held");
   const [data, setData] = msState(null);        // /sales の応答 ({ok:true,...} | {ok:false,error})
   const [loading, setLoading] = msState(true);
   const [banner, setBanner] = msState(null);    // 取り直しの失敗 {code}
   const [notice, setNotice] = msState(null);    // 渡し待ちの行を報告した結果 {ok, text}
-  const [formOpen, setFormOpen] = msState(false);
+  const [formOpen, setFormOpen] = msState(!!startWithForm && active);
   const [created, setCreated] = msState(null);  // 作成結果カード
   // 期限切れの表示を取り直し無しで切り替えるための時計。このページを表示している
   // 間だけ動かし、離れたら止める。
@@ -958,7 +1042,7 @@ function MoyBillsPage({ merchant }) {
   // 取得は重なりうる（チップの連打、報告直後の取り直し）。遅れて返った古い応答で
   // 一覧を上書きしないよう、最後に始めた取得の応答だけを採用する。
   const seqRef = msRef(0);
-  const filterRef = msRef("held");
+  const filterRef = msRef(initialFilter || "held");
   filterRef.current = filter;
   const aliveRef = msRef(true);
   msEffect(() => {
@@ -997,11 +1081,11 @@ function MoyBillsPage({ merchant }) {
     else setFilter("open");
   }
 
-  // 渡し待ちの絞り込み中に報告すると、その行は取り直しで一覧から消え、行の結果表示も
-  // 一緒に消える。何を報告したかが分かるよう、結果を一覧の上に残す。
+  // 渡し待ちの絞り込み中に知らせると、その行は取り直しで一覧から消え、行の結果表示も
+  // 一緒に消える。何を知らせたかが分かるよう、結果を一覧の上に残す。
   function handleReported(sale, res) {
     if (res && filterRef.current === "held") {
-      setNotice({ ok: res.ok, text: "「" + (sale.description || "請求") + "」 " + res.text });
+      setNotice({ ok: res.ok, text: "「" + (sale.description || "お会計") + "」 " + res.text });
     }
     refresh();
   }
@@ -1009,8 +1093,8 @@ function MoyBillsPage({ merchant }) {
   // 「未払い」の絞り込み中は、取り消した行が取り直しですぐ消え、行内の結果表示が
   // 見えない。何を取り消したかを一覧の上に残す。
   function handleCanceled(sale) {
-    setNotice({ ok: true, text: "「" + (sale.description || "請求") + "」（" + formatEme(sale.amount_minor) +
-      " エメ）の請求を取り消しました。" });
+    setNotice({ ok: true, text: "「" + (sale.description || "お会計") + "」（" + formatEme(sale.amount_minor) +
+      " エメ）のお会計を取り消しました。" });
   }
 
   const spec = MOY_BILL_FILTERS.find((f) => f.key === filter);
@@ -1018,15 +1102,15 @@ function MoyBillsPage({ merchant }) {
   return (
     <>
       <div style={{ fontFamily: "var(--font-jp)", fontSize: 18, fontWeight: 800, color: "var(--ink)" }}>
-        {merchant.name} の請求
+        {merchant.name} のお会計
       </div>
       <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
-        お客さまが払うと、代金はいったん MoyMoy が預かります。商品を渡したら「全額渡した」で報告してください。
+        お客さんが払うと、代金はいったん MoyMoy が預かります。商品を渡したら「全額渡した」を押してください。
       </div>
       <div style={{ marginTop: 8, padding: "9px 12px", border: "1.5px solid var(--carle-red)",
         background: "rgba(227,38,54,0.06)", fontFamily: "var(--font-jp)", fontSize: 12,
         fontWeight: 700, color: "var(--carle-red)", lineHeight: 1.7 }}>
-        報告しないまま 6 時間経つと凍結され、お店には入金されません。
+        「渡した」と知らせないまま 6 時間たつと、代金は凍結されてお店に入りません。
       </div>
 
       {banner && (
@@ -1038,7 +1122,7 @@ function MoyBillsPage({ merchant }) {
       {created && (
         <div style={{ marginTop: 14, border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)", padding: "14px" }}>
           <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 800, color: "var(--moy-deep)" }}>
-            請求を作成しました
+            お会計を作りました
           </div>
           <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink)", lineHeight: 1.8 }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
@@ -1066,12 +1150,12 @@ function MoyBillsPage({ merchant }) {
           marginTop: 14, padding: "14px", border: "1.5px solid var(--ink)",
           background: active ? "var(--bg-white)" : "#e6e6e6", boxShadow: active ? "3px 3px 0 var(--ink)" : "none",
           cursor: active ? "pointer" : "default", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15 }}>
-          ＋ 新しい請求
+          ＋ お会計をつくる
         </button>
       )}
       {!formOpen && !active && (
         <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
-          稼働中のお店だけ請求を作成できます。
+          営業中のお店だけお会計をつくれます。
         </div>
       )}
       {formOpen && (
@@ -1123,19 +1207,36 @@ function MoyBillsPage({ merchant }) {
             ))}
             {rows.length === 0 && (
               <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",
-                fontSize: 13, color: "var(--ink-soft)" }}>{spec ? spec.empty : "請求はありません"}</div>
+                fontSize: 13, color: "var(--ink-soft)" }}>{spec ? spec.empty : "お会計はありません"}</div>
             )}
           </div>
           {data.truncated && (
             <div style={{ marginTop: 10, padding: "9px 12px", border: "1.5px solid var(--ink)",
               background: "rgba(0,0,0,0.04)", fontFamily: "var(--font-jp)", fontSize: 11,
               fontWeight: 700, color: "var(--ink)", lineHeight: 1.6 }}>
-              さらに古い請求があります（最新 {formatCount(data.limit)} 件を表示）
+              さらに古いお会計があります（最新 {formatCount(data.limit)} 件を表示）
             </div>
           )}
         </>
       )}
     </>
+  );
+}
+
+/* 「今日のお店」の大きなボタン（2×2 の 1 つ）。primary は塗りつぶし。grid の子が内容の幅で
+   はみ出さないよう minWidth:0 にして、長い文は折り返す。 */
+function MoyHomeButton({ label, sub, onClick, disabled, primary }) {
+  return (
+    <button disabled={disabled} onClick={onClick} style={{ minWidth: 0, minHeight: 96, padding: "14px 12px",
+      textAlign: "left", display: "flex", flexDirection: "column", justifyContent: "center", gap: 4,
+      border: "1.5px solid " + (disabled ? "rgba(0,0,0,0.25)" : primary ? "var(--moy-deep)" : "var(--ink)"),
+      background: disabled ? "#e6e6e6" : primary ? "var(--moy-deep)" : "var(--bg-white)",
+      color: disabled ? "var(--ink-soft)" : primary ? "#fff" : "var(--ink)",
+      boxShadow: disabled ? "none" : "3px 3px 0 var(--ink)", cursor: disabled ? "default" : "pointer",
+      fontFamily: "var(--font-jp)" }}>
+      <span style={{ fontSize: 16, fontWeight: 800, lineHeight: 1.4, wordBreak: "break-all" }}>{label}</span>
+      <span style={{ fontSize: 11, fontWeight: 600, lineHeight: 1.5, opacity: 0.85, wordBreak: "break-all" }}>{sub}</span>
+    </button>
   );
 }
 
@@ -1147,8 +1248,15 @@ function MerchantPortal({ open, onClose, inline }) {
   const [list, setList] = msState([]);
   const [loading, setLoading] = msState(true);
   const [loadErr, setLoadErr] = msState(null);
-  const [view, setView] = msState("list");   // list | register | detail | sales | bills
+  // list = お店の一覧（複数あるとき） / register / detail = 「今日のお店」（店のホーム） /
+  // sales = 売上 / bills = お会計 / qr = お店の QR
+  const [view, setView] = msState("list");
   const [selected, setSelected] = msState(null); // merchant_id
+  // お会計ページをどの入口で開いたか。{filter, form, n}。n を key に混ぜて開き直す
+  // （同じ店のまま「渡し待ち」から「お会計をつくる」へ、のときも入力欄を作り直すため）。
+  const [billsOpt, setBillsOpt] = msState({ filter: "held", form: false, n: 0 });
+  // 「お店の設定・開発者向け」の開閉。API キーを一度だけ見せるとき（revealed）は強制的に開く。
+  const [settingsOpen, setSettingsOpen] = msState(false);
   const [revealed, setRevealed] = msState(null); // 一度だけ見せる平文キー
   const [ask, setAsk] = msState(null);       // {title, sub, cta, run(pin)}
   const [askErr, setAskErr] = msState(null);
@@ -1160,7 +1268,8 @@ function MerchantPortal({ open, onClose, inline }) {
   // ({ok:true, ...} または {ok:false, error}) — 未取得なら null。
   const [sales, setSales] = msState(null);
   const [salesLoading, setSalesLoading] = msState(false);
-  // 店ごとの「渡し待ち」件数 { [merchant_id]: {n, more} }。一覧と詳細の目立つ表示用。
+  // 店ごとの「渡し待ち」件数と預かり中の合計 { [merchant_id]: {n, more, total} | {failed:true} }。
+  // 一覧と「今日のお店」の目立つ表示用。まだ取れていない店は undefined（0 件と区別する）。
   const [heldMap, setHeldMap] = msState({});
   const aliveRef = msRef(true);
   // 非同期の売上取り直しが返ってきたとき、まだ同じ店の売上ページを見ているかの照合用。
@@ -1193,7 +1302,11 @@ function MerchantPortal({ open, onClose, inline }) {
         const r = await MoyMoy.merchantSales(m.merchant_id, undefined, "held");
         if (!aliveRef.current) return;
         if (r.ok) {
-          setHeldMap((prev) => ({ ...prev, [m.merchant_id]: { n: (r.sales || []).length, more: !!r.truncated } }));
+          // held_total_minor は絞り込みに関係なく店全体の「MoyMoy が預かり中」の合計
+          // （サーバの集計値をそのまま使う。ここで足し算し直さない）。
+          setHeldMap((prev) => ({ ...prev, [m.merchant_id]: {
+            n: (r.sales || []).length, more: !!r.truncated,
+            total: typeof r.held_total_minor === "number" ? r.held_total_minor : null } }));
         } else {
           console.warn("MoyMoy: held count refused for " + m.merchant_id, r.error);
           setHeldMap((prev) => ({ ...prev, [m.merchant_id]: { failed: true } }));
@@ -1205,11 +1318,17 @@ function MerchantPortal({ open, onClose, inline }) {
     }));
   }
 
-  async function reload() {
+  // autoEnter: 最初の読み込みだけ true。お店がちょうど 1 つなら、一覧を飛ばしてそのお店の
+  // ホームを開く。PIN 操作のあとの取り直し（runAsk）では false のまま — 表示中の画面を動かさない。
+  async function reload(autoEnter) {
     try {
       const r = await MoyMoy.merchantList();
       if (!aliveRef.current) return;
-      if (r.ok) { setList(r.merchants || []); setLoadErr(null); loadHeld(r.merchants || []); }
+      if (r.ok) {
+        const merchants = r.merchants || [];
+        setList(merchants); setLoadErr(null); loadHeld(merchants);
+        if (autoEnter && merchants.length === 1) openShop(merchants[0], "detail");
+      }
       else setLoadErr(r.error || "error");
     } catch (e) {
       console.warn("MoyMoy: merchant portal list failed", e);
@@ -1222,8 +1341,8 @@ function MerchantPortal({ open, onClose, inline }) {
     if (!open) return;
     aliveRef.current = true;
     setLoading(true); setView("list"); setErr(null); setRevealed(null); setAsk(null);
-    setSales(null); setSalesLoading(false); setHeldMap({});
-    reload();
+    setSales(null); setSalesLoading(false); setHeldMap({}); setSettingsOpen(false);
+    reload(true);
     return () => { aliveRef.current = false; };
   }, [open]);
 
@@ -1282,7 +1401,7 @@ function MerchantPortal({ open, onClose, inline }) {
     const name = form.name.trim();
     const sub = form.sub.trim();
     askPin({
-      title: "PIN で確認", sub: "加盟店を登録します", cta: "登録する",
+      title: "PIN で確認", sub: "お店を登録します", cta: "登録する",
       run: async (pin) => {
         const r = await MoyMoy.merchantRegister({ name, sub: sub || undefined, pin });
         if (r.ok) {
@@ -1307,15 +1426,15 @@ function MerchantPortal({ open, onClose, inline }) {
     });
   }
 
-  // 発行 / 作り直し。作り直すと古い QR は無効になり、すでに店頭に設定した
+  // 発行 / 作り直し。作り直すと古い QR は無効になり、すでに QR ブロックに設定した
   // ものも使えなくなる — PIN を求める前に、その場で何が起きるかを書く。
   // 成功したら runAsk が一覧を取り直すので、新しい URL はそこから表示される。
   function doStaticQr(m, reissue) {
     askPin({
       title: "PIN で確認",
       sub: reissue
-        ? m.name + " の店頭 QR を作り直します（古い QR は使えなくなります）"
-        : m.name + " の店頭 QR を発行します",
+        ? m.name + " のお店の QR を作り直します（古い QR は使えなくなります）"
+        : m.name + " のお店の QR を発行します",
       cta: reissue ? "作り直す" : "発行する",
       run: (pin) => MoyMoy.portalStaticQr(m.merchant_id, pin),
     });
@@ -1337,7 +1456,7 @@ function MerchantPortal({ open, onClose, inline }) {
     // — ここを忘れると、加盟店が意図した上限の 1/100 がサーバへ通ってしまう。
     const capEme = parseInt(limits.daily_issue_cap, 10);
     askPin({
-      title: "PIN で確認", sub: m.name + " の発行上限を変更", cta: "変更する",
+      title: "PIN で確認", sub: m.name + " のお会計の上限を変更", cta: "変更する",
       run: async (pin) => {
         const r = await MoyMoy.merchantSetLimits(m.merchant_id, pin, {
           max_open_intents: Number.isFinite(open) ? open : undefined,
@@ -1372,17 +1491,40 @@ function MerchantPortal({ open, onClose, inline }) {
   function openShop(m, nextView) {
     setSelected(m.merchant_id); setRevealed(null); setErr(null);
     setLimits({ max_open_intents: "", daily_issue_cap: "" });
+    setSettingsOpen(false);
     setView(nextView);
   }
+
+  // お会計ページを開く。filter = 最初に見せる絞り込み、form = 作成フォームを開いた状態で始める。
+  function openBills(filter, form) {
+    setErr(null);
+    setBillsOpt((o) => ({ filter, form: !!form, n: o.n + 1 }));
+    setView("bills");
+  }
+
+  // お店がちょうど 1 つのとき、一覧の画面は無い（最初から店のホームを開く）。
+  const solo = list.length === 1;
 
   // 一つ上の画面へ戻る。一覧ではオーバーレイ形のときだけ閉じる。
   function goBack() {
     if (view === "list") { if (onClose) onClose(); return; }
-    // 売上・請求はある加盟店の詳細のサブ画面なので、一覧ではなく詳細へ戻る。
-    // 報告や取り消しで渡し待ちの件数が変わっているので、戻るときに数え直す。
-    if (view === "sales" || view === "bills") { setView("detail"); setErr(null); loadHeld(list); return; }
+    // 売上・お会計・お店の QR は店のホームのサブ画面なので、一覧ではなくホームへ戻る。
+    // 知らせや取り消しで渡し待ちの件数が変わっているので、戻るときに数え直す。
+    if (view === "sales" || view === "bills" || view === "qr") { setView("detail"); setErr(null); loadHeld(list); return; }
+    // 登録画面からは、お店が 1 つだけならその店のホームへ戻る。
+    if (view === "register" && solo) { openShop(list[0], "detail"); return; }
     setView("list"); setErr(null); setRevealed(null);
   }
+  const backLabel = view === "sales" || view === "bills" || view === "qr" ? "お店へ"
+    : view === "register" ? "戻る" : "お店の一覧";
+  // お店が 1 つのときのホームには、戻る先（一覧）が無い。
+  const showBack = view !== "list" && !(view === "detail" && solo);
+
+  // 一度だけ見せる API キーは設定の折りたたみの中に出す。見せている間は閉じられないようにして、
+  // 折りたたまれたまま二度と見られなくなる事故を避ける。
+  const revealHere = !!(current && revealed && revealed.merchant_id === current.merchant_id);
+  const heldCur = current ? heldMap[current.merchant_id] : undefined;
+  const activeCur = !!current && current.status === "active";
 
   return (
     <>
@@ -1394,19 +1536,19 @@ function MerchantPortal({ open, onClose, inline }) {
         {inline ? (
           <div style={{ flexShrink: 0, padding: "14px 18px 10px", borderBottom: "1px solid rgba(0,0,0,0.08)",
             display: "flex", alignItems: "center", gap: 10 }}>
-            {view !== "list" && (
-              <button onClick={goBack} aria-label={view === "sales" || view === "bills" ? "詳細へ戻る" : "一覧へ戻る"}
+            {showBack && (
+              <button onClick={goBack} aria-label={backLabel === "戻る" ? "戻る" : backLabel + "へ戻る"}
                 style={{ background: "transparent", border: "1.5px solid var(--ink)", cursor: "pointer",
                 color: "var(--ink)", padding: "4px 8px", display: "flex", alignItems: "center", gap: 4,
-                fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700 }}>
+                fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap" }}>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M15 18l-6-6 6-6" /></svg>
-                {view === "sales" || view === "bills" ? "詳細へ" : "一覧へ"}
+                {backLabel}
               </button>
             )}
             <div>
               <div style={{ fontFamily: "var(--font-jp)", fontSize: 16, fontWeight: 800, color: "var(--ink)" }}>お店</div>
               <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)" }}>
-                加盟店管理 · MoyMoy で代金を受け取る
+                MoyMoy で代金を受け取る
               </div>
             </div>
           </div>
@@ -1421,13 +1563,13 @@ function MerchantPortal({ open, onClose, inline }) {
               fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 700, letterSpacing: "0.16em",
               display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M15 18l-6-6 6-6" /></svg>
-              {view === "list" ? "閉じる" : view === "sales" || view === "bills" ? "詳細へ" : "一覧へ"}
+              {view === "list" ? "閉じる" : backLabel}
             </button>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <EmeGem size={24} />
               <div>
                 <div style={{ fontFamily: "'Archivo', var(--font-sans)", fontWeight: 800, fontSize: 20,
-                  letterSpacing: "-0.02em" }}>加盟店管理</div>
+                  letterSpacing: "-0.02em" }}>お店</div>
                 <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, opacity: 0.9 }}>
                   MoyMoy で代金を受け取る
                 </div>
@@ -1463,8 +1605,7 @@ function MerchantPortal({ open, onClose, inline }) {
                 <>
                   <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)",
                     lineHeight: 1.8 }}>
-                    加盟店を登録すると、あなたのアプリやお店から MoyMoy 決済を呼び出せます。
-                    売上はこの口座にそのまま入ります。
+                    お店を登録すると、MoyMoy でお客さんから代金を受け取れます。売上はこの口座にそのまま入ります。
                   </div>
                   <div style={{ marginTop: 14, border: "1.5px solid var(--ink)" }}>
                     {list.map((m, i) => (
@@ -1482,9 +1623,10 @@ function MerchantPortal({ open, onClose, inline }) {
                           <div style={{ fontFamily: "var(--font-jp)", fontSize: 15, fontWeight: 700,
                             color: "var(--ink)", whiteSpace: "nowrap", overflow: "hidden",
                             textOverflow: "ellipsis" }}>{m.name}</div>
-                          <div style={{ fontFamily: "var(--font-mono)", fontSize: 10,
-                            color: "var(--ink-soft)", marginTop: 1 }}>
-                            {MOY_STATUS_LABEL[m.status] || m.status} · {m.api_key_prefix || "キー未発行"}
+                          <div style={{ fontFamily: "var(--font-jp)", fontSize: 11,
+                            color: m.status === "active" ? "var(--ink-soft)" : "var(--carle-red)",
+                            fontWeight: m.status === "active" ? 400 : 700, marginTop: 1 }}>
+                            {MOY_STATUS_LABEL[m.status] || m.status}
                           </div>
                         </div>
                         <span style={{ fontFamily: "var(--font-mono)", fontSize: 18, color: "var(--moy-deep)" }}>›</span>
@@ -1492,21 +1634,21 @@ function MerchantPortal({ open, onClose, inline }) {
                       {/* 渡し待ちがあるお店だけ。ボタンの中にボタンは置けないので兄弟として並べる。 */}
                       {heldMap[m.merchant_id] && (heldMap[m.merchant_id].n > 0 || heldMap[m.merchant_id].failed) && (
                         <div style={{ padding: "0 14px 12px" }}>
-                          <MoyHeldAlert held={heldMap[m.merchant_id]} onClick={() => openShop(m, "bills")} />
+                          <MoyHeldAlert held={heldMap[m.merchant_id]} onClick={() => { openShop(m, "bills"); openBills("held", false); }} />
                         </div>
                       )}
                       </div>
                     ))}
                     {list.length === 0 && (
                       <div style={{ padding: 20, textAlign: "center", fontFamily: "var(--font-jp)",
-                        fontSize: 13, color: "var(--ink-soft)" }}>まだ加盟店がありません</div>
+                        fontSize: 13, color: "var(--ink-soft)" }}>まだお店がありません</div>
                     )}
                   </div>
                   <button onClick={() => { setErr(null); setView("register"); }} style={{ width: "100%",
                     marginTop: 14, padding: "14px", border: "1.5px solid var(--ink)",
                     background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)", cursor: "pointer",
                     fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15 }}>
-                    ＋ 加盟店を登録する
+                    ＋ お店を登録する
                   </button>
                 </>
               )}
@@ -1517,8 +1659,8 @@ function MerchantPortal({ open, onClose, inline }) {
             <>
               <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)",
                 lineHeight: 1.8 }}>
-                店名はあとから変更できません。お客さまの承認画面に出るのは、あなたの
-                @ID と、ここで決めた店名です。
+                店名はあとから変更できません。お客さんの支払い画面には、あなたの
+                @ID と、ここで決めた店名が表示されます。
               </div>
               {/* maxLength は UTF-16 コード単位でしか数えられないので、本当の上限
                   （NFKC 後のスカラー 32 / 48）を表現できない。32 のままだと絵文字の
@@ -1572,133 +1714,186 @@ function MerchantPortal({ open, onClose, inline }) {
             </>
           )}
 
+          {/* 「今日のお店」= 店のホーム。上から: 渡し待ち、預かり中の合計、4 つの大きなボタン、
+              一番下に設定・開発者向け（既定は閉じる）。 */}
           {view === "detail" && current && (
             <>
-              <div style={{ fontFamily: "var(--font-jp)", fontSize: 18, fontWeight: 800, color: "var(--ink)" }}>
+              <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, fontWeight: 700, color: "var(--ink-soft)" }}>
+                今日のお店
+              </div>
+              <div style={{ fontFamily: "var(--font-jp)", fontSize: 20, fontWeight: 800, color: "var(--ink)",
+                marginTop: 2, wordBreak: "break-all", lineHeight: 1.4 }}>
                 {current.name}
               </div>
-              <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)", marginTop: 2 }}>
-                {current.merchant_id}
-              </div>
 
-              {revealed && revealed.merchant_id === current.merchant_id && (
-                <MoyApiKeyReveal apiKey={revealed.api_key} onClose={() => setRevealed(null)} />
+              {!activeCur && (
+                <div style={{ marginTop: 10, padding: "9px 12px", border: "1.5px solid var(--carle-red)",
+                  background: "rgba(227,38,54,0.06)", fontFamily: "var(--font-jp)", fontSize: 12,
+                  fontWeight: 700, color: "var(--carle-red)", lineHeight: 1.7 }}>
+                  このお店は{MOY_STATUS_LABEL[current.status] || current.status}です。お客さんは支払えません。
+                  {current.status === "disabled" ? "再開するには、下の「お店の設定・開発者向け」を開いてください。" : ""}
+                </div>
+              )}
+              {revealHere && (
+                <div style={{ marginTop: 10, padding: "9px 12px", border: "1.5px solid var(--carle-red)",
+                  background: "rgba(227,38,54,0.06)", fontFamily: "var(--font-jp)", fontSize: 12,
+                  fontWeight: 700, color: "var(--carle-red)", lineHeight: 1.7 }}>
+                  API キーを発行しました。一度しか表示されないので、下の「お店の設定・開発者向け」で控えてください。
+                </div>
               )}
 
-              {/* 渡し待ち（支払い済みで、まだ「渡した」を報告していない請求）。最優先の
-                  作業なので、他のボタンより上に赤で出す。 */}
-              <div style={{ marginTop: 8 }}>
-                <MoyHeldAlert held={heldMap[current.merchant_id]}
-                  onClick={() => { setErr(null); setView("bills"); }} />
+              <div style={{ marginTop: 14 }}>
+                <MoyTodayCard held={heldCur} onClick={() => openBills("held", false)} />
               </div>
 
-              <button onClick={() => { setErr(null); setView("bills"); }} style={{ width: "100%", marginTop: 16,
-                padding: "14px", border: "1.5px solid var(--ink)", background: "var(--bg-white)",
-                boxShadow: "3px 3px 0 var(--ink)", cursor: "pointer", fontFamily: "var(--font-jp)",
-                fontWeight: 700, fontSize: 15 }}>
-                請求を管理する（作成・取消・渡した報告）
-              </button>
-
-              <button onClick={() => { setErr(null); setView("sales"); }} style={{ width: "100%", marginTop: 10,
-                padding: "14px", border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)",
-                cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15,
-                color: "var(--moy-deep)", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                <EmeGem size={18} /> 売上を見る（保留中の入金を確認）
-              </button>
-
-              <div style={{ marginTop: 16, border: "1.5px solid var(--ink)", padding: "12px 14px",
-                fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)" }}>
-                {[
-                  ["状態", MOY_STATUS_LABEL[current.status] || current.status],
-                  ["一覧掲載", current.listed ? "あり" : "なし"],
-                  ["APIキー", current.api_key_prefix ? current.api_key_prefix + "…" : "未発行"],
-                  ["キー発行日", moyDateLabel(current.api_key_created_unix_ms)],
-                  // 最終利用時刻は漏洩の唯一の手がかりになる。今日取引していない
-                  // のに今日の時刻が出ていれば、キーが誰かの手にあると分かる。
-                  ["キー最終利用", moyDateLabel(current.api_key_last_used_unix_ms)],
-                  ["未決済の上限", current.max_open_intents + " 件"],
-                  ["24時間の発行上限", formatEme(current.daily_issue_cap) + " エメ"],
-                  ["登録日", moyDateLabel(current.created_unix_ms)],
-                ].map(([k, v], i) => (
-                  <div key={k} style={{ display: "flex", justifyContent: "space-between", gap: 10,
-                    padding: "5px 0", borderTop: i === 0 ? "none" : "1px solid rgba(0,0,0,0.08)" }}>
-                    <span>{k}</span>
-                    <span style={{ color: "var(--ink)", fontWeight: 700, textAlign: "right" }}>{v}</span>
+              {heldCur && !heldCur.failed && typeof heldCur.total === "number" && (
+                <div style={{ marginTop: 12, padding: "12px 14px", border: "1.5px solid var(--ink)",
+                  background: "var(--bg-white)", fontFamily: "var(--font-jp)" }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "var(--ink)" }}>
+                    入金待ち（MoyMoy が預かり中）
                   </div>
-                ))}
-              </div>
-              <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11,
-                color: "var(--ink-soft)", lineHeight: 1.7 }}>
-                「キー最終利用」に心当たりのない時刻が出ていたら、キーが漏れています。
-                すぐに停止するか、キーを再発行してください。
-              </div>
-
-              <button onClick={() => doRotate(current)} style={{ width: "100%", marginTop: 16,
-                padding: "14px", border: "1.5px solid var(--ink)", background: "var(--bg-white)",
-                boxShadow: "3px 3px 0 var(--ink)", cursor: "pointer", fontFamily: "var(--font-jp)",
-                fontWeight: 700, fontSize: 15 }}>
-                APIキーを再発行する
-              </button>
-              {current.status === "active" ? (
-                <button onClick={() => doStatus(current, "disabled")} style={{ width: "100%", marginTop: 10,
-                  padding: "14px", border: "1.5px solid var(--carle-red)", background: "rgba(227,38,54,0.06)",
-                  cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15,
-                  color: "var(--carle-red)" }}>
-                  このお店を停止する（集金を止める）
-                </button>
-              ) : current.status === "disabled" ? (
-                <button onClick={() => doStatus(current, "active")} style={{ width: "100%", marginTop: 10,
-                  padding: "14px", border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)",
-                  cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15,
-                  color: "var(--moy-deep)" }}>
-                  このお店を再開する
-                </button>
-              ) : null}
-
-              <MoyStaticQrSection merchant={current} onIssue={doStaticQr} />
-
-              <div style={{ marginTop: 22 }}>
-                <div className="h-section">発行上限の変更</div>
-                <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11,
-                  color: "var(--ink-soft)", lineHeight: 1.7 }}>
-                  {/* max_open_intents は件数 (単位なし) であって金額ではないので
-                      formatEme を通さない — 通すと minor 扱いされ「5.00」になる。
-                      daily_issue_cap は金額 (minor) なので formatEme を通す。 */}
-                  空欄の項目は変えません。上限は最大 500 件 /
-                  {" " + formatEme(200000000)} エメまでで、それを超える値は自動的に丸められます。
-                </div>
-                <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                  <div>
-                    <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>未決済の上限</div>
-                    <input value={limits.max_open_intents} inputMode="numeric"
-                      aria-label="未決済の上限（件数。空欄なら変更しません）"
-                      onChange={(e) => setLimits({ ...limits, max_open_intents: e.target.value.replace(/[^0-9]/g, "") })}
-                      placeholder={String(current.max_open_intents)} style={fieldStyle} />
+                  <div style={{ marginTop: 2, fontFamily: "var(--font-mono)", fontSize: 22, fontWeight: 800,
+                    color: "var(--ink)" }}>
+                    {formatEme(heldCur.total)} エメ
                   </div>
-                  <div>
-                    <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>24時間の発行上限</div>
-                    {/* current.daily_issue_cap は minor。この欄はエメで打たせるので、
-                        プレースホルダも ÷100 してエメで見せる — 生の minor を出すと
-                        「変更しない」つもりで打ち直した値が100倍になる。 */}
-                    <input value={limits.daily_issue_cap} inputMode="numeric"
-                      aria-label="24時間の発行上限（エメ。空欄なら変更しません）"
-                      onChange={(e) => setLimits({ ...limits, daily_issue_cap: e.target.value.replace(/[^0-9]/g, "") })}
-                      placeholder={String(Math.floor(current.daily_issue_cap / 100))} style={fieldStyle} />
+                  <div style={{ marginTop: 2, fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.6 }}>
+                    商品を渡すとお店に入ります
                   </div>
                 </div>
-                <button
-                  disabled={!limits.max_open_intents && !limits.daily_issue_cap}
-                  onClick={() => doLimits(current)}
-                  style={{ ...ctaStyle(!limits.max_open_intents && !limits.daily_issue_cap), marginTop: 12 }}>
-                  PIN で確認して変更
-                </button>
+              )}
+
+              <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <MoyHomeButton primary disabled={!activeCur} label="お会計をつくる"
+                  sub={activeCur ? "金額入りの QR" : "営業中のお店だけ"}
+                  onClick={() => openBills("open", true)} />
+                <MoyHomeButton label="お会計の一覧" sub="渡す・取り消す" onClick={() => openBills("all", false)} />
+                <MoyHomeButton label="売上" sub="入ったお金・入る予定のお金"
+                  onClick={() => { setErr(null); setView("sales"); }} />
+                <MoyHomeButton label="お店の QR" sub="置いておく QR"
+                  onClick={() => { setErr(null); setView("qr"); }} />
               </div>
+
+              <MoyFold title="お店の設定・開発者向け" open={settingsOpen || revealHere} onToggle={setSettingsOpen}>
+                <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
+                  お店のアプリやサーバーから MoyMoy 決済を使う開発者向けの設定です。API キーを使うと、
+                  お店のプログラムからお会計の作成や「渡した」の知らせができます。
+                </div>
+
+                {revealHere && (
+                  <MoyApiKeyReveal apiKey={revealed.api_key} onClose={() => setRevealed(null)} />
+                )}
+
+                <div style={{ marginTop: 12, border: "1.5px solid var(--ink)", padding: "10px 12px",
+                  fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)" }}>
+                  {[
+                    ["お店の ID", current.merchant_id],
+                    ["状態", MOY_STATUS_LABEL[current.status] || current.status],
+                    ["一覧への掲載", current.listed ? "あり" : "なし"],
+                    ["API キー", current.api_key_prefix ? current.api_key_prefix + "…" : "未発行"],
+                    ["キー発行日", moyDateLabel(current.api_key_created_unix_ms)],
+                    // 最終利用時刻は漏洩の唯一の手がかりになる。今日取引していない
+                    // のに今日の時刻が出ていれば、キーが誰かの手にあると分かる。
+                    ["キー最終利用", moyDateLabel(current.api_key_last_used_unix_ms)],
+                    ["未払いのお会計の上限", current.max_open_intents + " 件"],
+                    ["1 日のお会計の上限", formatEme(current.daily_issue_cap) + " エメ"],
+                    ["登録日", moyDateLabel(current.created_unix_ms)],
+                  ].map(([k, v], i) => (
+                    <div key={k} style={{ display: "flex", justifyContent: "space-between", gap: 10,
+                      padding: "5px 0", borderTop: i === 0 ? "none" : "1px solid rgba(0,0,0,0.08)" }}>
+                      <span style={{ flexShrink: 0 }}>{k}</span>
+                      <span style={{ color: "var(--ink)", fontWeight: 700, textAlign: "right", wordBreak: "break-all" }}>{v}</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11, fontWeight: 700,
+                  color: "var(--carle-red)", lineHeight: 1.7 }}>
+                  「キー最終利用」に心当たりのない時刻があれば、キーが漏れています。すぐに停止するか、キーを再発行してください。
+                </div>
+
+                <button onClick={() => doRotate(current)} style={{ width: "100%", marginTop: 14,
+                  padding: "14px", border: "1.5px solid var(--ink)", background: "var(--bg-white)",
+                  boxShadow: "3px 3px 0 var(--ink)", cursor: "pointer", fontFamily: "var(--font-jp)",
+                  fontWeight: 700, fontSize: 15 }}>
+                  API キーを再発行する
+                </button>
+                {current.status === "active" ? (
+                  <button onClick={() => doStatus(current, "disabled")} style={{ width: "100%", marginTop: 10,
+                    padding: "14px", border: "1.5px solid var(--carle-red)", background: "rgba(227,38,54,0.06)",
+                    cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14,
+                    color: "var(--carle-red)", lineHeight: 1.5 }}>
+                    このお店を停止する（お客さんが払えなくなります）
+                  </button>
+                ) : current.status === "disabled" ? (
+                  <button onClick={() => doStatus(current, "active")} style={{ width: "100%", marginTop: 10,
+                    padding: "14px", border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)",
+                    cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 15,
+                    color: "var(--moy-deep)" }}>
+                    このお店を再開する
+                  </button>
+                ) : null}
+
+                <div style={{ marginTop: 20 }}>
+                  <div className="h-section">お会計の上限を変える</div>
+                  <div style={{ marginTop: 6, fontFamily: "var(--font-jp)", fontSize: 11,
+                    color: "var(--ink-soft)", lineHeight: 1.7 }}>
+                    {/* max_open_intents は件数 (単位なし) であって金額ではないので
+                        formatEme を通さない — 通すと minor 扱いされ「5.00」になる。
+                        daily_issue_cap は金額 (minor) なので formatEme を通す。 */}
+                    空欄の項目は変えません。上限は最大 500 件 /
+                    {" " + formatEme(200000000)} エメまでで、それを超える値は自動的に丸められます。
+                  </div>
+                  <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>未払いの上限</div>
+                      <input value={limits.max_open_intents} inputMode="numeric"
+                        aria-label="未払いのお会計の上限（件数。空欄なら変更しません）"
+                        onChange={(e) => setLimits({ ...limits, max_open_intents: e.target.value.replace(/[^0-9]/g, "") })}
+                        placeholder={String(current.max_open_intents)} style={fieldStyle} />
+                    </div>
+                    <div style={{ minWidth: 0 }}>
+                      <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 6 }}>1 日の上限</div>
+                      {/* current.daily_issue_cap は minor。この欄はエメで打たせるので、
+                          プレースホルダも ÷100 してエメで見せる — 生の minor を出すと
+                          「変更しない」つもりで打ち直した値が100倍になる。 */}
+                      <input value={limits.daily_issue_cap} inputMode="numeric"
+                        aria-label="1 日のお会計の上限（エメ。空欄なら変更しません）"
+                        onChange={(e) => setLimits({ ...limits, daily_issue_cap: e.target.value.replace(/[^0-9]/g, "") })}
+                        placeholder={String(Math.floor(current.daily_issue_cap / 100))} style={fieldStyle} />
+                    </div>
+                  </div>
+                  <button
+                    disabled={!limits.max_open_intents && !limits.daily_issue_cap}
+                    onClick={() => doLimits(current)}
+                    style={{ ...ctaStyle(!limits.max_open_intents && !limits.daily_issue_cap), marginTop: 12 }}>
+                    PIN で確認して変更
+                  </button>
+                </div>
+              </MoyFold>
+
+              {/* お店が 1 つのときは一覧の画面が無いので、2 つ目の登録はここから。 */}
+              {solo && (
+                <button onClick={() => { setErr(null); setView("register"); }} style={{ display: "block",
+                  margin: "16px auto 0", padding: "8px 10px", border: "none", background: "transparent",
+                  cursor: "pointer", fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 600,
+                  color: "var(--ink-soft)", textDecoration: "underline" }}>
+                  別のお店を登録する
+                </button>
+              )}
             </>
           )}
 
           {view === "detail" && !current && (
             <div style={{ padding: "30px 0", textAlign: "center", fontFamily: "var(--font-jp)",
-              fontSize: 13, color: "var(--ink-soft)" }}>加盟店が見つかりません</div>
+              fontSize: 13, color: "var(--ink-soft)" }}>お店が見つかりません</div>
+          )}
+
+          {view === "qr" && current && (
+            <MoyStaticQrSection merchant={current} onIssue={doStaticQr} />
+          )}
+
+          {view === "qr" && !current && (
+            <div style={{ padding: "30px 0", textAlign: "center", fontFamily: "var(--font-jp)",
+              fontSize: 13, color: "var(--ink-soft)" }}>お店が見つかりません</div>
           )}
 
           {view === "sales" && current && (
@@ -1721,13 +1916,14 @@ function MerchantPortal({ open, onClose, inline }) {
 
               {!salesLoading && sales && sales.ok && (
                 <>
-                  {/* 「買い手は払ったのに残高が増えていない」への答え。この画面で
+                  {/* 「お客さんは払ったのに残高が増えていない」への答え。この画面で
                       いちばん目立たせるべき数字。 */}
                   <div style={{ marginTop: 14, border: "1.5px solid " + (sales.held_count > 0 ? "var(--carle-red)" : "var(--ink)"),
                     background: sales.held_count > 0 ? "rgba(227,38,54,0.06)" : "var(--bg-white)",
                     padding: "14px" }}>
-                    <div className="eyebrow" style={{ color: sales.held_count > 0 ? "var(--carle-red)" : "var(--moy-deep)" }}>
-                      保留中（エスクロー中）の売上
+                    <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
+                      color: sales.held_count > 0 ? "var(--carle-red)" : "var(--moy-deep)" }}>
+                      入金待ち（MoyMoy が預かり中）
                     </div>
                     <div style={{ marginTop: 4, fontFamily: "var(--font-mono)", fontWeight: 800, fontSize: 26,
                       color: sales.held_count > 0 ? "var(--carle-red)" : "var(--ink)" }}>
@@ -1735,34 +1931,32 @@ function MerchantPortal({ open, onClose, inline }) {
                     </div>
                     <div style={{ marginTop: 2, fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)" }}>
                       {sales.held_count > 0
-                        ? formatCount(sales.held_count) + " 件が買い手から支払い済みで、まだこの口座には入金されていません。"
-                        : "現在、保留中の売上はありません。"}
+                        ? formatCount(sales.held_count) + " 件がお客さんの支払い済みです。商品を渡すとお店に入ります。"
+                        : "いま預かり中の売上はありません。"}
                     </div>
-                    {/* この合計には parked（保留のまま停止）も含まれる — 金は
-                        実際にエスクローにあるため。合計だけでは「全部いつもどおり
-                        待っているだけ」に見えてしまうので、一部が停止しているなら
+                    {/* この合計には parked（止まったまま）も含まれる — お金は
+                        実際に MoyMoy が預かっているため。合計だけでは「全部いつもどおり
+                        待っているだけ」に見えてしまうので、一部が止まっているなら
                         ここで明示して一覧の該当行へ注意を向ける。 */}
                     {(sales.sales || []).some((s) => s.escrow && s.escrow.stage === "parked") && (
                       <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
                         color: "var(--carle-red)" }}>
-                        このうち一部は保留のまま停止しています。下の一覧で「入金停止中（要確認）」の行をご確認ください。
+                        このうち一部は止まったままです。下の一覧で「入金停止中（要確認）」の行を確認してください。
                       </div>
                     )}
                   </div>
 
-                  {/* 履行の報告は、この画面（「渡した」）とお店の連携（API キー）の両方
-                      からできる。報告を忘れると 6 時間で凍結されて入金されない、という
-                      期限は店頭 QR の運用で特に踏みやすいので、ここで明示する。 */}
+                  {/* 「渡した」の知らせは、この画面とお店の連携（API キー）の両方からできる。
+                      知らせ忘れると 6 時間で凍結されて入金されない、という期限は
+                      お店の QR の運用で特に踏みやすいので、赤で明示する。 */}
                   <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11,
                     color: "var(--ink-soft)", lineHeight: 1.7 }}>
-                    商品を渡したら、下の取引の「全額渡した」を押して報告してください（一部だけの場合は「一部だけ渡した…」から）。
-                    お店の連携（API キー）から自動で報告している場合は、この操作は要りません。
-                    報告後、10分ほどでこの口座へ入金されます。
+                    商品を渡したら、下の「全額渡した」を押してください。外部連携で自動的に知らせている場合は不要です。
                   </div>
                   <div style={{ marginTop: 8, padding: "9px 12px", border: "1.5px solid var(--carle-red)",
                     background: "rgba(227,38,54,0.06)", fontFamily: "var(--font-jp)", fontSize: 12,
                     fontWeight: 700, color: "var(--carle-red)", lineHeight: 1.7 }}>
-                    報告しないまま 6 時間経つと凍結され、お店には入金されません。
+                    「渡した」と知らせないまま 6 時間たつと、代金は凍結されてお店に入りません。
                   </div>
 
                   {sales.truncated && (
@@ -1774,7 +1968,7 @@ function MerchantPortal({ open, onClose, inline }) {
                   )}
 
                   <div style={{ marginTop: 20 }}>
-                    <div className="h-section">支払われた取引</div>
+                    <div className="h-section">支払われたお会計</div>
                   </div>
                   <div style={{ marginTop: 10, border: "1.5px solid var(--ink)" }}>
                     {(sales.sales || []).map((s, i) => (
@@ -1793,21 +1987,24 @@ function MerchantPortal({ open, onClose, inline }) {
 
           {view === "sales" && !current && (
             <div style={{ padding: "30px 0", textAlign: "center", fontFamily: "var(--font-jp)",
-              fontSize: 13, color: "var(--ink-soft)" }}>加盟店が見つかりません</div>
+              fontSize: 13, color: "var(--ink-soft)" }}>お店が見つかりません</div>
           )}
 
-          {view === "bills" && current && <MoyBillsPage key={current.merchant_id} merchant={current} />}
+          {view === "bills" && current && (
+            <MoyBillsPage key={current.merchant_id + ":" + billsOpt.n} merchant={current}
+              initialFilter={billsOpt.filter} startWithForm={billsOpt.form} />
+          )}
 
           {view === "bills" && !current && (
             <div style={{ padding: "30px 0", textAlign: "center", fontFamily: "var(--font-jp)",
-              fontSize: 13, color: "var(--ink-soft)" }}>加盟店が見つかりません</div>
+              fontSize: 13, color: "var(--ink-soft)" }}>お店が見つかりません</div>
           )}
         </div>
       </div>
 
       {ask && (
         <MoyPinStep zIndex={150} title={ask.title} sub={ask.sub}
-          notice="この操作には口座の PIN が必要です。API キーだけでは実行できません。"
+          notice="大事な操作なので、口座の PIN を入力してください。"
           busy={busy} error={askErr ? errLabelFor(askErr) : null} cta={ask.cta}
           onCancel={() => { setAsk(null); setAskErr(null); }} onSubmit={runAsk} />
       )}
@@ -1817,4 +2014,4 @@ function MerchantPortal({ open, onClose, inline }) {
 
 Object.assign(window, { MerchantPortal, MoyApiKeyReveal, moyDateLabel, EscrowStageBadge, SalesRow,
   FulfillPanel, SaleEscrowNotes, MoyStaticQrSection, MoyBillsPage, MoyBillRow, MoyNewBillForm,
-  MoyBillQr, MoyHeldAlert, moyBillErrText });
+  MoyBillQr, MoyHeldAlert, moyBillErrText, MoyPayerLine, MoyFold, MoyQrShare, MoyTodayCard, MoyHomeButton });

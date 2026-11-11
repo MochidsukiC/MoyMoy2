@@ -62,8 +62,12 @@ const SCHEMA_V12: &str = include_str!("schema_v12.sql");
 /// static code) and `payment_intents.source` (shop-created vs customer-created
 /// via a static code, so the shop's issuance ceilings can ignore the latter).
 const SCHEMA_V13: &str = include_str!("schema_v13.sql");
+/// The v14 delta: `payment_intents.payer_game_name` — the payer's self-reported
+/// Minecraft name, recorded after a payment commits and shown only on the shop
+/// portal's sales list.
+const SCHEMA_V14: &str = include_str!("schema_v14.sql");
 /// Current schema version. Bump + add a step in [`migrate`] for changes.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Open (creating if absent) the SQLite DB at `path`, returning a pool whose
 /// connections all have WAL + foreign keys + a busy timeout set, with the schema
@@ -228,8 +232,16 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         version = 13;
         tracing::info!("sqlite migrated to schema v13 (QR payments: static codes + intent source)");
     }
-    // Future: `if version < 14 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V14)?;
-    //          tx.pragma_update(None, "user_version", 14)?; tx.commit()?; version = 14; }`
+    if version < 14 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V14)?;
+        tx.pragma_update(None, "user_version", 14)?;
+        tx.commit()?;
+        version = 14;
+        tracing::info!("sqlite migrated to schema v14 (payer's self-reported game name)");
+    }
+    // Future: `if version < 15 { let tx = conn.transaction()?; tx.execute_batch(SCHEMA_V15)?;
+    //          tx.pragma_update(None, "user_version", 15)?; tx.commit()?; version = 15; }`
     tracing::debug!(schema_version = version, "sqlite schema current");
     Ok(())
 }

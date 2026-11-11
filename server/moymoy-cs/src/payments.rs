@@ -743,17 +743,54 @@ pub fn sales_page(
         v
     };
     let truncated = rows.len() as i64 > limit;
+    // Who paid, for the owner's eyes only (see the `payer` insert below). A
+    // separate statement keyed by primary key rather than a JOIN folded into the
+    // listing query: `INTENT_COLS` and the `SalesFilter` fragments are unqualified,
+    // and the `Intent` row type (which `approve` and the public view share) stays
+    // exactly as it was. SQLite is in-process, so this is not a network N+1.
+    let mut payer_stmt = conn.prepare(
+        "SELECT a.handle, a.display_name, i.payer_game_name \
+         FROM payment_intents i LEFT JOIN accounts a ON a.account_id = i.payer_account_id \
+         WHERE i.intent_id = ?1",
+    )?;
     let sales = rows
         .iter()
         .take(limit as usize)
         .map(|i| {
             let mut row = merchant_view(m, i, now)?;
+            // The portal learns who paid; the public API does not.
+            //
+            // Only a PAID intent has a payer. `payer_account_id` alone is not the
+            // test: `decline` writes it too, and showing a shopkeeper the name of
+            // somebody who refused to buy would be disclosing a non-customer.
+            // (`state` stays `paid` through a refund, so a refunded sale keeps its
+            // buyer's name.) Read live from `accounts` — nothing is snapshotted, so
+            // a rename shows and past payments show too. An account row that cannot
+            // be found yields a `payer` object with null handle/display_name rather
+            // than hiding that somebody paid.
+            let payer = if i.state == STATE_PAID && i.payer_account_id.is_some() {
+                let (handle, display_name, game_name): (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = payer_stmt.query_row([&i.intent_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+                json!({
+                    "handle": handle,
+                    "display_name": display_name,
+                    "game_name": game_name,
+                })
+            } else {
+                Value::Null
+            };
             // On the sales page only, not in `merchant_view`: that view is also
             // the public `/merchant/v1/intent` response, whose shape is a
             // contract with third-party integrators. The owner reading its own
             // sales wants to tell a till-side QR payment from an API-created bill.
             if let Some(obj) = row.as_object_mut() {
                 obj.insert("source".to_string(), json!(i.source.as_db()));
+                obj.insert("payer".to_string(), payer);
                 // The URL its QR encodes — only while the bill can still be
                 // paid. Keyed off the EFFECTIVE state, like `state` itself, so a
                 // bill past its deadline stops offering a code before the sweep
@@ -1663,8 +1700,88 @@ pub(crate) struct ApproveReq {
     pin: Option<String>,
     /// Supplied on the retry after `otp_required`.
     otp: Option<String>,
+    /// The payer's Minecraft name as MochiOS `os.gameName()` reports it —
+    /// SELF-REPORTED and spoofable, so it is a label for the shopkeeper to read and
+    /// nothing is ever decided on it. Optional: an app that cannot read one simply
+    /// omits it. It never reaches [`approve`]; see [`record_payer_game_name`].
+    payer_game_name: Option<String>,
 }
 
+/// The longest game name kept, in Unicode scalar values. (A Minecraft name is at
+/// most 16; the slack is for whatever a launcher or a Bedrock gamertag reports.)
+const MAX_PAYER_GAME_NAME_CHARS: usize = 32;
+
+/// Record the payer's self-reported game name against a payment that has ALREADY
+/// committed. Returns whether THIS call wrote it.
+///
+/// ## Why this is outside `approve`
+///
+/// The name is incidental to the payment, so no outcome of recording it may
+/// influence the money path. It runs as its own single autocommit statement after
+/// `approve` has returned, and the claim UPDATE and `settle` are untouched
+/// (DEV.md invariant 4).
+///
+/// ## Why a bad name does not fail the payment
+///
+/// Standing user decision: a name that fails [`merchant::sanitize_text`] (control
+/// or bidi characters, over 32 chars, empty) is simply NOT recorded, and the
+/// payment — which is already committed and cannot be undone — stays a success.
+/// The refusal is logged (`intent_id` and the reason code, never the name) so it
+/// is not silent.
+///
+/// ## Why a DB error here is not propagated
+///
+/// The money has moved and the response must say so; turning a failed label write
+/// into an error response would tell the payer a paid purchase failed and invite a
+/// second attempt. The failure is not swallowed — it is logged at `error` and
+/// reported to the caller as `false` — but it cannot be allowed to change the
+/// payment's outcome.
+///
+/// Written once: `payer_game_name IS NULL` means a retry or a replay cannot
+/// overwrite what was first recorded, so it is `false` for a replay of a payment
+/// whose name was already stored. `payer_account_id = ?3` means only the payer can
+/// attach a name to their own payment.
+fn record_payer_game_name(
+    conn: &Connection,
+    intent_id: &str,
+    payer: &str,
+    raw: Option<&str>,
+) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let name = match merchant::sanitize_text(raw, MAX_PAYER_GAME_NAME_CHARS) {
+        Ok(n) => n,
+        Err(reject) => {
+            tracing::info!(
+                intent_id,
+                reason = reject.code(),
+                "approve: payer_game_name rejected, payment unaffected and name not recorded"
+            );
+            return false;
+        }
+    };
+    match conn.execute(
+        "UPDATE payment_intents SET payer_game_name = ?1 \
+         WHERE intent_id = ?2 AND payer_account_id = ?3 AND payer_game_name IS NULL",
+        params![name, intent_id, payer],
+    ) {
+        Ok(changed) => changed == 1,
+        Err(e) => {
+            tracing::error!(
+                intent_id, error = %e,
+                "approve: payment committed but recording payer_game_name failed"
+            );
+            false
+        }
+    }
+}
+
+/// `payer_game_name_stored` — added to the response of a SUCCESSFUL approval
+/// (`ok: true`, `state: "paid"`, which `approve` only ever returns to the payer,
+/// replays included) and to nothing else. Always present on those, `false` when the
+/// app sent no name, so a client reads one boolean rather than distinguishing
+/// "absent" from "false". `true` means this request wrote the name.
 pub(crate) async fn payment_approve(
     State(st): State<AppState>,
     acct: AuthedAccount,
@@ -1675,7 +1792,7 @@ pub(crate) async fn payment_approve(
     let watch = st.watch.clone();
     let intent_id = req.intent_id.clone();
     let result = blocking(st.pool, move |conn| {
-        approve(
+        let mut value = approve(
             conn,
             &backoff,
             email_enabled,
@@ -1687,7 +1804,21 @@ pub(crate) async fn payment_approve(
                 otp: req.otp.as_deref(),
             },
             &req.intent_id,
-        )
+        )?;
+        // `state` alone is not the test: the answer to a non-payer who approves an
+        // already-paid intent is `{ok:false, error:"already_paid", state:"paid"}`.
+        if value["ok"] == json!(true) && value["state"] == json!(STATE_PAID) {
+            let stored = record_payer_game_name(
+                conn,
+                &req.intent_id,
+                &acct.account_id,
+                req.payer_game_name.as_deref(),
+            );
+            if let Some(o) = value.as_object_mut() {
+                o.insert("payer_game_name_stored".to_string(), json!(stored));
+            }
+        }
+        Ok(value)
     })
     .await;
     // Before `?`, and whether or not the approval succeeded: `approve` commits in

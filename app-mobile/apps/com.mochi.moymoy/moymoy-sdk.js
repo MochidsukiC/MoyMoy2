@@ -659,8 +659,13 @@
     // the backend rebuilds the same response from `state`/`payer`/`tx_id`, so a
     // retry after a lost response replays server-side. Minting a key here would
     // add a second, weaker notion of "the same payment".
-    paymentApprove: (intentId, pin, otp) =>
-      postJson("/wallet/payment/approve", { intent_id: intentId, pin, otp }),
+    //
+    // `payerGameName` (optional) is the payer's in-game name, read from the OS by the
+    // caller. The shop sees it on its sales rows. A bad name never fails the payment
+    // (the answer says `payer_game_name_stored:false`); undefined is simply not sent.
+    paymentApprove: (intentId, pin, otp, payerGameName) =>
+      postJson("/wallet/payment/approve",
+        { intent_id: intentId, pin, otp, payer_game_name: payerGameName }),
 
     // Refuse it. No PIN: nothing moves, and making somebody authenticate to say
     // "no" is how people are taught to type their PIN into whatever asks.
