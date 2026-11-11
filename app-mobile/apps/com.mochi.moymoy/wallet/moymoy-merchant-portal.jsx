@@ -745,28 +745,54 @@ function MoyBillQr({ qrUrl, description }) {
   );
 }
 
-/* 前回つくったお会計の内容。お店ごと・この端末だけに保存し、次のフォームに最初から
-   入れておく（同じ品を続けて売る店頭の手間を減らす）。お金の流れには関わらない。 */
-const moyLastBillDescKey = (merchantId) => "moymoy.lastBillDesc.v1." + merchantId;
+/* 前回つくったお会計の金額と内容。お店ごと・この端末だけに保存し、次のフォームに
+   最初から入れておく（同じ品を続けて売る店頭の手間を減らす）。保存値は入力欄の
+   初期値になるだけで、送る金額・内容は常に画面に見えている値。
+   形式: JSON {"amount_minor": 正の整数, "description": 空でない文字列} */
+const moyLastBillKey = (merchantId) => "moymoy.lastBill.v1." + merchantId;
+
+function moyParseLastBill(raw) {
+  if (typeof raw !== "string" || raw === "") return null;
+  let v;
+  try {
+    v = JSON.parse(raw);
+  } catch (e) {
+    console.warn("MoyMoy: saved last bill is not JSON; starting the form empty", e);
+    return null;
+  }
+  const amountOk = v && Number.isSafeInteger(v.amount_minor) && v.amount_minor > 0;
+  const descOk = v && typeof v.description === "string" && v.description !== "";
+  if (!amountOk || !descOk) {
+    console.warn("MoyMoy: saved last bill has an unexpected shape; starting the form empty", v);
+    return null;
+  }
+  return { amountMinor: v.amount_minor, description: v.description };
+}
 
 /* 新しいお会計のフォーム。閉じると（成功・やめる）この部品ごと消えるので、入力値と
-   再試行用の鍵は次に開いたときに持ち越されない。内容だけは前回の値を保存から入れる。 */
+   再試行用の鍵は次に開いたときに持ち越されない。金額と内容だけは前回の値を保存から入れる。 */
 function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
   const entry = useMoyAmountInput(true);
   const [desc, setDesc] = msState("");
-  const [prefilled, setPrefilled] = msState(false);
-  const typedRef = msRef(false);
+  const [last, setLast] = msState(null); // 入れた前回の値（案内文の表示判定用）
+  // 保存の読み込みは非同期。返るまでに打ち始めていた欄は上書きしないよう、現在値を ref で見る。
+  const amountTextRef = msRef("");
+  amountTextRef.current = entry.text;
+  const descRef = msRef("");
+  descRef.current = desc;
   msEffect(() => {
     let live = true;
-    MoyMoy.store.get(moyLastBillDescKey(merchantId)).then((saved) => {
-      if (!live || typeof saved !== "string" || saved === "") return;
-      // 読み込み中に打ち始めていたら、その入力を優先して上書きしない。
-      if (typedRef.current) return;
-      setDesc(saved);
-      setPrefilled(true);
+    MoyMoy.store.get(moyLastBillKey(merchantId)).then((raw) => {
+      if (!live) return;
+      const saved = moyParseLastBill(raw);
+      if (!saved) return;
+      if (amountTextRef.current === "") entry.setAmount(saved.amountMinor);
+      if (descRef.current === "") setDesc(saved.description);
+      setLast(saved);
     });
     return () => { live = false; };
   }, [merchantId]);
+  const showLastNote = last !== null && entry.amount === last.amountMinor && desc === last.description;
   const [ttl, setTtl] = msState(600);
   const [orderRef, setOrderRef] = msState("");
   const [busy, setBusy] = msState(false);
@@ -803,8 +829,9 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
       const r = await MoyMoy.portalIntentCreate(merchantId, input, attemptRef.current.key);
       if (!aliveRef.current) return;
       if (r.ok && typeof r.qr_url === "string" && r.qr_url) {
-        MoyMoy.store.set(moyLastBillDescKey(merchantId), input.description).then((saved) => {
-          if (!saved) console.warn("MoyMoy: could not save the last bill description; the next form starts empty");
+        const lastJson = JSON.stringify({ amount_minor: input.amountMinor, description: input.description });
+        MoyMoy.store.set(moyLastBillKey(merchantId), lastJson).then((saved) => {
+          if (!saved) console.warn("MoyMoy: could not save the last bill; the next form starts empty");
         });
         onCreated(r, input.description);
         return;
@@ -829,6 +856,13 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
       <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.7 }}>
         金額入りの QR を作ります。
       </div>
+      {showLastNote && (
+        <div style={{ marginTop: 8, padding: "8px 10px", border: "1.5px solid var(--moy-deep)",
+          background: "var(--moy-mint)", fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
+          color: "var(--moy-deep)", lineHeight: 1.6 }}>
+          前回と同じ金額と内容を入れてあります。違うときは書き換えてください。
+        </div>
+      )}
 
       <div style={{ marginTop: 12 }}>
         <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>金額</div>
@@ -837,12 +871,11 @@ function MoyNewBillForm({ merchantId, onCreated, onCancel }) {
 
       <div style={{ marginTop: 14 }}>
         <div className="eyebrow" style={{ color: "var(--moy-deep)", marginBottom: 4 }}>内容（必須）</div>
-        <input value={desc} disabled={busy} onChange={(e) => { typedRef.current = true; setDesc(e.target.value); setPrefilled(false); }}
+        <input value={desc} disabled={busy} onChange={(e) => setDesc(e.target.value)}
           maxLength={MOY_MAX_BILL_DESC * 3} aria-label="お会計の内容（120文字まで）"
           placeholder="例: 石レンガ x64" style={fieldStyle} />
         <div style={{ marginTop: 4, fontFamily: "var(--font-jp)", fontSize: 11, lineHeight: 1.6,
           color: descBad ? "var(--carle-red)" : "var(--ink-soft)", fontWeight: descBad ? 700 : 400 }}>
-          {prefilled && <div>前回と同じ内容を入れてあります。違うときは書き換えてください。</div>}
           {descLen} / {MOY_MAX_BILL_DESC} 文字{descBad ? "。長すぎます" : ""}
         </div>
       </div>
