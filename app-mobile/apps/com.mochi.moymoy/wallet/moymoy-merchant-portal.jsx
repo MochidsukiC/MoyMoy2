@@ -19,7 +19,7 @@ const REASON_LABEL = {
   invisible_char: "表示されない文字が含まれています",
   stacked_marks: "装飾記号が多すぎます",
   reserved_name: "運営や公式を連想させる語は使えません",
-  mixed_script: "複数の文字体系が混ざっています",
+  mixed_script: "ひらがな・漢字と、似た形の外国の文字が混ざっています",
   unnameable: "名前として識別できません",
 };
 
@@ -72,7 +72,7 @@ function moyDateLabel(ts) {
    parked は carle-red の塗りつぶしにして、一見して別物と分かるようにする
    （held より強い表示にする、という要求への対応）。 */
 const ESCROW_STAGE = {
-  held:      { label: "MoyMoy が預かり中",     border: "var(--carle-red)", bg: "rgba(227,38,54,0.08)", color: "var(--carle-red)" },
+  held:      { label: "MoyMoy が預かり中",     border: "var(--ink)",       bg: "var(--bg-white)",      color: "var(--ink)" },
   parked:    { label: "入金停止中（要確認）",  border: "var(--carle-red)", bg: "var(--carle-red)",     color: "#fff" },
   fulfilled: { label: "渡した・入金待ち",      border: "var(--ink)",       bg: "rgba(0,0,0,0.05)",     color: "var(--ink)" },
   released:  { label: "入金済み",              border: "var(--moy-deep)",  bg: "var(--moy-mint)",      color: "var(--moy-deep)" },
@@ -146,7 +146,7 @@ function FulfillPanel({ merchantId, sale, held, onReported }) {
         ok = true; refresh = true;
         const refunded = typeof r.refund_amount_minor === "number" ? r.refund_amount_minor : full - fulfilledAmount;
         const paid = typeof r.fulfilled_amount_minor === "number" ? r.fulfilled_amount_minor : fulfilledAmount;
-        text = "「渡した」と知らせました。お店に入る額 " + formatEme(paid) + " エメ" +
+        text = "渡したことを知らせました。お店に入る額 " + formatEme(paid) + " エメ" +
           (refunded > 0 ? "、お客さんへの返金 " + formatEme(refunded) + " エメ" : "") + "。";
       } else if (r.error === "already_fulfilled") {
         refresh = true;
@@ -340,7 +340,9 @@ function SaleEscrowNotes({ sale, merchantId, onReported }) {
       {partial && (
         <div style={{ marginTop: 8, padding: "8px 10px", border: "1px dashed rgba(0,0,0,0.28)",
           fontFamily: "var(--font-jp)", fontSize: 11, color: "var(--ink)", lineHeight: 1.7 }}>
-          一部だけ渡したので、差額はお客さんへ返金されています。
+          {escrow.stage === "released"
+            ? "一部だけ渡したので、差額はお客さんへ返金しました。"
+            : "一部だけ渡したので、差額は、お店に入金されるときにお客さんへ返金されます。"}
           <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
             <span>お店に入る額</span>
             <span style={{ fontWeight: 700 }}>{formatEme(escrow.fulfilled_amount_minor)} エメ</span>
@@ -379,11 +381,11 @@ function SalesRow({ sale, last, merchantId, onReported }) {
           <div style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--ink-soft)", marginTop: 2,
             display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             <span>{moyDateLabel(sale.created_unix_ms)}</span>
-            {/* お店の QR（静的 QR）経由の売上。API 経由 (source: "api") は従来どおり何も付けない。 */}
-            {sale.source === "static_qr" && (
+            {/* 発生元バッジ。お会計の一覧（MoyBillRow）と同じ規則・同じ文言。 */}
+            {MOY_BILL_SOURCE[sale.source] && (
               <span style={{ border: "1.5px solid var(--moy-deep)", background: "var(--moy-mint)",
                 color: "var(--moy-deep)", padding: "0 5px", fontFamily: "var(--font-jp)", fontSize: 10,
-                fontWeight: 700, whiteSpace: "nowrap" }}>お店の QR</span>
+                fontWeight: 700, whiteSpace: "nowrap" }}>{MOY_BILL_SOURCE[sale.source]}</span>
             )}
           </div>
         </div>
@@ -959,7 +961,7 @@ function MoyBillRow({ sale, last, merchantId, now, onChanged, onCanceled, onRepo
             <button onClick={() => setShowQr(!showQr)} style={{ padding: "8px 14px",
               border: "1.5px solid var(--ink)", background: "var(--bg-white)", cursor: "pointer",
               fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 13 }}>
-              {showQr ? "QR を隠す" : "QR を出す"}
+              {showQr ? "閉じる" : "QR の URL を見る"}
             </button>
           )}
           {showQr && hasQr && <MoyBillQr qrUrl={sale.qr_url} description={sale.description || ""} />}
@@ -1085,7 +1087,7 @@ function MoyBillsPage({ merchant, initialFilter, startWithForm }) {
   // 一緒に消える。何を知らせたかが分かるよう、結果を一覧の上に残す。
   function handleReported(sale, res) {
     if (res && filterRef.current === "held") {
-      setNotice({ ok: res.ok, text: "「" + (sale.description || "お会計") + "」 " + res.text });
+      setNotice({ ok: res.ok, text: (sale.description || "お会計") + "：" + res.text });
     }
     refresh();
   }
@@ -1302,11 +1304,13 @@ function MerchantPortal({ open, onClose, inline }) {
         const r = await MoyMoy.merchantSales(m.merchant_id, undefined, "held");
         if (!aliveRef.current) return;
         if (r.ok) {
-          // held_total_minor は絞り込みに関係なく店全体の「MoyMoy が預かり中」の合計
-          // （サーバの集計値をそのまま使う。ここで足し算し直さない）。
+          // incoming_total_minor は絞り込みに関係なく店全体の「これからお店に入る額」
+          // （一部だけ渡した分は渡した額で数える。お客さんへ戻る差額は含まない）。
+          // サーバの集計値をそのまま使い、ここで足し算し直さない。
           setHeldMap((prev) => ({ ...prev, [m.merchant_id]: {
             n: (r.sales || []).length, more: !!r.truncated,
-            total: typeof r.held_total_minor === "number" ? r.held_total_minor : null } }));
+            total: typeof r.incoming_total_minor === "number" ? r.incoming_total_minor : null,
+            awaiting: typeof r.awaiting_count === "number" ? r.awaiting_count : null } }));
         } else {
           console.warn("MoyMoy: held count refused for " + m.merchant_id, r.error);
           setHeldMap((prev) => ({ ...prev, [m.merchant_id]: { failed: true } }));
@@ -1682,7 +1686,7 @@ function MerchantPortal({ open, onClose, inline }) {
                   fontWeight: nameBad ? 700 : 400 }}>
                   {nameBad
                     ? "いま " + nameLen + " 文字です（㈱ などの記号は変換後の文字数で数えます）。32文字までにしてください。"
-                    : "32文字まで。運営を騙る語や、複数の文字体系を混ぜた紛らわしい名前は登録できません。"}
+                    : "32文字まで。運営を騙る語や、ひらがな・漢字と、似た形の外国の文字を混ぜた名前は登録できません。"}
                 </div>
                 {/* 予約語とスクリプト混在の条件は、長さの警告が出ているあいだも
                     消さない。上の行を差し替えるだけだと、名前を削って長さを直した
@@ -1690,7 +1694,7 @@ function MerchantPortal({ open, onClose, inline }) {
                 {nameBad && (
                   <div style={{ fontFamily: "var(--font-jp)", fontSize: 11, marginTop: 4, lineHeight: 1.7,
                     color: "var(--ink-soft)" }}>
-                    運営を騙る語や、複数の文字体系を混ぜた紛らわしい名前は登録できません。
+                    運営を騙る語や、ひらがな・漢字と、似た形の外国の文字を混ぜた名前は登録できません。
                   </div>
                 )}
               </div>
@@ -1738,7 +1742,7 @@ function MerchantPortal({ open, onClose, inline }) {
                 <div style={{ marginTop: 10, padding: "9px 12px", border: "1.5px solid var(--carle-red)",
                   background: "rgba(227,38,54,0.06)", fontFamily: "var(--font-jp)", fontSize: 12,
                   fontWeight: 700, color: "var(--carle-red)", lineHeight: 1.7 }}>
-                  API キーを発行しました。一度しか表示されないので、下の「お店の設定・開発者向け」で控えてください。
+                  お店の連携用キー（開発者向け）を発行しました。一度しか表示されないので、必要な人は下の「お店の設定・開発者向け」で控えてください。使わない場合は閉じて構いません。
                 </div>
               )}
 
@@ -1757,7 +1761,9 @@ function MerchantPortal({ open, onClose, inline }) {
                     {formatEme(heldCur.total)} エメ
                   </div>
                   <div style={{ marginTop: 2, fontSize: 11, color: "var(--ink-soft)", lineHeight: 1.6 }}>
-                    商品を渡すとお店に入ります
+                    {heldCur.awaiting > 0
+                      ? "商品を渡すとお店に入ります"
+                      : "渡した分は、支払いから 10 分ほどでお店に入ります。"}
                   </div>
                 </div>
               )}
@@ -1918,21 +1924,24 @@ function MerchantPortal({ open, onClose, inline }) {
                 <>
                   {/* 「お客さんは払ったのに残高が増えていない」への答え。この画面で
                       いちばん目立たせるべき数字。 */}
-                  <div style={{ marginTop: 14, border: "1.5px solid " + (sales.held_count > 0 ? "var(--carle-red)" : "var(--ink)"),
-                    background: sales.held_count > 0 ? "rgba(227,38,54,0.06)" : "var(--bg-white)",
-                    padding: "14px" }}>
+                  <div style={{ marginTop: 14, border: "1.5px solid var(--ink)",
+                    background: "var(--bg-white)", padding: "14px" }}>
                     <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 700,
-                      color: sales.held_count > 0 ? "var(--carle-red)" : "var(--moy-deep)" }}>
+                      color: "var(--moy-deep)" }}>
                       入金待ち（MoyMoy が預かり中）
                     </div>
                     <div style={{ marginTop: 4, fontFamily: "var(--font-mono)", fontWeight: 800, fontSize: 26,
-                      color: sales.held_count > 0 ? "var(--carle-red)" : "var(--ink)" }}>
-                      {formatEme(sales.held_total_minor)} エメ
+                      color: "var(--ink)" }}>
+                      {typeof sales.incoming_total_minor === "number"
+                        ? formatEme(sales.incoming_total_minor) + " エメ"
+                        : "確認できませんでした"}
                     </div>
                     <div style={{ marginTop: 2, fontFamily: "var(--font-jp)", fontSize: 12, color: "var(--ink-soft)" }}>
-                      {sales.held_count > 0
-                        ? formatCount(sales.held_count) + " 件がお客さんの支払い済みです。商品を渡すとお店に入ります。"
-                        : "いま預かり中の売上はありません。"}
+                      {sales.awaiting_count > 0
+                        ? formatCount(sales.awaiting_count) + " 件がお客さんの支払い済みです。商品を渡すとお店に入ります。"
+                        : sales.held_count > 0
+                          ? "渡した分は、支払いから 10 分ほどでお店に入ります。"
+                          : "いま預かり中の売上はありません。"}
                     </div>
                     {/* この合計には parked（止まったまま）も含まれる — お金は
                         実際に MoyMoy が預かっているため。合計だけでは「全部いつもどおり
@@ -1949,10 +1958,12 @@ function MerchantPortal({ open, onClose, inline }) {
                   {/* 「渡した」の知らせは、この画面とお店の連携（API キー）の両方からできる。
                       知らせ忘れると 6 時間で凍結されて入金されない、という期限は
                       お店の QR の運用で特に踏みやすいので、赤で明示する。 */}
-                  <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11,
-                    color: "var(--ink-soft)", lineHeight: 1.7 }}>
-                    商品を渡したら、下の「全額渡した」を押してください。外部連携で自動的に知らせている場合は不要です。
-                  </div>
+                  {sales.awaiting_count > 0 && (
+                    <div style={{ marginTop: 8, fontFamily: "var(--font-jp)", fontSize: 11,
+                      color: "var(--ink-soft)", lineHeight: 1.7 }}>
+                      商品を渡したら、下の「全額渡した」を押してください。ほかのシステムとつないで自動で知らせている場合は不要です。
+                    </div>
+                  )}
                   <div style={{ marginTop: 8, padding: "9px 12px", border: "1.5px solid var(--carle-red)",
                     background: "rgba(227,38,54,0.06)", fontFamily: "var(--font-jp)", fontSize: 12,
                     fontWeight: 700, color: "var(--carle-red)", lineHeight: 1.7 }}>

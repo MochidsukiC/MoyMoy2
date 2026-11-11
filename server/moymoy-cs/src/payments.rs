@@ -806,11 +806,27 @@ pub fn sales_page(
     // Counted from the intents, not from any balance — see the note above. Over
     // ALL of the shop's intents whatever `filter` is: the held money does not
     // shrink because the owner is looking at only the open bills.
-    let (held_count, held_total): (i64, i64) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payment_intents \
+    //
+    // `held_total_minor` is what the customers paid and the escrow account still
+    // holds. `incoming_total_minor` is what the SHOP will receive out of it: a
+    // reported delivery replaces the paid amount with the delivered one (the
+    // difference goes back to the customer at release), so the two differ as
+    // soon as a partial delivery is reported. The owner-facing "入金待ち" is the
+    // second one; showing the first told a shop it would get the refunds too.
+    let (held_count, held_total, incoming_total): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(amount), 0), \
+                COALESCE(SUM(COALESCE(fulfilled_amount, amount)), 0) FROM payment_intents \
          WHERE merchant_id = ?1 AND escrowed_unix_ms IS NOT NULL AND released_unix_ms IS NULL",
         [&m.merchant_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    // Not yet reported as delivered: exactly the `held` filter's rows (one
+    // definition, reused, so "N 件 渡し待ち" and the held list cannot disagree).
+    let (held_sql, _) = SalesFilter::Held.sql();
+    let awaiting_count: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM payment_intents WHERE merchant_id = ?1{held_sql}"),
+        [&m.merchant_id],
+        |r| r.get(0),
     )?;
 
     Ok(json!({
@@ -818,6 +834,8 @@ pub fn sales_page(
         "name": m.name,
         "held_count": held_count,
         "held_total_minor": held_total,
+        "incoming_total_minor": incoming_total,
+        "awaiting_count": awaiting_count,
         "limit": limit,
         // Stated rather than implied: the caller can ask for more.
         "truncated": truncated,
