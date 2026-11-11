@@ -778,6 +778,12 @@ const MOY_PRESENT_REFUSED = {
   rate_limited: "少し待ってから、もう一度掲げてください。",
 };
 
+/* OS が掲げるのを終えた理由（os.qr.onPresentEnded）。 */
+const MOY_PRESENT_ENDED_BY_OS = {
+  phone_reopened: "スマホを開き直したので、掲げるのを終えました。",
+  left_foreground: "MoyMoy から離れたので、掲げるのを終えました。",
+};
+
 const MOY_PRESENT_ENDED = {
   expired: "期限が切れました。もう一度お会計をつくってください。",
   canceled: "このお会計は取り消されました。",
@@ -810,6 +816,13 @@ function MoyPresentPanel({ merchantId, shopName, kind, content, bill, onClose, o
     if (!api) { setPresent({ phase: "unsupported" }); return undefined; }
     let live = true;
     setPresent({ phase: "starting" });
+    // OS が自分で掲げるのを終えたとき（スマホを開き直した・MoyMoy から離れた）に知らせが来る。
+    // 登録は外せないので、この掲げ方が終わった後の知らせは live で捨てる。
+    if (typeof api.onPresentEnded === "function") {
+      api.onPresentEnded((reason) => {
+        if (live) setPresent({ phase: "ended", reason });
+      });
+    }
     Promise.resolve(api.present(content)).then((r) => {
       if (!live) return;
       if (r && r.ok === false) {
@@ -923,7 +936,8 @@ function MoyPresentPanel({ merchantId, shopName, kind, content, bill, onClose, o
     <div style={box}>
       <div style={{ fontFamily: "var(--font-jp)", fontSize: 12, fontWeight: 800, color: "var(--moy-deep)" }}>
         {phase === "on" ? (kind === "bill" ? "スマホを掲げています" : "お店の QR を掲げています")
-          : phase === "starting" ? "掲げています…" : "掲げられませんでした"}
+          : phase === "starting" ? "掲げています…"
+          : phase === "ended" ? "掲げるのを終えました" : "掲げられませんでした"}
       </div>
       {kind === "bill" && bill ? (
         <>
@@ -944,7 +958,7 @@ function MoyPresentPanel({ merchantId, shopName, kind, content, bill, onClose, o
         <div style={{ marginTop: 10, padding: "10px 12px", background: "var(--moy-mint)",
           fontFamily: "var(--font-jp)", fontSize: 13, fontWeight: 700, color: "var(--ink)", lineHeight: 1.8 }}>
           お客さんに、QR 読み取りにしたスマホであなたを右クリックしてもらってください。
-          スマホは手に持ったままにしてください（画面は閉じても大丈夫です）。
+          スマホは手に持ったままにしてください。画面は自動で閉じ、スマホを掲げます（持ち替えるか、スマホを開き直すと下ろします）。
         </div>
       )}
       {kind === "static" && phase === "on" && (
@@ -960,6 +974,12 @@ function MoyPresentPanel({ merchantId, shopName, kind, content, bill, onClose, o
       {phase === "refused" && (
         <div style={{ ...small, marginTop: 10, color: "var(--carle-red)", fontWeight: 700 }}>
           {MOY_PRESENT_REFUSED[present.reason] || "いまは掲げられません。もう一度お試しください。"}
+        </div>
+      )}
+      {phase === "ended" && (
+        <div style={{ ...small, marginTop: 10, fontWeight: 700 }}>
+          {MOY_PRESENT_ENDED_BY_OS[present.reason] || "掲げるのを終えました。"}
+          まだ払ってもらっていなければ「もう一度掲げる」を押してください。
         </div>
       )}
       {phase === "failed" && (
