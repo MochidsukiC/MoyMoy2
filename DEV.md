@@ -201,8 +201,8 @@ QR を読んで MoyMoy で払う経路。実装は `server/moymoy-cs/src/qr.rs`�
 - ボタン「スマホを掲げて払ってもらう」の置き場所: お会計の作成直後カード、お会計一覧の未払い行、「お店の QR」ページ。お会計一覧ページ（`MoyBillsPage`）では同時に 1 件だけ掲げる（`presentingBill`）。
 - お会計の掲げ画面（`MoyPresentPanel`）は `GET /merchant/portal/intent/wait?merchant_id&intent_id&timeout_secs` で 25 秒ずつ待ち受け、支払い/期限切れ/取消/拒否を検知すると `clearPresent` して結果を表示（paid は支払者名と「全額渡した」）。通信失敗・429 は 4 秒後に再接続。セッション認証のみ、所有店のみ（他は `unknown_merchant`）。お店の QR は待ち受けなし（客が払うたび新しいお会計になるため）で、支払いは渡し待ちに出る。
 - サーバー: 待ち受け本体を `wait_for_change`（`merchant.rs`）に切り出し、公開 `/merchant/v1/intent/wait` と共有（公開側の応答は不変）。`mget:` 予算・16 枠・429 `too_many_waiters` も同じ。応答 `{ok:true, intent:<portal_sales の sales[] と同じ行>, timed_out}`。行は `payments::owner_sale_row` で sales_page と共有。
-- manifest 0.9.0（未公開）に scope `qr.present` を追加。
-- 確認状況: 開発用 Hub 外のブラウザで `os.qr` を差し替えて確認済み（present/clear の呼び出し、支払い検知→掲げ解除→支払者名、全額渡した後の表示、お店の QR の掲げ、未対応環境の文言、`readLaunchIntent` の 7 ケース）。**Minecraft 内での実際の右クリック読み取りは未確認**（§TODO）。
+- manifest 0.9.0（公開済み）に scope `qr.present` を追加。
+- 確認状況: 開発用 Hub 外のブラウザで `os.qr` を差し替えて確認済み（present/clear の呼び出し、支払い検知→掲げ解除→支払者名、全額渡した後の表示、お店の QR の掲げ、未対応環境の文言、`readLaunchIntent` の 7 ケース）。Minecraft 内での実際の読み取りは 2026-11-12 に本番でユーザーが正常動作を確認済み。
 
 ### お店タブ（店主向け画面、v14）
 `moymoy-merchant-portal.jsx`。「画面が技術者向けすぎて機械が苦手な人に敬遠される」という判断（2026-11-11）で店主向けに作り直した。コード識別子（`merchant`/`intent` 等）は従来名のまま、変えたのは画面文言のみ。
@@ -212,7 +212,7 @@ QR を読んで MoyMoy で払う経路。実装は `server/moymoy-cs/src/qr.rs`�
 - **支払者名**: 売上行とお会計の支払済み行に `MoyPayerLine` で 1 行目「表示名（@handle）」（片方しか無ければその片方）、2 行目「PL: <PL 名>」（PL 名が無ければ 2 行目なし）を出す。`payer` が null なら何も出さない。匿名の `payer_ref` は画面に出さない。MoyMoy アカウント名は `accounts` から都度参照、PL 名は `os.gameName()`（scope 不要）を `doApprove`（`moymoy-screens.jsx`）が承認時に最大 1 秒待って `paymentApprove` の第 4 引数で送る。取れなければ名前なしで支払う（名前のために支払いを止めない）。**承認画面で店に名前が渡ると告知することはしない**（ユーザー決定）。
 - **プライバシー方針の変更**: 従来「@handle は wallet の外に出ない（加盟店には `payer_ref` だけ）」としていたが、**ポータル（店主本人のセッションで読む売上ページ）に限って**支払者の @handle・表示名・PL 名を見せる。公開 `/merchant/v1/*` は匿名のまま。PL 名は自己申告で偽装可能だが、偽名を名乗る動機が無いため許容（ユーザー判断）。
 
-**制約**: QR ブロックは MochiOS の Fabric 26.2 版のみの機能（Forge 1.20.1 では使えない）。in-world 実機検証は未実施（§TODO）。
+**制約**: QR ブロックは MochiOS の Fabric 26.2 版のみの機能（Forge 1.20.1 では使えない）。in-world 実機検証は 2026-11-12 に本番でユーザーが正常動作を確認済み。
 
 ### リスクベース段階認証（riskauth、v6）
 機能別に PIN を撒かず、資金流出の唯一の関門にする。`/wallet/send`・`/wallet/withdraw`・決済承認 (`/wallet/payment/approve`) が同じ関門 (`riskauth::step_up`) を通る。`/wallet/charge` は資金流入なので対象外。
@@ -262,7 +262,15 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 **単位の検査**: `api.rs` の `whole_emeralds()` — チャージ・出金は `%100 != 0` を **400** で拒否（エメラルドは不可分）。送金・決済承認には `%100` 検査が**無く**、1 マイナーユニット（0.01エメ）から通る。
 
 ### デプロイの制約
-**MoyMoy と PiggleShop2 は同時にしかデプロイできない**。`attest` の署名ハッシュと `amount_minor` 契約が、MoyMoy サーバー・MoyMoy アプリ・PiggleShop2 サーバー・PiggleShop2 クライアントの4成果物に跨るため。加えて v9〜v12（エスクロー・履行完了通知API）は MoyMoy-cs と PiggleShop2-cs 間の契約にも跨る。**逆マイグレーションは存在しない**——エスクローは実際に金を移すため、列を消すと保留中の金の行き先情報が失われる。**今回は PiggleShop2 側の MC mod が変わる（配送 claim を叩くようになる）ため、Minecraft サーバーの停止と mod 入れ替えが必要**（従来のv8リリース時点では「Minecraft サーバーと mod は停止も変更も不要」だったが、今回は当てはまらない）。**MoyMoy 自身の MC サーバーサイドmodの入れ替えも本番デプロイに含まれ得る**——`mod-fabric-26.2/`（Fabric 26.2 移植、§MC mod ビルド）は追加済みだが、本番 MC サーバーを Forge 1.20.1 のまま運用するか 26.2 へ上げるかは未決定（§TODO）。**v9〜v12はコミット済み・本番未適用**。アプリの状態は**レジストリ登録済み（＝本番の利用者に届いている）が 0.6.0**、**GitHub リリース済みだがストア未登録が 0.7.0（エスクロー）と 0.8.0（Web 起点の戻り先 URL）**の二段になっている。この二つを分けて読むこと——0.8.0 を登録すると 0.7.0 のエスクロー一式も同時に本番へ出るため、登録は上記の同時デプロイ計画が整うまで行わない。**v13（QR 決済）・v14（支払者名）は本番未適用の v9〜v12 の上に積まれる**ため、単独では出せず上記の同時デプロイに含まれる。**アプリ 0.9.0（QR 決済）はコミットのみでリリース未作成**（`manifest.json` の bundle/icon URL は 0.8.0 のまま。0.8.3 までの UI 監査修正も同じ状態）。**アプリの GitHub リリースはアプリストア公開より前に作る必要がある**——インストーラは manifest の `bundle.url` を見て直接 GitHub から取得し、ローカルのリポジトリは見ない（`MochiOS2.0/mobile/cef-host/src/app_install.rs:188-189`）。
+**MoyMoy と PiggleShop2 は同時にしかデプロイできない**。`attest` の署名ハッシュと `amount_minor` 契約が、MoyMoy サーバー・MoyMoy アプリ・PiggleShop2 サーバー・PiggleShop2 クライアントの4成果物に跨るため。加えて v9〜v12（エスクロー・履行完了通知API）は MoyMoy-cs と PiggleShop2-cs 間の契約にも跨る。**逆マイグレーションは存在しない**——エスクローは実際に金を移すため、列を消すと保留中の金の行き先情報が失われる。**今回は PiggleShop2 側の MC mod が変わる（配送 claim を叩くようになる）ため、Minecraft サーバーの停止と mod 入れ替えが必要**（従来のv8リリース時点では「Minecraft サーバーと mod は停止も変更も不要」だったが、今回は当てはまらない）。**MoyMoy 自身の MC サーバーサイドmodの入れ替えも本番デプロイに含まれ得る**——`mod-fabric-26.2/`（Fabric 26.2 移植、§MC mod ビルド）は追加済みだが、本番 MC サーバーを Forge 1.20.1 のまま運用するか 26.2 へ上げるかは未決定（§TODO）。**本番反映状況（2026-11-12 時点）**: 本番 DB は v14 まで適用済み（moymoy-cs v14 版稼働）。アプリは GitHub リリース v0.9.0（tag、tar sha256 `bb5e6d7d…`）と本番アプリストアに登録済み（登録済み 0.8.0〜0.8.3, 0.9.0）。**本番未反映なのはサーバーのみの変更**（0b47426 契約テスト、01bcf54 レビュー指摘修正＝待ち受け通知をコミット直後の blocking 内へ移動・期限切れ静的 QR お会計を取消扱いしない。アプリは影響なし）。**アプリの GitHub リリースはアプリストア公開より前に作る必要がある**——インストーラは manifest の `bundle.url` を見て直接 GitHub から取得し、ローカルのリポジトリは見ない（`MochiOS2.0/mobile/cef-host/src/app_install.rs:188-189`）。
+
+### 本番の所在と手順
+- **所在**: EC2 `13.114.100.18`（ubuntu、SSH 鍵は運用者の手元）。`mochi-hub --dev --headless`（systemd `mochi-hub`、env `/etc/mochi/hub-stack.env`、state `/var/lib/mochi`、Postgres で durable）の launcher が `/opt/mochi/bin/app_backends/moymoy/moymoy-cs`（Linux ELF）を起動する。MC は Fabric 26.2（mc1 / school / Velocity）。実験環境で利用者は実験アカウントのみ。ローカルの `MochiOS2.0\run` は本番ではない。
+- **2026-11-12 デプロイ実績**: 本番 DB は v12（エスクロー適用済み）だった → v14 版へ入れ替え（schema v13/v14 適用、9 口座・合計 236.00 エメ・取引 3 件・お店 5 件が前後で不変、quick_check ok）。ユーザーが本番で正常動作を確認。
+- **Linux ビルド**: WSL で `CARGO_TARGET_DIR=/root/moymoy-linux-target cargo build --release`。
+- **移行リハーサル**: 本番ホストで SQLite backup API のコピーに新バイナリを loopback・TLS/トンネル無しで起動して検証。
+- **入れ替え**: backup API で DB 退避（`/home/ubuntu/deploy/moymoy-0.9.0/backup-pre-v13/`）→ バイナリを atomic mv → moymoy-cs の PID だけ SIGTERM（launcher が 2 秒以内に再起動、Hub 再起動不要）。
+- **ストア登録**: 既存 app_id の更新には Hub 管理者が必要（allowlist は `MOCHI_HUB_ADMIN_ACCOUNTS` ∪ `/var/lib/mochi/admin-accounts.json` を起動時のみ読む）。今回は試験用発行アカウントを一時的に管理者にして登録し、ファイルは削除済み（次の Hub 再起動で管理者から外れる）。
 
 ---
 
@@ -373,12 +381,13 @@ MochiOS 側（別リポジトリ、未照合）は `ALLOWED_PUSH_SENDERS` allowl
 - [ ] **将来実装**（着手前に承認要）: MoyMoy ホスト型承認ページ（現行スキーマ/状態機械は無変更で使える）／ 返金 API（加盟店主導、加盟店口座から金が出る唯一の経路になるため着手時に別途承認）／ 署名レシート（moymoy-cs は `mochi-proto-attest` の `issue` feature を OFF にしており署名鍵を持たないため webhook 導入時に別途判断）／ 猶予付き二重 API キー（無停止ローテーション）／ webhook 通知
 - [x] 入金通知（OS push、schema v7）: backend の transfer/credit 両プリミティブでの outbox 書き込み・配送タスク・端末リンク／MoyMoy アプリの登録配線／MochiOS 側の送信元認可再設計・v0.5.2 リリース公開（backend `5cb6342` / app `90a4fb0` / fix `c66df2a` / release `dfa624b`）
 - [x] 入金通知の実機 E2E（送金 → 受取側端末の通知バナー到達を本番スタックで確認。初回失敗は Hub の staging コピー漏れ＝旧 allowlist が 404 を返したためで、機能側の欠陥ではなかった）
-- [ ] **本番デプロイ**: エスクロー(schema v9〜v12)・step-up帯変更(v11)は実装・コミット済みだが本番未適用。PiggleShop2側のMCサーバー停止・mod入れ替えを伴うため、両リポジトリの同時デプロイ計画が必要（§デプロイの制約）。
+- [x] **本番デプロイ**（2026-11-12）: moymoy-cs v14 版へ入れ替え・アプリ 0.9.0 をリリース/ストア登録済み（§本番の所在と手順）。
+- [ ] 本番へ未反映のサーバー変更（0b47426, 01bcf54）の反映。手順は §本番の所在と手順。
 - [ ] Fabric 26.2 版 mod の実サーバでのロード検証（`MochiMod.MNN_SERVER.serve()` の実バインド、`SERVER_STARTING` の順序、`/eme`、チャージ・出金の E2E）。現状 `./gradlew build` が通ることまでしか確認していない。
 - [ ] `EmeraldOpStore.migrateLegacyStore` を実際の 1.20.1 世代 `.dat` に対して実行した検証。未実行。本番ワールドを引き継ぐ場合は必須。
 - [ ] 本番 MC サーバーを Forge 1.20.1 のまま運用するか 26.2 へ上げるかの決定。上げる場合はワールドのバージョンアップと mod 入れ替えの計画が要る（PiggleShop2 側の MC mod 入れ替えと同時になる可能性）。
-- [ ] QR 決済の in-world 実機検証（Fabric 26.2 の QR ブロック → 着地ページ → アプリ起動 → 承認 → `intent/wait` の完了通知、静的 QR の発行〜売上ページの履行報告まで）。
-- [ ] 請求管理の in-world 確認（アプリで請求作成 → `/mochi qr label` で QR ブロック化 → 客が読んで承認 → 渡し待ちに出る → 「全額渡した」報告）。
-- [ ] 「スマホを掲げる」の in-world 確認（Fabric 26.2 で店主のスマホを掲げ → 客が「QR を読み取る」で店主を右クリック → 客の MoyMoy が起動し承認 → 掲げ画面が支払いを検知）。ブラウザでの `os.qr` 差し替え確認のみ済。
-- [ ] QR 決済の契約テスト（`write-tests` skill に従い Codex が作成）。
+- [x] QR 決済の in-world 実機検証（2026-11-12 本番で確認。Fabric 26.2 の QR ブロック → 着地ページ → アプリ起動 → 承認 → `intent/wait` の完了通知、静的 QR の発行〜売上ページの履行報告まで）
+- [x] 請求管理の in-world 確認（2026-11-12、0.9.0 本番デプロイ後にユーザーが「正常動作」を確認。アプリで請求作成 → `/mochi qr label` で QR ブロック化 → 客が読んで承認 → 渡し待ちに出る → 「全額渡した」報告）。
+- [x] 「スマホを掲げる」の in-world 確認（2026-11-12 本番でユーザーが正常動作を確認）。
+- [x] QR 決済の契約テスト（0b47426、12 件。01bcf54 でレビュー指摘を修正）。
 - [ ] `mod/`（Forge 1.20.1 版）の廃止時期。MochiOS の fabric-26.2 が本番になった時点で削除できる。
