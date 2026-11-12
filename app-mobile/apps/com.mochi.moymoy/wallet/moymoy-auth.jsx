@@ -540,10 +540,10 @@ function AuthRecover({ onDone, onBack }) {
 }
 
 /* ─── account switcher (bottom sheet) ────────────────────────────────── */
-function AccountMenu({ open, accounts, activeId, onSwitch, onAdd, onLogout, onSettings, onClose }) {
+function AccountMenu({ open, accounts, activeId, onSwitch, onAdd, onLogout, onSettings, onClose, zIndex = 130 }) {
   if (!open) return null;
   return (
-    <div style={{ position: "absolute", inset: 0, zIndex: 130, display: "flex", flexDirection: "column",
+    <div style={{ position: "absolute", inset: 0, zIndex, display: "flex", flexDirection: "column",
       justifyContent: "flex-end", background: "rgba(10,30,18,0.45)" }} onClick={onClose}>
       <div className="slide-up" onClick={(e) => e.stopPropagation()} style={{ background: "var(--bg-white)",
         borderTop: "1.5px solid var(--ink)", padding: "18px 0 24px", maxHeight: "80%", overflow: "auto" }}>
@@ -578,8 +578,10 @@ function AccountMenu({ open, accounts, activeId, onSwitch, onAdd, onLogout, onSe
           <button onClick={onAdd} style={{ width: "100%", padding: "13px", border: "1.5px solid var(--ink)",
             background: "var(--bg-white)", boxShadow: "3px 3px 0 var(--ink)", cursor: "pointer",
             fontFamily: "var(--font-jp)", fontWeight: 700, fontSize: 14, color: "var(--ink)" }}>＋ アカウントを追加</button>
-          <button onClick={onSettings} style={{ width: "100%", padding: "13px", border: "none", background: "transparent",
-            cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 600, fontSize: 13, color: "var(--ink-soft)" }}>設定</button>
+          {onSettings && (
+            <button onClick={onSettings} style={{ width: "100%", padding: "13px", border: "none", background: "transparent",
+              cursor: "pointer", fontFamily: "var(--font-jp)", fontWeight: 600, fontSize: 13, color: "var(--ink-soft)" }}>設定</button>
+          )}
         </div>
       </div>
     </div>

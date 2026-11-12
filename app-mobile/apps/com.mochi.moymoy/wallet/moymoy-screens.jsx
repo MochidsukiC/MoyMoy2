@@ -1510,8 +1510,33 @@ function MoyWarnBanner({ children }) {
   );
 }
 
+/* 支払う口座の表示と切り替え。切り替えると root が MoyMoyApp を作り直し、
+   保持中の支払いを新しい口座で読み直す。 */
+function MoyPayAccountBar({ account, disabled, onSwitch }) {
+  if (!account) return null;
+  return (
+    <div style={{ marginTop: 12, border: "1.5px solid var(--ink)", padding: "10px 12px",
+      display: "flex", alignItems: "center", gap: 10 }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontFamily: "var(--font-mono)", fontSize: 9, letterSpacing: "0.14em",
+          color: "var(--ink-soft)", marginBottom: 2 }}>支払うアカウント</div>
+        <div style={{ fontFamily: "var(--font-jp)", fontSize: 14, fontWeight: 700, color: "var(--ink)",
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {account.display_name || ("@" + account.handle)}
+        </div>
+        <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--ink-soft)",
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>@{account.handle}</div>
+      </div>
+      <button disabled={disabled} onClick={onSwitch} style={{ flexShrink: 0, padding: "8px 12px",
+        border: "1.5px solid var(--moy-deep)", background: "var(--bg-white)", color: "var(--moy-deep)",
+        cursor: disabled ? "default" : "pointer", fontFamily: "var(--font-jp)", fontWeight: 700,
+        fontSize: 13 }}>切り替える</button>
+    </div>
+  );
+}
+
 function MoyPaymentApproval({ pending, intent, loading, error, required, balance, busy, step, done,
-  seal, onToPin, onApprove, onDecline, onClose, onCharge, onReturn, onBackToReview }) {
+  seal, account, onSwitchAccount, onToPin, onApprove, onDecline, onClose, onCharge, onReturn, onBackToReview }) {
   // 残り時間と経過時間を進めるためだけの時計。
   const [now, setNow] = msState(Date.now());
   msEffect(() => {
@@ -1588,6 +1613,7 @@ function MoyPaymentApproval({ pending, intent, loading, error, required, balance
             </span>
             <span style={{ flexShrink: 0 }}>{moyDuration(ageMs)}前</span>
           </div>
+          {onSwitchAccount && <MoyPayAccountBar account={account} disabled={busy} onSwitch={onSwitchAccount} />}
 
           {loading && (
             <div style={{ padding: "48px 0", textAlign: "center" }}>
@@ -1790,7 +1816,7 @@ function MoyPaymentApproval({ pending, intent, loading, error, required, balance
      ② 入力した金額は「次へ」でサーバへ送り、請求（intent）に変えてもらう。
         支払いの確定は既存の承認画面（PIN・段階認証）に渡し、ここでは何も
         動かさない — 残高が動く操作はこの画面には 1 つも無い。 */
-function MoyStaticQrPay({ pending, balance, onCancel, onIntent, onExpired }) {
+function MoyStaticQrPay({ pending, balance, account, onSwitchAccount, onCancel, onIntent, onExpired }) {
   const code = pending.static_qr;
   const [merchant, setMerchant] = msState(null);
   const [loading, setLoading] = msState(true);
@@ -1883,6 +1909,7 @@ function MoyStaticQrPay({ pending, balance, onCancel, onIntent, onExpired }) {
           overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           FROM {moyLaunchFrom(pending)}
         </div>
+        {onSwitchAccount && <MoyPayAccountBar account={account} disabled={busy} onSwitch={onSwitchAccount} />}
 
         {loading && (
           <div style={{ padding: "48px 0", textAlign: "center" }}>
@@ -2052,6 +2079,8 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
     : staticLinked ? { ...rootPending, kind: "intent", intent_id: staticIntent.intentId }
     : null;
   const staticAmountStage = !!rootPending && rootPending.kind === "static_qr" && !staticLinked;
+  // 支払い画面（承認・店頭 QR の金額入力）が前面に出ているか。
+  const payScreenUp = (!!pendingPayment && !payMin) || staticAmountStage;
 
   // A session that expired mid-use ⇒ drop this account and re-authenticate.
   function onExpired() {
@@ -2554,7 +2583,7 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
         <MoyPaymentApproval
           pending={pendingPayment} intent={payIntent} loading={payLoading} error={payErr}
           required={payRequired} balance={balance} busy={payBusy} step={payStep} done={payDone}
-          seal={seal}
+          seal={seal} account={account} onSwitchAccount={() => setMenuOpen(true)}
           onToPin={() => { setPayErr(null); setPayStep("pin"); }}
           onBackToReview={() => { setPayErr(null); setPayStep("review"); }}
           onApprove={doApprove} onDecline={doDecline}
@@ -2566,6 +2595,7 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
           key は起動要求ごと — 別の QR に切り替わったら入力欄ごと作り直す。 */}
       {staticAmountStage && (
         <MoyStaticQrPay key={"sq-" + rootPending.taken_at} pending={rootPending} balance={balance}
+          account={account} onSwitchAccount={() => setMenuOpen(true)}
           onCancel={clearPayment} onExpired={onExpired}
           onIntent={(intentId) => setStaticIntent({ takenAt: rootPending.taken_at, intentId })} />
       )}
@@ -2576,11 +2606,14 @@ function MoyMoyApp({ account, accounts = [], onSwitchAccount, onAddAccount, onLo
       )}
 
       {/* account switcher + settings */}
+      {/* 支払い画面 (zIndex 150) の上から開くときは、その上に出す。設定シート (140) は
+          支払い画面の裏に隠れるので、そのあいだは出さない。 */}
       <AccountMenu open={menuOpen} accounts={accounts} activeId={account ? account.account_id : null}
+        zIndex={payScreenUp ? 165 : 130}
         onSwitch={(id) => { setMenuOpen(false); if (onSwitchAccount) onSwitchAccount(id); }}
         onAdd={() => { setMenuOpen(false); if (onAddAccount) onAddAccount(); }}
         onLogout={(id) => { setMenuOpen(false); if (onLogoutAccount) onLogoutAccount(id); }}
-        onSettings={() => { setMenuOpen(false); setSettingsOpen(true); }}
+        onSettings={payScreenUp ? null : () => { setMenuOpen(false); setSettingsOpen(true); }}
         onClose={() => setMenuOpen(false)} />
       <SettingsSheet open={settingsOpen} account={account} seal={seal}
         onLogout={() => { setSettingsOpen(false); if (account && onLogoutAccount) onLogoutAccount(account.account_id); }}
@@ -2598,6 +2631,6 @@ Object.assign(window, {
   MoyKeypad, MineSlot, EmeBlockMini, MoyPay, MoySend, MoyAmountEntry, MoyEmeModeSwitch,
   MoyCharge, MoyWithdraw, MoyHistory, MoyConfirmSheet, MoyMoyApp,
   MoyPinStep, MoyStepUp, maskEmail, MoySealBadge, MoySealSetup,
-  MoyPaymentApproval, MoyPaymentResumeBar, MoyStaticQrPay, errLabel, errLabelFor,
+  MoyPaymentApproval, MoyPayAccountBar, MoyPaymentResumeBar, MoyStaticQrPay, errLabel, errLabelFor,
   MoyMerchantFace, MoyAmountInput, useMoyAmountInput,
 });
