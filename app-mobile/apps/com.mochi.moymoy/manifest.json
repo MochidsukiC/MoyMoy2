@@ -1,6 +1,6 @@
 {
   "id": "com.mochi.moymoy",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "schema_version": 1,
   "name": {
     "default": "MoyMoy",
@@ -21,9 +21,9 @@
     "utilities"
   ],
   "bundle": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.9.1/com.mochi.moymoy-0.9.1.tar",
-    "sha256": "dde6c4f35aba17a1df5baafde90a6ac3e78b30e7141c9d3bfd2c17f6c9f2dea4",
-    "size": 427520,
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.9.2/com.mochi.moymoy-0.9.2.tar",
+    "sha256": "cdd806820685d6f12a5c121249ee953b176186b42fddcbd7c3e2d177401a46e2",
+    "size": 429568,
     "format": "tar"
   },
   "runtime": {
@@ -33,7 +33,7 @@
     }
   },
   "icon": {
-    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.9.1/com.mochi.moymoy-0.9.1.png",
+    "url": "https://github.com/MochidsukiC/MoyMoy2/releases/download/v0.9.2/com.mochi.moymoy-0.9.2.png",
     "sha256": "cfd2d10d05f14df3ef79adbbc68c3447670b150634746d7076ea5090f409e988",
     "size_px": 512,
     "format": "png"
@@ -54,6 +54,13 @@
     "min_runtime_version": "0.1.0"
   },
   "release_notes": [
+    {
+      "version": "0.9.2",
+      "notes": {
+        "default": "お支払いの確認画面と、お店の QR で金額を入れる画面に、支払うアカウントを表示するようにしました。「切り替える」から、その場で別のアカウントに切り替えて支払えます。",
+        "ja": "お支払いの確認画面と、お店の QR で金額を入れる画面に、支払うアカウントを表示するようにしました。「切り替える」から、その場で別のアカウントに切り替えて支払えます。"
+      }
+    },
     {
       "version": "0.9.1",
       "notes": {
